@@ -115,6 +115,32 @@ pub const ADMIN_QUORUM: Bound = Bound {
     default: 2,
 };
 
+/// dird's `dns_record_max_age`: a member host's address registered longer
+/// ago is left out of the zone image — 7 days (default and ceiling), at
+/// least 1 s. docs/54 §5.2 gives "e.g. 7 days ⚠", read as Q-230 item 4
+/// reads every docs value: an operator may tighten it, never loosen it.
+/// Spec: docs/54 §4.4, §5.2; docs/questions/Q-614 item 7, Q-230 item 4,
+/// Q-1001 item 2.
+pub const DNS_RECORD_MAX_AGE_SECS: Bound = Bound::up_to(7 * 24 * 60 * 60);
+
+/// dird's zone time values — the SOA's REFRESH, RETRY, EXPIRE and MINIMUM
+/// and the TTLs of the synthesized (`dns_infrastructure_ttl`) and host
+/// (`dns_host_ttl`) records — in seconds: 0 ..= 2 147 483 647. A TTL is one
+/// of the "positive values of a signed 32 bit number" (RFC 1035 §2.3.4); the
+/// zone image refuses a larger TTL or MINIMUM (crates/dns-zone `MAX_TTL`,
+/// pinned in crates/directory-daemon), and the SOA's three intervals take the
+/// same range so that every time value of the zone has one bound. Required
+/// whenever dird's DNS channel is configured — no default is ever used (the
+/// `default` field only fills the struct): docs/54 §3.1 names them dird
+/// configuration with no value (project choices ⚠).
+/// Spec: RFC 1035 §2.3.4, §3.2.1, §3.3.13 ("All times are in units of
+/// seconds"); docs/54 §3.1; docs/questions/Q-619 item 5, Q-1001 item 2.
+pub const DNS_TIME_SECS: Bound = Bound {
+    min: 0,
+    max: 2_147_483_647,
+    default: 0,
+};
+
 /// A client's deadline for an answer on the keyd channel: 2 s.
 /// Spec: docs/50 §3.6 ("deadline in the client — keyd: 2 s").
 pub const KEYD_DEADLINE_SECS: Bound = Bound::up_to(2);

@@ -225,7 +225,7 @@ impl Engine {
         // §4.4 (R49-15).
         let requester = match &session.identity {
             Identity::Anonymous => Requester::Anonymous,
-            Identity::Bound(identity) => match recheck(identity, inputs.accounts, &inputs.now) {
+            Identity::Bound(identity) => match recheck(identity, inputs.subjects, &inputs.now) {
                 Recheck::Valid(bound) => Requester::Bound(bound),
                 failed => {
                     run.principal = Some(identity.sid);

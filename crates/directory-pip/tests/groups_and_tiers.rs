@@ -329,7 +329,11 @@ fn object_tiers() {
 }
 
 /// docs/06 §9; A-36: every resource the map cannot classify is Tier0 for
-/// writes — a policy scope, and RPC / file / DNS / Kerberos resources.
+/// writes — a policy scope, and RPC / file / Kerberos resources; and a DNS
+/// record whose owner the map does not classify (task DN6: a record's tier
+/// is its owning computer's — docs/54 §5.6, Q-614 item 6; here ws01 is
+/// unclassified, so Tier0 by A-36; tests/zone_projection.rs covers the
+/// classified case).
 #[test]
 fn non_directory_resources_are_tier0() {
     let d = Dir::standard("resource-tier");

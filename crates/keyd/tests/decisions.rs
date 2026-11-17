@@ -511,6 +511,12 @@ impl KeyStore for HeldKeys {
     fn is_empty(&self) -> bool {
         false
     }
+    fn attestation_key(&self) -> Option<&keyd::AttestationKey> {
+        self.0.attestation_key()
+    }
+    fn install_attestation_key(&mut self, key: keyd::AttestationKey) -> Result<(), StoreError> {
+        self.0.install_attestation_key(key)
+    }
     fn get(&self, handle: &KeyHandle) -> Option<&StoredKeySet> {
         self.0.get(handle)
     }

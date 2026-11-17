@@ -1,0 +1,49 @@
+# cargo-fuzz harness for principal-names (docs/CLEAN-ROOM.md: every parser gets a
+# fuzz target before it merges to main; docs/59 §8, task PN1). The request
+# form parses attacker-supplied names: `key_of_request` must never panic,
+# hang or over-allocate on any principal name and realm a client can send.
+#
+# This is a SEPARATE workspace (note the empty [workspace] table below): it is
+# intentionally NOT a member of the root workspace, so `cargo build --all`,
+# `cargo clippy`, `cargo test`, `cargo deny` and the SBOM in the product
+# workspace never pull in the fuzzing-only dependencies. It is built only via
+# `cargo fuzz run principal_key_of_request` (nightly + cargo-fuzz).
+#
+# NOTE FOR REVIEW: libfuzzer-sys is fuzz-harness-only test infrastructure, not
+# linked into any product crate, and on the license allowlist (MIT /
+# Apache-2.0, docs/CLEAN-ROOM.md). Pending owner sign-off (docs/questions/
+# PENDING-OWNER.md P-1); not built or run until then. The same properties run
+# deterministically in crates/principal-names/tests/one_equivalence.rs (both
+# include tests/support/properties.rs).
+
+[package]
+name = "principal-names-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.principal-names]
+path = ".."
+
+# The request's types (`PrincipalName`, `Realm`, `KerberosString`).
+[dependencies.krb-proto]
+path = "../../krb-proto"
+
+# `key_of_request` on arbitrary names and realms, and `keys_of_names` on
+# arbitrary stored names, with the properties of tests/support/properties.rs
+# (`cargo fuzz run principal_key_of_request`).
+[[bin]]
+name = "principal_key_of_request"
+path = "fuzz_targets/principal_key_of_request.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the root workspace (see header).
+[workspace]

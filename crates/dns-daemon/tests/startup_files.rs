@@ -1,14 +1,18 @@
 //! dnsd's start-up steps before the runtime: the configuration file read
 //! through crates/protected-file, its refusals (no file content echoed),
-//! and the binding of one UDP socket and one TCP listener per address.
+//! and the port rule — a file naming any port but 53 is refused before any
+//! bind (task DN10d). The binding itself is tested in-crate
+//! (src/startup.rs), on a loopback port the system picks: no product path
+//! and no test seam binds an address that is not from a file dnsd's schema
+//! accepted (docs/questions/Q-1025 item 1).
 //!
 //! Sources: docs/54 §4.7 ("root ⇒ reading the configuration (protected-file,
 //! R11b) ⇒ `bind` UDP+TCP 53 for every configured address"); docs/50 R50-15,
 //! §7.1 ("file root:0644"; errors never echo a value — A-60); RFC 1035 §4.2
-//! (UDP and TCP on the same server address). The files are hand-made; the
-//! owner is the test's own uid (the daemon passes root's).
+//! ("server port 53 (decimal)"). The files are hand-made; the owner is the
+//! test's own uid (the daemon passes root's).
 
-use dns_daemon::startup::{bind_listeners, read_settings, StartupError};
+use dns_daemon::startup::{read_settings, StartupError};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use test_scratch::ScratchDir;
@@ -57,7 +61,7 @@ impl Scratch {
 fn a_protected_configuration_file_is_read() {
     let scratch = Scratch::new("ok");
     let path = scratch.path("dnsd.conf");
-    write(&path, &file("127.0.0.1:5353"), 0o644);
+    write(&path, &file("127.0.0.1:53"), 0o644);
     let settings = read_settings(&path, scratch.uid).expect("read");
     assert_eq!(settings.listen().len(), 1);
     assert_eq!(settings.dird().uid(), 802);
@@ -71,13 +75,13 @@ fn a_protected_configuration_file_is_read() {
 fn unprotected_or_invalid_files_are_refused() {
     let scratch = Scratch::new("refused");
     let writable = scratch.path("writable.conf");
-    write(&writable, &file("127.0.0.1:5353"), 0o664);
+    write(&writable, &file("127.0.0.1:53"), 0o664);
     assert_eq!(
         read_settings(&writable, scratch.uid).map(drop),
         Err(StartupError::ConfigPermissions)
     );
     let target = scratch.path("target.conf");
-    write(&target, &file("127.0.0.1:5353"), 0o644);
+    write(&target, &file("127.0.0.1:53"), 0o644);
     let link = scratch.path("link.conf");
     std::os::unix::fs::symlink(&target, &link).expect("symlink");
     assert_eq!(
@@ -98,24 +102,32 @@ fn unprotected_or_invalid_files_are_refused() {
     }
 }
 
-/// RFC 1035 §4.2; docs/54 §4.7: every configured address is bound on UDP
-/// and on TCP, at that address. (A free loopback port is found first; the
-/// configuration refuses port 0.)
+/// Task DN10d (A-178 on docs/questions/Q-1025 item 1; RFC 1035 §4.2 —
+/// "server port 53 (decimal)"; the NS record names the DC as the zone's name
+/// server, docs/54 §3.1): a file naming another port is refused at start-up,
+/// before any bind, naming `listen` and never echoing the port; the
+/// addresses dnsd binds are all on port 53, crates/config's one definition.
 #[test]
-fn every_address_is_bound_on_udp_and_tcp() {
-    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe");
-    let port = probe.local_addr().expect("probe").port();
-    drop(probe);
+fn dnsd_binds_only_port_53() {
+    let scratch = Scratch::new("port");
+    for listen in ["127.0.0.1:5353", "127.0.0.1:53, 127.0.0.2:1053"] {
+        let path = scratch.path("dnsd-port.conf");
+        write(&path, &file(listen), 0o644);
+        match read_settings(&path, scratch.uid) {
+            Err(StartupError::Config(message)) => {
+                assert!(message.contains("`listen`"), "{message}");
+                assert!(!message.contains("5353"), "no echo: {message}");
+                assert!(!message.contains("1053"), "no echo: {message}");
+            }
+            other => panic!("expected a configuration refusal, got {other:?}"),
+        }
+        std::fs::remove_file(&path).expect("remove");
+    }
     let settings =
-        config::DnsdSettings::parse(file(&format!("127.0.0.1:{port}")).as_bytes()).expect("valid");
-    let listeners = bind_listeners(&settings).expect("bound");
-    assert_eq!(listeners.udp.len(), 1);
-    assert_eq!(listeners.tcp.len(), 1);
-    assert_eq!(listeners.udp[0].local_addr().expect("udp").port(), port);
-    assert_eq!(listeners.tcp[0].local_addr().expect("tcp").port(), port);
-    // The address is taken now: binding it again fails with the OS error.
-    assert!(matches!(
-        bind_listeners(&settings),
-        Err(StartupError::Bind(_))
-    ));
+        config::DnsdSettings::parse(file("127.0.0.1:53, 127.0.0.2:53").as_bytes()).expect("valid");
+    assert!(settings
+        .listen()
+        .iter()
+        .all(|address| address.port() == config::StandardPort::Dns.number()));
+    assert_eq!(config::StandardPort::Dns.number(), 53);
 }

@@ -22,6 +22,8 @@
 //! | [`opened`] | an already-opened store, skipping the file checks | the redb file (`StoreSource::File`) |
 //! | [`KpasswdParams::keyd`] | the kpasswd service's keyd client — any [`crate::KpasswdKeyd`] (task K7) | `KeydKpasswdClient` over `ipc_keyd::UnixConnector` (Role::Ldap) |
 //! | [`KpasswdParams::max_connections`], [`KpasswdParams::queue_capacity`] | the kpasswd channel's bounds | `MAX_KPASSWD_CONNECTIONS`, `KPASSWD_QUEUE_CAPACITY` |
+//! | [`DnsParams::max_connections`], [`DnsParams::queue_capacity`] | the DNS channel's bounds (task DN10a) | `MAX_DNS_CONNECTIONS`, `DNS_QUEUE_CAPACITY` |
+//! | [`DnsParams::min_serial_advance_interval`] | the least time between two serial advances for the clock (task DN10b) | `MIN_SERIAL_ADVANCE_INTERVAL` |
 //!
 //! Spec: docs/52 §3.18, §7 R15; docs/questions/Q-415, Q-432 (A-95), Q-501
 //! (A-105), Q-570.
@@ -33,6 +35,7 @@
 
 use crate::admin_service::{AdminServeParams, DecisionAckDeadline};
 use crate::daemon::{DaemonControl, DaemonError, OpenedStore, Stopped, StoreSource};
+use crate::dns_service::DnsServeParams;
 use crate::kpasswd_service::KpasswdServeParams;
 use crate::policy::DevelopmentPolicy;
 use crate::policy_next::PolicyNextFile;
@@ -162,6 +165,56 @@ impl From<KpasswdParams> for KpasswdServeParams {
     }
 }
 
+/// Everything the DNS service runs with — the product
+/// [`crate::DnsParams`] plus its seams (module documentation; task DN10a).
+/// Spec: docs/54 §4.6; docs/52 C18.
+#[derive(Debug, Clone)]
+pub struct DnsParams {
+    /// `dird_dns_socket`.
+    pub socket: PathBuf,
+    /// `dnsd_uid`: the only peer admitted.
+    pub dnsd_uid: u32,
+    /// The zone values of the image.
+    pub zone: directory_pip::ZoneParameters,
+    /// Connections dnsd may hold.
+    pub max_connections: usize,
+    /// The DNS queue.
+    pub queue_capacity: usize,
+    /// The least time between two serial advances for the clock (task
+    /// DN10b).
+    pub min_serial_advance_interval: Duration,
+}
+
+impl From<DnsParams> for DnsServeParams {
+    fn from(dns: DnsParams) -> DnsServeParams {
+        DnsServeParams {
+            socket: dns.socket,
+            dnsd_uid: dns.dnsd_uid,
+            zone: dns.zone,
+            max_connections: dns.max_connections,
+            queue_capacity: dns.queue_capacity,
+            min_serial_advance_interval: dns.min_serial_advance_interval,
+        }
+    }
+}
+
+impl DnsParams {
+    /// The product DNS parameters with every production value — a starting
+    /// point for a test that changes one seam.
+    #[must_use]
+    pub fn production(dns: crate::DnsParams) -> DnsParams {
+        let full = DnsServeParams::production(dns);
+        DnsParams {
+            socket: full.socket,
+            dnsd_uid: full.dnsd_uid,
+            zone: full.zone,
+            max_connections: full.max_connections,
+            queue_capacity: full.queue_capacity,
+            min_serial_advance_interval: full.min_serial_advance_interval,
+        }
+    }
+}
+
 /// A store already opened in this process ([`StoreSource::Opened`]).
 #[must_use]
 pub fn opened(store: Arc<Store>) -> StoreSource {
@@ -178,7 +231,7 @@ pub async fn serve(
     policy: DevelopmentPolicy,
     control: DaemonControl,
 ) -> Result<Stopped, DaemonError> {
-    crate::daemon::serve_with(params, None, None, source, policy, control).await
+    crate::daemon::serve_with(params, None, None, None, source, policy, control).await
 }
 
 /// `crate::serve_with_admin` with every value given.
@@ -192,7 +245,16 @@ pub async fn serve_with_admin(
     policy: DevelopmentPolicy,
     control: DaemonControl,
 ) -> Result<Stopped, DaemonError> {
-    crate::daemon::serve_with(params, admin.map(Into::into), None, source, policy, control).await
+    crate::daemon::serve_with(
+        params,
+        admin.map(Into::into),
+        None,
+        None,
+        source,
+        policy,
+        control,
+    )
+    .await
 }
 
 /// `crate::serve_with_services` with every value given (task K7).
@@ -211,6 +273,33 @@ pub async fn serve_with_kpasswd(
         params,
         admin.map(Into::into),
         kpasswd.map(Into::into),
+        None,
+        source,
+        policy,
+        control,
+    )
+    .await
+}
+
+/// `crate::serve_with_services` with every value given, the DNS service
+/// included (task DN10a).
+///
+/// # Errors
+/// [`DaemonError`].
+pub async fn serve_with_dns(
+    params: DaemonParams,
+    admin: Option<AdminParams>,
+    kpasswd: Option<KpasswdParams>,
+    dns: Option<DnsParams>,
+    source: StoreSource,
+    policy: DevelopmentPolicy,
+    control: DaemonControl,
+) -> Result<Stopped, DaemonError> {
+    crate::daemon::serve_with(
+        params,
+        admin.map(Into::into),
+        kpasswd.map(Into::into),
+        dns.map(Into::into),
         source,
         policy,
         control,

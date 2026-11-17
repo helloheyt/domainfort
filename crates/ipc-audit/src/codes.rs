@@ -218,8 +218,11 @@ code_table! {
     /// `CompleteChangePassword`, `SealChangePasswordError` (codes 22-24) were
     /// appended by task K3 (docs/53 §5.5, §9); codes 1-21 keep their meaning.
     /// `RevokeDecision` (code 25) was appended by task F3 (docs/questions/
-    /// Q-976); codes 1-24 keep their meaning.
-    /// Spec: docs/10 §2-§7; crates/keyd authz.rs; docs/52 §4; docs/53 §9.
+    /// Q-976); codes 1-24 keep their meaning. `InstallAttestationKey` (code
+    /// 26) was appended by task PN9 (docs/59 §7.5; docs/questions/Q-1033);
+    /// codes 1-25 keep their meaning.
+    /// Spec: docs/10 §2-§7; crates/keyd authz.rs; docs/52 §4; docs/53 §9;
+    /// docs/59 §7.5.
     pub enum KeydOperation {
         VerifyPreauth,
         IssueAsRep,
@@ -246,6 +249,7 @@ code_table! {
         CompleteChangePassword,
         SealChangePasswordError,
         RevokeDecision,
+        InstallAttestationKey,
     }
 }
 
@@ -270,7 +274,9 @@ code_table! {
     /// intent must be acknowledged first (`keyd::requires_acknowledged_intent`):
     /// one that changes keyd's key state (`keyd::changes_key_state`:
     /// `SetSecret`, `CreateKey`, `RotateKey`, `RotateKrbtgt`, `RetireKvno`,
-    /// `DestroyKeySet`) or one that loosens keyd's authorization
+    /// `DestroyKeySet`, `CompleteChangePassword` — task K3 — and
+    /// `InstallAttestationKey` — task PN9) or one that loosens keyd's
+    /// authorization
     /// (`keyd::loosens_authorization`: `GrantSetSecret`, task A15a —
     /// docs/questions/Q-452; `RegisterDecision`, A-102):
     ///
@@ -316,7 +322,18 @@ code_table! {
     /// 80 to 94. The two revocation reasons (`DecisionRevoked`,
     /// `DecisionExecuted`, codes 94-95) were appended by task F3
     /// (docs/questions/Q-976) the same way; `Unlisted` moved from 94 to 96.
-    /// Spec: crates/keyd audit.rs; docs/10 §9, §10, I8; docs/53 §9.
+    /// The attestation-key install's own reason (`AttestationKeyInstalled`,
+    /// code 96 — the first of keyd's five PN8 reasons in declaration order)
+    /// was appended by task PN9 (docs/59 §7.5; docs/questions/Q-1033 item 4)
+    /// the same way; `Unlisted` moved from 96 to 97. The four name-resolution
+    /// reasons that follow it in keyd (`AttestationKeyMissing`,
+    /// `NameResolutionInvalid`, `NameResolutionStale`,
+    /// `NameResolutionMismatch`, codes 97-100) and the seal's
+    /// `AttestationKeyNotInstalled` (code 101) were appended by task PN11
+    /// (docs/59 §7.5; docs/questions/Q-1033 item 4, Q-1056 item 4) the same
+    /// way, in keyd's declaration order; `Unlisted` moved from 97 to 102.
+    /// Spec: crates/keyd audit.rs; docs/10 §9, §10, I8; docs/53 §9; docs/59
+    /// §7.5.
     pub enum KeydReason {
         None,
         RoleNotPermitted,
@@ -413,6 +430,12 @@ code_table! {
         KpasswdInitialFlagNeeded,
         DecisionRevoked,
         DecisionExecuted,
+        AttestationKeyInstalled,
+        AttestationKeyMissing,
+        NameResolutionInvalid,
+        NameResolutionStale,
+        NameResolutionMismatch,
+        AttestationKeyNotInstalled,
         Unlisted,
     }
 }
@@ -619,10 +642,80 @@ code_table! {
 code_table! {
     /// The event shapes (the wire tag of [`crate::EventBody`]). `DirAdmin`
     /// and `Admind` were appended for the admin plane (docs/51 §5.7, R51-12,
-    /// task A7); the codes of the first four are unchanged.
+    /// task A7); the codes of the first four are unchanged. `ZoneSerial` (7)
+    /// was appended by task DN10b for dird's serial-only zone write
+    /// (crate::zone; docs/questions/Q-1002, Q-1013); no earlier code moved.
     /// Spec: docs/50 §8.1; docs/questions/Q-252 item 3; docs/51 §5.7, §12
-    /// (A7); docs/questions/Q-340.
-    pub enum EventShape { Kdc, Keyd, Ldap, WindowSummary, DirAdmin, Admind }
+    /// (A7); docs/questions/Q-340, Q-1002 (A-172), Q-1013.
+    pub enum EventShape { Kdc, Keyd, Ldap, WindowSummary, DirAdmin, Admind, ZoneSerial }
+}
+
+// ---- dird's serial-only zone write: the `ZoneSerial` shape (task DN10b) -------
+
+code_table! {
+    /// Why dird advances the zone's SOA SERIAL without a content write — the
+    /// two instances of the class "the zone's content changes while its
+    /// SERIAL does not" that no commit can see (docs/questions/Q-1002 item
+    /// 1, Q-993 item 3):
+    ///
+    /// * `ServiceStart` — dird's DNS service starts: every image of the new
+    ///   process gets a SERIAL after every SERIAL an earlier process served,
+    ///   whatever changed in dird's zone configuration (Q-1002 item 4 (b);
+    ///   docs/54 §5.4: "a change of the DC / of the SOA parameters
+    ///   (configuration) ⇒ increment at dird's next start");
+    /// * `ContentAged` — the clock changed the projection's answer under the
+    ///   current SERIAL: an address reached `dns_record_max_age`, an account
+    ///   its accountExpires (`ZoneProjection::valid_until` passed — Q-1002
+    ///   item 4 (a)), or dird's clock went back past a change.
+    ///
+    /// Spec: RFC 2136 §3.6 (autoincrement events; "If the zone appears to
+    /// change, the SOA must appear to change as well"); docs/54 §5.4;
+    /// docs/questions/Q-1002 (A-172), Q-1013.
+    pub enum ZoneSerialCause { ServiceStart, ContentAged }
+}
+
+code_table! {
+    /// When dird sent a `ZoneSerial` event: `Decision` — before the write,
+    /// acknowledged by auditd before the write commits; `Outcome` — after
+    /// the commit (or its failure). The wire tag of
+    /// [`crate::ZoneSerialStage`].
+    /// Spec: docs/51 §5.7 item 2 ("decide ⇒ a decision event acknowledged
+    /// ⇒ commit ⇒ an outcome event") as every dird state change (A-57,
+    /// A-85); docs/52 §3.11 R6.
+    pub enum ZoneSerialPhase { Decision, Outcome }
+}
+
+code_table! {
+    /// What a `ZoneSerial` outcome says: the serial advanced (the new SERIAL
+    /// follows on the wire), not needed (the counter moved after the
+    /// decision — another write advanced it; nothing written), or failed
+    /// (a [`ZoneSerialFailure`] follows). The wire tag of
+    /// [`crate::ZoneSerialOutcome`].
+    /// Spec: RFC 2136 §3.6, §7.10 ("Deferral of SOA SERIAL autoincrements is
+    /// made possible so that serial numbers can be conserved"); docs/questions
+    /// Q-1013.
+    pub enum ZoneSerialOutcomeCode { Advanced, NotNeeded, Failed }
+}
+
+code_table! {
+    /// Why a decided serial advance was not written — a class only.
+    ///
+    /// * `AuditUnacknowledged` — auditd did not acknowledge the decision
+    ///   event within dird's deadline: not performed (docs/51 §5.7 item 2;
+    ///   A-85 — the `DirAdmin` code of the same name, A-91).
+    /// * `StoreFailure` — the store could not begin, read or commit the
+    ///   transaction.
+    /// * `CounterUnavailable` — the `dns-zone-serial` counter is missing or
+    ///   exhausted (A-83: never created at run time).
+    /// * `InternalFailure` — a misassembled caller or a time out of range.
+    ///
+    /// Spec: docs/51 §5.7 item 2; A-83; A-85; docs/questions/Q-1013.
+    pub enum ZoneSerialFailure {
+        AuditUnacknowledged,
+        StoreFailure,
+        CounterUnavailable,
+        InternalFailure,
+    }
 }
 
 // ---- the admin plane: dird's `DirAdmin` shape (docs/51 §5.7) -----------------
@@ -925,9 +1018,10 @@ code_table! {
 
 code_table! {
     /// Which name a [`crate::TargetName`] is: the name fields of the
-    /// `dird-admin.sock` requests (docs/51 §7.3: `sam`, `upn`, `name`,
-    /// `dns_host_name`, `spn`, and `dn` for `Lookup`), by the attribute they
-    /// name in docs/51 §11. `PolicyChange` (appended by task A16): one
+    /// `dird-admin.sock` requests (docs/51 §7.3: `sam`, `upn`, `name`, `spn`,
+    /// and `dn` for `Lookup`) and the dNSHostName a `CreateComputer` derives
+    /// (A-184 — not a request field), by the attribute they name in docs/51
+    /// §11. `PolicyChange` (appended by task A16): one
     /// tier-map change of a `ChangePolicy` request, in the command-line
     /// spelling of `provision policy` (`--add-principal <SID> <TierN>`, …;
     /// crate policy-store module `edit`) — SIDs and DNs only, not secret

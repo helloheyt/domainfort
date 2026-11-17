@@ -3,9 +3,11 @@
 //! As with the KDC (`kdc::Kdc::handle`), the engine is a library PEP: it
 //! holds no policy, no directory view and no clock of its own. Each request
 //! brings one consistent policy snapshot and its PIP (docs/11 §6 snapshot
-//! semantics), the account source of the same directory view (docs/47 §8.1:
-//! one view serves as both — `directory_pip::DirectoryView` implements
-//! `pdp::Pip` and `kdc::AccountSource`), the caller's rate limiter, the
+//! semantics), the ticket-subject lookup of the same directory view (docs/47
+//! §8.1: one view serves as both — `directory_pip::DirectoryView` implements
+//! `pdp::Pip` and `directory_pip::TicketSubjects`; never the KDC's account
+//! source, whose records carry dird's attested name resolutions — task
+//! PN10b, docs/questions/Q-1047), the caller's rate limiter, the
 //! caller's `now`, and the transport facts the front observes. For a
 //! search, the directory comes as a `directory_pip::PepView`: the
 //! visibility gate and the locators of its questions — never the raw
@@ -15,8 +17,7 @@
 //! `connection_id` and the transport state), §10.2; docs/11 §2, §6, §8;
 //! docs/47 §8.1 (R47-11).
 
-use directory_pip::PepView;
-use kdc::AccountSource;
+use directory_pip::{PepView, TicketSubjects};
 use krb_proto::KerberosTime;
 use pdp::{IpScope, Pip, PolicySnapshot, RlKey};
 
@@ -80,7 +81,7 @@ pub trait SearchClock {
 /// [MS-ADTS] 3.1.1.5.1.4). For a directory search the engine takes every PIP
 /// answer from it as well (`PepView::pip`), so the objects it enumerates and
 /// the descriptors the PDP reads come from the same snapshot (docs/11 §6
-/// P9); the caller passes the same view as `pip` and `accounts` (docs/47
+/// P9); the caller passes the same view as `pip` and `subjects` (docs/47
 /// §8.1, R47-11). It is a `PepView` — the visibility gate, the locators of
 /// its questions and the PIP — never the `DirectoryView`: the engine cannot
 /// read a raw object (docs/52 R-a; A-103 on docs/questions/Q-486).
@@ -100,9 +101,14 @@ pub struct RequestInputs<'a> {
     /// The policy information point of the request's directory view.
     /// Spec: docs/11 §6.
     pub pip: &'a dyn Pip,
-    /// The account source of the same directory view: the per-request
-    /// re-check of a bound identity (docs/49 §4.4, R49-15).
-    pub accounts: &'a dyn AccountSource,
+    /// The ticket-subject lookup of the same directory view: the
+    /// per-request re-check of a bound identity (docs/49 §4.4, R49-15) reads
+    /// the bound client's account facts from it — the one lookup path in
+    /// the `TicketClient` context, with no name resolution and no signer
+    /// (docs/59 §6.2, §6.4; docs/questions/Q-1047, A-187). Named for what
+    /// it is — a `TicketSubjects`, never the KDC's account source (task
+    /// PN10c; A-189 on docs/questions/Q-1051 item 2).
+    pub subjects: &'a dyn TicketSubjects,
     /// The caller's rate limiter. Spec: docs/49 §10.2.
     pub rate: &'a mut dyn RateLimiter,
     /// The caller's time. Spec: docs/49 §11; docs/11 P9.

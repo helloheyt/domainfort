@@ -419,7 +419,15 @@ fn the_n1_takeover_is_refused_at_every_step() {
     // Step 1: destroy — keyadm can only run dird's destroy decisions.
     let sweep = sweep::run(&mut keyd_client(&world));
     assert!(sweep.destroyed.is_empty() && sweep.listed == 0, "{sweep:?}");
-    // keyd's ceremony ends with the seal (keyadm's ceremony sends it last).
+    // keyd's ceremony ends with the seal (keyadm's ceremony sends it last,
+    // after the attestation key — keyd refuses the seal without it, task
+    // PN11, docs/questions/Q-1056 item 4).
+    assert_eq!(
+        keyd_client(&world).install_attestation_key(
+            ipc_keyd::AttestationKeyOctets::from_slice(&[0x3C; 32]).unwrap()
+        ),
+        Ok(Ok(()))
+    );
     assert_eq!(keyd_client(&world).seal_ceremony(), Ok(()));
     // Step 2: an initial-secret grant for the live account.
     let account = ws9(KeyPurpose::PrincipalLongterm);

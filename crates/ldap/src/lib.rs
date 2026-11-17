@@ -10,7 +10,7 @@
 //! LDAPMessage it re-encodes the client's message in parse-ldap's canonical
 //! form and calls [`Engine::handle`] with the connection's [`Session`] and
 //! the [`RequestInputs`] of that request: one policy snapshot and its PIP,
-//! the account source of the same directory view, the caller's rate
+//! the ticket-subject lookup of the same directory view, the caller's rate
 //! limiter, `now`, the [`TransportReport`] (source zone, whether TLS is
 //! up, whether more octets are already buffered), and — for a search of the
 //! directory — the [`DirectoryInputs`] (the request's directory view and the

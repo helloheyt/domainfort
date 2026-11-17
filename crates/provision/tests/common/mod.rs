@@ -10,12 +10,44 @@ use std::path::{Path, PathBuf};
 use test_scratch::ScratchDir;
 
 use directory_admin::{RandomError, RandomSource};
+use directory_pip::NameResolutionSigner;
 use krb_proto::KerberosTime;
 use provision::install::Halt;
 use provision::{
     Account, Accounts, DomainInput, FilePath, Names, Network, Owner, Ownership, OwnershipError,
     Paths, Progress, Staged, Step,
 };
+use std::sync::Arc;
+
+/// dird's name-resolution signer as dird builds it (task PN10; docs/59
+/// §7.4): the product's `ResolutionSigner` under the key of the **produced**
+/// attestation-key file (task PN12), read with dird's own reader
+/// (`startup::read_attestation_key` — root:0400, 32 octets; `owner` stands in
+/// for root, the tests cannot chown), issuing at the system clock — for the
+/// directory contexts the tests build to read the produced store as dird's
+/// account source does.
+pub fn dird_signer(paths: &Paths, owner: u32) -> Arc<dyn NameResolutionSigner> {
+    let key =
+        directory_daemon::startup::read_attestation_key(paths.attestation_key.as_path(), owner)
+            .expect("the produced attestation key file");
+    let clock = directory_daemon::SharedClock::system();
+    Arc::new(directory_daemon::ResolutionSigner::new(
+        key,
+        Arc::new(move || clock.now()),
+    ))
+}
+
+/// keyadm's input copy of the attestation key as `keyadm ceremony` reads it
+/// (task PN12; crates/keyadm `attestation_key` — the running account's file,
+/// 0400/0600, 32 octets, not all zero): the **produced** file, with `owner`
+/// standing in for keyadm's account (the tests cannot chown).
+pub fn keyadm_attestation_key(paths: &Paths, owner: u32) -> ipc_keyd::AttestationKeyOctets {
+    keyadm::attestation_key::read_attestation_key_owned_by(
+        paths.keyadm_attestation_key.as_path(),
+        owner,
+    )
+    .expect("the produced keyadm attestation key file")
+}
 
 /// A unique scratch directory (mode 0700), removed on drop — inside the
 /// workspace (crates/test-scratch, Q-480): the products installed here are
@@ -256,6 +288,10 @@ pub fn input(dir: &TempDir, dird_uid: u32, keyadm_uid: u32) -> DomainInput {
             staging: path(dir, "etc/provision-staging"),
             database: path(dir, "var/directory.redb"),
             integrity_key: path(dir, "etc/integrity.key"),
+            // Task PN12 (docs/59 §7.4): dird's attestation key and keyadm's
+            // copy.
+            attestation_key: path(dir, "etc/attestation.key"),
+            keyadm_attestation_key: path(dir, "etc/keyadm-attestation.key"),
             policy: path(dir, "etc/policy.store"),
             manifest: path(dir, "etc/provision.manifest"),
             audit_log: path(dir, "var/audit.log"),
@@ -282,15 +318,22 @@ pub fn input(dir: &TempDir, dird_uid: u32, keyadm_uid: u32) -> DomainInput {
         },
         network: Network {
             kdc_listen: vec!["127.0.0.1:88".to_owned()],
-            ldap_listen: Vec::new(),
+            // Task DN10c: the StartTLS listener on 389 the zone's
+            // `_ldap._tcp` needs (docs/questions/Q-1016 item 3, A-176 —
+            // ldap-front's own schema requires it since task DN10d, Q-1025
+            // item 3), and LDAPS beside it.
+            ldap_listen: vec!["127.0.0.1:389".to_owned()],
             ldaps_listen: vec!["127.0.0.1:636".to_owned()],
-            // The LDAPS listener (127.0.0.1) lies inside the internal
+            // The LDAP listeners (127.0.0.1) lie inside the internal
             // networks (docs/52 R14: ldap-front listens only there).
             internal_networks: vec!["10.0.0.0/8".to_owned(), "127.0.0.0/8".to_owned()],
             // Task K9: TCP 464 (docs/53 R53-3) and port 53 (docs/54 §4.3),
             // inside the internal networks.
             kpasswd_listen: vec!["127.0.0.1:464".to_owned()],
             dnsd_listen: vec!["127.0.0.1:53".to_owned()],
+            // Task DN10b: the DC's host record (docs/54 §3.1), inside the
+            // IPv4 internal network 10.0.0.0/8 (not loopback).
+            dc_addresses: vec!["10.0.0.10".to_owned()],
         },
         names: Names {
             tier0_ou: "Tier0".to_owned(),

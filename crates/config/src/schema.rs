@@ -10,6 +10,7 @@ use core::time::Duration;
 use crate::error::{Error, ErrorKind};
 use crate::format::{Document, Located};
 use crate::limits::Bound;
+use crate::standard_port::StandardPort;
 use crate::value::{self, is_internal, AbsolutePath, Network};
 
 /// Key: the uid the daemon drops to. Spec: docs/50 §6.1–§6.2 (R50-14), §7.1.
@@ -33,6 +34,11 @@ pub(crate) const DIRD_ADMIN_SOCKET: &str = "dird_admin_socket";
 /// docs/50 the channel-magic registry (`dird-kpasswd.sock | ipc-kpasswd |
 /// 0x4B50`); docs/questions/Q-955 item 13.
 pub(crate) const DIRD_KPASSWD_SOCKET: &str = "dird_kpasswd_socket";
+/// Key: path of `dird-dns.sock` — one spelling for dird's file (the server,
+/// task DN10a) and dnsd's (the client, task DN11). Spec: docs/54 §4.6;
+/// docs/50 the channel-magic registry (`dird-dns.sock | ipc-dns | 0x444E`);
+/// docs/questions/Q-619 items 4-5.
+pub(crate) const DIRD_DNS_SOCKET: &str = "dird_dns_socket";
 /// Key: path of `audit.sock`. Spec: docs/50 §3.1, §8.1 (R50-17).
 pub(crate) const AUDIT_SOCKET: &str = "audit_socket";
 /// Key: the uid auditd runs as (verified by its clients). Spec: docs/50 R50-3.
@@ -257,6 +263,34 @@ pub(crate) fn check_internal<const N: usize>(
     match outside {
         Some((line, key)) => Err(Error::at(line, key, ErrorKind::ListenerNotInternal)),
         None => Ok(()),
+    }
+}
+
+/// Every address of an advertised listener list is on its service's
+/// standard port — the one copy of the port, [`StandardPort`], which the SRV
+/// synthesis reads too; reported at the list's line. One rule for the four
+/// files whose listeners the zone advertises: the kdc's `listen`,
+/// ldap-front's `ldap_listen`, kpasswd-front's `listen` (task DN10c) and
+/// dnsd's `listen` — the name server the NS record names (task DN10d).
+/// Addresses stay configurable; only the port is fixed.
+/// Spec: RFC 4120 §7.2.3.2; [MS-ADTS] v20261026 §6.3.2.3; RFC 1035 §4.2;
+/// docs/54 §3.1; docs/questions/Q-1016 item 4 (A-176), Q-1024, Q-1025 item
+/// 1 (A-178).
+pub(crate) fn check_standard_port(
+    list: Option<&Located<Vec<SocketAddr>>>,
+    key: &'static str,
+    service: StandardPort,
+) -> Result<(), Error> {
+    match list {
+        Some(list)
+            if list
+                .value
+                .iter()
+                .any(|address| address.port() != service.number()) =>
+        {
+            Err(Error::at(list.line, key, ErrorKind::NonStandardPort))
+        }
+        _ => Ok(()),
     }
 }
 

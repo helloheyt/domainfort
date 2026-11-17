@@ -63,6 +63,8 @@ fn domain_args() -> Vec<String> {
         "61010",
         "--kdc-listen",
         "127.0.0.1:88",
+        "--ldap-listen",
+        "127.0.0.1:389",
         "--ldaps-listen",
         "127.0.0.1:636",
         "--kpasswd-listen",
@@ -73,11 +75,19 @@ fn domain_args() -> Vec<String> {
         "10.0.0.0/8",
         "--internal-network",
         "127.0.0.0/8",
+        "--dc-address",
+        "10.0.0.10",
     ];
     let paths = [
         ("--staging-dir", "/srv/p/etc/staging"),
         ("--database-path", "/srv/p/var/directory.redb"),
         ("--integrity-key-path", "/srv/p/etc/integrity.key"),
+        // Task PN12 (docs/59 §7.4): the attestation key's two files.
+        ("--attestation-key-path", "/srv/p/etc/attestation.key"),
+        (
+            "--keyadm-attestation-key-path",
+            "/srv/p/etc/keyadm-attestation.key",
+        ),
         ("--policy-path", "/srv/p/etc/policy.store"),
         ("--manifest-path", "/srv/p/etc/provision.manifest"),
         ("--audit-log-path", "/srv/p/var/audit.log"),
@@ -130,7 +140,10 @@ fn a_full_domain_command_parses() {
     assert_eq!(input.accounts.keyadm_uid, 61007);
     assert_eq!(input.paths.database.as_str(), "/srv/p/var/directory.redb");
     assert_eq!(input.network.kdc_listen, ["127.0.0.1:88"]);
-    assert!(input.network.ldap_listen.is_empty());
+    // Task DN10c (docs/questions/Q-1016 item 3, A-176): the StartTLS
+    // listener the zone's `_ldap._tcp` needs; LDAPS beside it.
+    assert_eq!(input.network.ldap_listen, ["127.0.0.1:389"]);
+    assert_eq!(input.network.ldaps_listen, ["127.0.0.1:636"]);
     // Task K9 (docs/53 §3.3, §5.2; docs/54 §4.3, §4.6): the change-password
     // service object's name, the two fronts' accounts, files, sockets and
     // listeners.
@@ -152,6 +165,31 @@ fn a_full_domain_command_parses() {
     );
     assert_eq!(input.network.kpasswd_listen, ["127.0.0.1:464"]);
     assert_eq!(input.network.dnsd_listen, ["127.0.0.1:53"]);
+    // Task DN10b: the DC's address (docs/54 §3.1, §10 row DN13).
+    assert_eq!(input.network.dc_addresses, ["10.0.0.10"]);
+}
+
+/// Task DN10b (docs/54 §10 row DN13; docs/questions/Q-1014): `--dc-address`
+/// is repeatable; given twice, both values are kept in order — and left out,
+/// the command line still parses (the rule "at least one" is the input's,
+/// with the flag's name, like the listeners').
+#[test]
+fn the_dc_address_flag_repeats() {
+    let mut args = domain_args();
+    args.push("--dc-address".to_owned());
+    args.push("10.0.0.11".to_owned());
+    let Ok(Command::Domain(input)) = parse(os(&args)) else {
+        panic!("parses");
+    };
+    assert_eq!(input.network.dc_addresses, ["10.0.0.10", "10.0.0.11"]);
+    let base = domain_args();
+    let i = base.iter().position(|a| a == "--dc-address").unwrap();
+    let mut without = base.clone();
+    without.drain(i..i + 2);
+    let Ok(Command::Domain(input)) = parse(os(&without)) else {
+        panic!("parses");
+    };
+    assert!(input.network.dc_addresses.is_empty());
 }
 
 /// Task K9: every new `domain` flag that has no default is required (an
@@ -168,6 +206,32 @@ fn the_k9_flags_are_required() {
         "--dird-kpasswd-socket",
         "--dird-dns-socket",
     ] {
+        let i = base.iter().position(|a| a == flag).unwrap();
+        let mut v = base.clone();
+        v.drain(i..i + 2);
+        assert!(usage(&v), "{flag}");
+    }
+}
+
+/// Task PN12 (docs/59 §7.4; docs/questions/Q-1039 item 1, A-183): the
+/// attestation key's two files — dird's and keyadm's copy — are paths on
+/// the command line (the key itself never is: the run draws it — D95), each
+/// required and parsed into the input.
+#[test]
+fn the_attestation_key_paths_are_required_flags() {
+    let Command::Domain(input) = parse(os(&domain_args())).unwrap() else {
+        panic!("not domain");
+    };
+    assert_eq!(
+        input.paths.attestation_key.as_str(),
+        "/srv/p/etc/attestation.key"
+    );
+    assert_eq!(
+        input.paths.keyadm_attestation_key.as_str(),
+        "/srv/p/etc/keyadm-attestation.key"
+    );
+    let base = domain_args();
+    for flag in ["--attestation-key-path", "--keyadm-attestation-key-path"] {
         let i = base.iter().position(|a| a == flag).unwrap();
         let mut v = base.clone();
         v.drain(i..i + 2);

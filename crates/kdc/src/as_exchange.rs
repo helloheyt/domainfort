@@ -23,7 +23,9 @@
 //! R6. the client account: source failure → KRB_ERR_GENERIC (fail closed,
 //!     decision 3), source unreachable → KDC_ERR_SVC_UNAVAILABLE (7.5.9;
 //!     docs/50 §3.7, A-56); unknown → KDC_ERR_C_PRINCIPAL_UNKNOWN (3.1.3;
-//!     user enumeration is a documented residual, decision 5);
+//!     user enumeration is a documented residual, decision 5); a record
+//!     whose resolution names a key set that is no client's (not
+//!     `PrincipalLongterm`) → KRB_ERR_GENERIC (inconsistent, fail closed);
 //! R7. disabled / locked / expired → KDC_ERR_CLIENT_REVOKED, checked BEFORE
 //!     pre-authentication so that a locked or disabled account is never a
 //!     password-guessing oracle and keyd is never asked for it;
@@ -91,8 +93,9 @@
 //! A8a. `kadmin/changepw` only (docs/53 §5.2): the client must be a user
 //!     account (R53-1: a computer, and so every service object, R47-13 →
 //!     KDC_ERR_POLICY); the service object (unknown →
-//!     KDC_ERR_S_PRINCIPAL_UNKNOWN; key set not ChangePasswordService →
-//!     KRB_ERR_GENERIC; disabled / locked / expired →
+//!     KDC_ERR_S_PRINCIPAL_UNKNOWN; not resolved by dird to the
+//!     change-password service's key set → KRB_ERR_GENERIC — the kind from
+//!     the resolution, task PN11, Q-1009 item 4; disabled / locked / expired →
 //!     KDC_ERR_SERVICE_REVOKED); a session-key type both the client offers
 //!     and the service accepts (RFC 4120 3.1.3; none → KDC_ERR_ETYPE_NOSUPP)
 //!     — all before pre-authentication and keyd;
@@ -117,6 +120,18 @@
 //!     the requested sname (no canonicalisation, [MS-KILE] 3.3.5.1.2);
 //! A14. the AS-REP: padata = [PA-FX-FAST(enc-fast-rep)] only, crealm / cname
 //!     of the inner request (5.4.3, 5.4.5).
+//!
+//! **dird's resolutions go to keyd** (task PN11; docs/59 §7.2, §7.5): every
+//! `issue_as_rep` carries the client record's attested resolution and, for
+//! `kadmin/changepw`, the service record's — as dird sent them; keyd binds
+//! the client key and the change-password service's key only through them,
+//! so the KDC cannot choose which key set a name maps to. The TGT's krbtgt
+//! takes none (the canonical `krbtgt/<REALM>`, [MS-KILE] 3.3.5.1.2) and
+//! goes by its handle. Since task PN11b the KDC names those two key sets to
+//! `issue_as_rep` only by their resolutions — no handle beside them, no
+//! client in the template (docs/questions/Q-1067); `verify_preauth` still
+//! takes the client record's handle, which keyd binds its proof to and
+//! checks against the resolution at issuance (docs/questions/Q-1080).
 //!
 //! Every keyd call above (`open_fast_armor`, `verify_preauth`,
 //! `issue_as_rep`) that keyd does not serve — the `Unavailable` variant: its
@@ -146,14 +161,14 @@ use crate::kdc::{
 };
 use crate::krb_error::{advertise, etype_info2, fast_required_e_data, preauth_required_e_data};
 use crate::lifetime::{check_starttime, plan, LifetimeRequest, Limits};
-use crate::names::{classify_server, same_realm, ServerNameKind};
+use crate::names::{classify_server, resolved_server_kind, same_realm, ServerNameKind};
 use crate::options::{asks_unsupported_operation, delegation_flags, FlagRequests};
 use crate::time::seconds;
 use crate::transport::Peer;
 use core::time::Duration;
 use keyd_types::{
-    ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof, EncTypeId, KeyCustody,
-    KeyPurpose, CHANGE_PASSWORD_TICKET_MAX_LIFETIME_SECS,
+    ArmorId, AsRepParts, AsServerKeySet, AsTicketTemplate, AuthnError, AuthnProof, EncTypeId,
+    KeyCustody, KeyPurpose, CHANGE_PASSWORD_TICKET_MAX_LIFETIME_SECS,
 };
 use krb_proto::constants::{
     FX_FAST_ARMOR_AP_REQUEST, KDC_ERR_BADOPTION, KDC_ERR_CLIENT_REVOKED,
@@ -469,7 +484,11 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
             }
             Ok(Some(account)) => account,
         };
-        if account.key.purpose != KeyPurpose::PrincipalLongterm {
+        // A client record names a PrincipalLongterm key set — once, in
+        // dird's resolution (task PN10c; docs/59 §7.1); anything else is an
+        // inconsistent record (fail closed; keyd binds the key set only
+        // through that resolution, docs/59 §7.2 step 4).
+        if account.key().purpose != KeyPurpose::PrincipalLongterm {
             return Err(internal(AuditReason::AccountRecordInvalid));
         }
         if !account.state.usable_at(now) {
@@ -557,7 +576,7 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
         }
         let proof = self
             .custody
-            .verify_preauth(&checked.account.key, timestamp, None, now)
+            .verify_preauth(&checked.account.key(), timestamp, None, now)
             .map_err(preauth_refusal)?;
 
         // U5-U6. The PDP (armored = false), times, keyd issues.
@@ -680,7 +699,7 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
         // A10. keyd verifies the encrypted challenge under the armor.
         let proof = self
             .custody
-            .verify_preauth(&checked.account.key, challenge, Some(armor_id), now)
+            .verify_preauth(&checked.account.key(), challenge, Some(armor_id), now)
             .map_err(|error| challenge_refusal(error, etype_info))?;
 
         // A11-A13. The PDP (armored = true), times, keyd issues under the
@@ -834,7 +853,6 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
             .clone()
             .ok_or_else(|| internal(AuditReason::InternalFailure))?;
         let template = AsTicketTemplate {
-            client: account.key.principal,
             crealm: body.realm.clone(),
             cname,
             sname: local_tgs_name(&self.config.realm)?,
@@ -845,19 +863,31 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
             session_enctype,
             nonce: body.nonce,
         };
+        // The client's resolution as dird sent it — the call's only name of
+        // the client's key set (tasks PN11, PN11b); the krbtgt has none and
+        // goes by its handle (docs/59 §7.2).
         let krbtgt = self.config.krbtgt;
         self.custody
-            .issue_as_rep(&account.key, &krbtgt, proof, armor, &template, now)
+            .issue_as_rep(
+                &account.resolution,
+                AsServerKeySet::LocalTgt(&krbtgt),
+                proof,
+                armor,
+                &template,
+                now,
+            )
             .map_err(issue_refusal)
     }
 
     /// A8a (module docs): what an armored AS for `kadmin/changepw` needs
     /// before pre-authentication — the client is a user account (docs/53
     /// R53-1: users only; a computer account, and so every service object,
-    /// R47-13, is refused); the service object exists, its key set is the
-    /// change-password service's (the one derivation,
-    /// `KeyPurpose::of_service_name`, R2b) and it is usable; and a
-    /// session-key type both the client offers and the service accepts.
+    /// R47-13, is refused); the service object exists, dird resolved the
+    /// name to the change-password service's key set (the kind from the
+    /// resolution's purpose, never the request's spelling — task PN11,
+    /// Q-1009 item 4; the record's one statement of its key set, task
+    /// PN10c), and it is usable; and a session-key type both the client
+    /// offers and the service accepts.
     /// Every refusal here is armored (sealed by the caller).
     /// Spec: docs/53 R53-1, §5.2; RFC 4120 3.1.3 ("looks up the client and
     /// server principals"; "information from the Kerberos database
@@ -891,9 +921,8 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
             }
             Ok(Some(service)) => service,
         };
-        if service.key.purpose != KeyPurpose::ChangePasswordService
-            || service.key.purpose != KeyPurpose::of_service_name(sname)
-        {
+        let kind = resolved_server_kind(service.resolution.resolution().key_purpose());
+        if kind != Some(ServerNameKind::ChangePassword) {
             return Err(internal(AuditReason::AccountRecordInvalid));
         }
         if !service.state.usable_at(now) {
@@ -1006,7 +1035,6 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
             .clone()
             .ok_or_else(|| internal(AuditReason::InternalFailure))?;
         let template = AsTicketTemplate {
-            client: account.key.principal,
             crealm: body.realm.clone(),
             cname,
             sname,
@@ -1017,10 +1045,14 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
             session_enctype: target.session_enctype,
             nonce: body.nonce,
         };
+        // Both resolutions as dird sent them: the client's and the
+        // change-password service's — the call's only names of the two key
+        // sets; keyd looks each set up by its own and binds it only through
+        // it (tasks PN11, PN11b; docs/59 §7.2).
         self.custody
             .issue_as_rep(
-                &account.key,
-                &target.service.key,
+                &account.resolution,
+                AsServerKeySet::ChangePasswordService(&target.service.resolution),
                 proof,
                 Some(target.armor),
                 &template,

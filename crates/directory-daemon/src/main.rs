@@ -1,17 +1,22 @@
 #![forbid(unsafe_code)]
 //! The dird binary: `directory-daemon <configuration file>` — the
 //! directory-view service (task P8), the LDAP service (task P10) and, when
-//! configured, the admin service (task A8, docs/51 §7) and the kpasswd
-//! service beside it (task K7, docs/53 §5.6).
+//! configured, the admin service (task A8, docs/51 §7), the kpasswd
+//! service beside it (task K7, docs/53 §5.6) and the DNS service (task
+//! DN10a, docs/54 §4.6).
 //!
 //! The start-up order (docs/50 R50-14, §6.2, §7.5; crates/daemon-sandbox):
 //!
 //! 1. claim the single-thread proof — the first statement of `main`;
 //! 2. read the configuration path from argv and parse it;
-//! 3. as root: read the development integrity key and the development
-//!    policy (both root-owned files, read before the drop), the provisioning
-//!    manifest when the admin channel is configured (root-owned, docs/51
-//!    §4.3 step 8), and prepare the socket directories;
+//! 3. as root: read the name-resolution attestation key (task PN10 — a
+//!    root-owned 0400 file named by `attestation_key_path`, which the
+//!    configuration schema requires (task PN12); unreadable ⇒ no start,
+//!    docs/59 §7.4), the development integrity key and the
+//!    development policy (both root-owned files, read before the drop), the
+//!    provisioning manifest when the admin channel is configured
+//!    (root-owned, docs/51 §4.3 step 8), and prepare the socket
+//!    directories;
 //! 4. apply the hardening plan while the process has exactly one thread;
 //! 5. only then build the tokio runtime, and serve (auditd first, then the
 //!    directory, then the socket).
@@ -20,14 +25,15 @@
 //! Messages are fixed texts on stderr (docs/50 §8.2); the key never appears.
 //!
 //! Spec: docs/50 R50-2, R50-14, R50-16, §6.2, §7.2, §7.4, §7.5, §8.2;
-//! docs/questions/Q-213, Q-219 (A-57), Q-235 (A-61), Q-270.
+//! docs/questions/Q-213, Q-219 (A-57), Q-235 (A-61), Q-270; docs/59 §7.4;
+//! docs/questions/Q-1046.
 
 use daemon_sandbox::{apply, SingleThreadProof};
 use directory_daemon::log::{note, Note};
 use directory_daemon::startup::{
-    admin_params, hardening_plan, kpasswd_params, params, prepare_policy_next_directory,
-    prepare_socket_directory, read_integrity_key, read_policy, read_provision_manifest,
-    read_settings,
+    admin_params, attestation_key_path, dns_params, hardening_plan, kpasswd_params, params,
+    prepare_policy_next_directory, prepare_socket_directory, read_attestation_key,
+    read_integrity_key, read_policy, read_provision_manifest, read_settings,
 };
 use directory_daemon::{serve_with_services, DaemonControl, StoreSource};
 use std::io::Write;
@@ -82,9 +88,22 @@ fn main() -> ExitCode {
         Ok(settings) => settings,
         Err(error) => return fail("configuration", &error),
     };
-    let params = match params(&settings) {
+    // Task PN10: dird's name-resolution attestation key, as root before the
+    // drop (docs/59 §7.4) — not readable ⇒ no start. Not configured is not
+    // reachable here: the schema requires the key, so `read_settings`
+    // already refused such a file (task PN12; docs/questions/Q-1055 item 9).
+    let attestation_key = match read_attestation_key(attestation_key_path(&settings), ROOT_UID) {
+        Ok(key) => key,
+        Err(error) => return fail("attestation key", &error),
+    };
+    let params = match params(&settings, attestation_key) {
         Ok(params) => params,
         Err(error) => return fail("configuration", &error),
+    };
+    // Task DN10a: the DNS service, when its channel is configured.
+    let dns = match dns_params(&settings) {
+        Ok(dns) => dns,
+        Err(error) => return fail("DNS service", &error),
     };
 
     // 3. As root, before the drop: the development key and policy, the
@@ -149,7 +168,7 @@ fn main() -> ExitCode {
     // channel is configured.
     let kpasswd = kpasswd_params(&settings);
     let result = runtime.block_on(serve_with_services(
-        params, admin, kpasswd, source, policy, control,
+        params, admin, kpasswd, dns, source, policy, control,
     ));
     drop(runtime);
     match result {

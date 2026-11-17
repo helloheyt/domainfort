@@ -17,15 +17,18 @@
 //! exactly its three fixed-width counters (decision A-88 appended the
 //! third, `unrecorded_outcomes`; docs/questions/Q-395): 2 + 3 × 8 octets,
 //! the counters in their declared order. A `DirAdmin` refusal or failure
-//! code is one of its closed table's (A-91 appended three; Q-397).
+//! code is one of its closed table's (A-91 appended three; Q-397). A
+//! `ZoneSerial` event (task DN10b) never carries SERIAL 0.
 //!
 //! Spec: docs/50 §3.3, §8.1, §8.2; docs/51 §5.7; docs/questions/Q-340,
-//! Q-341, Q-346 (A-86), Q-365, Q-366 (A-88), Q-388 (A-91), Q-395, Q-397.
+//! Q-341, Q-346 (A-86), Q-365, Q-366 (A-88), Q-388 (A-91), Q-395, Q-397,
+//! Q-1013; RFC 2136 §7.11.
 
 use ipc_audit::{
     decode_event, encode_event, peek_shape, AdminFailure, AdminRefusal, AdmindActivity, AuditText,
     DecisionResult, DirAdminStage, EventBody, KeydOutcome, OutcomeResult, Principal,
-    MAX_APPROVERS, MAX_REPORTED_KVNOS, MAX_TARGET_NAMES, MAX_TEXT_OCTETS,
+    ZoneSerialOutcome, ZoneSerialStage, MAX_APPROVERS, MAX_REPORTED_KVNOS, MAX_TARGET_NAMES,
+    MAX_TEXT_OCTETS,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -105,6 +108,21 @@ fuzz_target!(|data: &[u8]| {
             assert_eq!(&data[2..10], &summary.suppressed_noise.to_be_bytes()[..]);
             assert_eq!(&data[10..18], &summary.refused_gating.to_be_bytes()[..]);
             assert_eq!(&data[18..26], &summary.unrecorded_outcomes.to_be_bytes()[..]);
+        }
+        EventBody::ZoneSerial(zone) => {
+            // No SERIAL 0 survives decoding (RFC 2136 §7.11; task DN10b,
+            // docs/questions/Q-1013); the failure table is closed (4 codes).
+            assert_ne!(zone.from.get(), 0);
+            match zone.stage {
+                ZoneSerialStage::Outcome(ZoneSerialOutcome::Advanced { serial }) => {
+                    assert_ne!(serial.get(), 0);
+                }
+                ZoneSerialStage::Outcome(ZoneSerialOutcome::Failed(failure)) => {
+                    assert!((1..=4).contains(&failure.code()));
+                }
+                ZoneSerialStage::Decision
+                | ZoneSerialStage::Outcome(ZoneSerialOutcome::NotNeeded) => {}
+            }
         }
     }
 });

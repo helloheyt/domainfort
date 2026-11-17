@@ -25,8 +25,9 @@ use ipc::{
 use ipc_keyd::channel::{reply_kind, request_kind, MAX_ENCTYPES, MAX_REPLY_BODY, MAX_REPLY_FIELD};
 use ipc_keyd::wire::WireConfigDescription;
 use ipc_keyd::{
-    decode_request, encode_answer, Answer, Call, DescribedConfig, IssuanceCall, KeydReply,
-    KeydRequest, Rejection, RoutedCall, StateCall, KEYD_CHANNEL, KEYD_MAGIC, KEYD_VERSION,
+    decode_request, encode_answer, Answer, AsServerArgument, Call, DescribedConfig, IssuanceCall,
+    KeydReply, KeydRequest, Rejection, RoutedCall, StateCall, KEYD_CHANNEL, KEYD_MAGIC,
+    KEYD_VERSION,
 };
 use keyd_types::{EncTypeId, Operation, Role, TicketPolicy};
 use std::collections::BTreeSet;
@@ -109,12 +110,13 @@ fn kind_tables_are_as_documented() {
     // `list_destroy_decisions` appended by A-102 (docs/52 §4.6); 0x15
     // `verify_operation_ticket` appended by Q-523; 0x16-0x18 the three
     // change-password operations, appended by task K4 (docs/53 §5.5); 0x19
-    // `revoke_decision`, appended by task F3 (docs/questions/Q-976).
-    assert_eq!(request_kind::ALL, (0x01..=0x19).collect::<Vec<u8>>());
+    // `revoke_decision`, appended by task F3 (docs/questions/Q-976); 0x1A
+    // `install_attestation_key`, appended by task PN9 (docs/59 §7.5).
+    assert_eq!(request_kind::ALL, (0x01..=0x1A).collect::<Vec<u8>>());
     for (request, reply) in request_kind::ALL.iter().zip(reply_kind::ALL) {
         assert_eq!(*reply, 0x80 | request);
     }
-    assert_eq!(&reply_kind::ALL[25..], &[0xF1, 0xF2, 0xF3]);
+    assert_eq!(&reply_kind::ALL[26..], &[0xF1, 0xF2, 0xF3]);
     assert!(!request_kind::ALL.contains(&REFUSED_KIND));
     assert!(!reply_kind::ALL.contains(&REFUSED_KIND));
     let body = request_body(&Call::Ping);
@@ -166,6 +168,7 @@ fn is_refusal(answer: &Answer) -> bool {
             | Answer::CompleteChangePassword(Ok(_))
             | Answer::SealChangePasswordError(Ok(_))
             | Answer::RevokeDecision(Ok(_))
+            | Answer::InstallAttestationKey(Ok(_))
     )
 }
 
@@ -460,11 +463,13 @@ fn code_identifiers(source: &str) -> Vec<String> {
 ///   field names a role in the whole file, `pub caller_role: Role`, and it
 ///   is `WireConfigDescription`'s;
 ///
-/// and every time field encoded is a ticket fact or a template time — never
-/// a value handed to keyd as its `now`. The type-level argument: `dispatch`
-/// and `execute` take `now` as a parameter and build every keyd call from
-/// it; `Call` (what a request decodes to) has no time field outside
-/// templates, proofs and contexts, and no role field at all.
+/// and every time field encoded is a ticket fact or a template time — or
+/// the issue time of dird's attested name resolution (task PN11), a fact
+/// keyd judges against its own clock (docs/59 §7.2 step 3) — never a value
+/// handed to keyd as its `now`. The type-level argument: `dispatch` and
+/// `execute` take `now` as a parameter and build every keyd call from it;
+/// `Call` (what a request decodes to) has no time field outside templates,
+/// proofs, contexts and resolutions, and no role field at all.
 #[test]
 fn no_now_on_the_wire_and_no_role_in_any_request() {
     let wire = include_str!("../src/wire.rs");
@@ -519,6 +524,9 @@ fn no_now_on_the_wire_and_no_role_in_any_request() {
         "endtime",
         "renew_till",
         "armor_authtime",
+        // dird's issue time of a name resolution (task PN11): keyd checks it
+        // against its own `now` (R50-5 holds — docs/59 §7.2 step 3).
+        "issued_at",
     ];
     let mut time_fields = BTreeSet::new();
     for line in wire.lines() {
@@ -689,9 +697,10 @@ fn an_unknown_ping_caller_role_is_refused() {
 /// §3.10 (c); Q-466 item 3 (A-102: "state calls only through call_with_fate
 /// by type"): for every call of every operation (tests/samples), the split
 /// follows keyd's one table — `keyd_types::authz::requires_acknowledged_intent`,
-/// the table keyd-daemon's classification reads — and the expected nine
-/// operations (the eight of R9, and the change-password completion of task
-/// K4) are exactly the state calls: an `IssuanceCall` (the only
+/// the table keyd-daemon's classification reads — and the expected ten
+/// operations (the eight of R9, the change-password completion of task K4
+/// and the attestation key's install of task PN9) are exactly the state
+/// calls: an `IssuanceCall` (the only
 /// argument `KeydClient::call` takes) can be made of every other call and
 /// of none of these, a `StateCall` of these and of no other.
 #[test]
@@ -706,6 +715,7 @@ fn the_state_calls_are_keyds_table_and_never_issuance_calls() {
         Operation::GrantSetSecret,
         Operation::RegisterDecision,
         Operation::CompleteChangePassword,
+        Operation::InstallAttestationKey,
     ];
     for operation in Operation::ALL {
         assert_eq!(
@@ -1056,4 +1066,455 @@ fn the_destroy_page_is_bounded() {
         samples::destruction_page(1, 65, None)
     )))
     .is_err());
+}
+
+// ---- the attestation key's install (task PN9) ----------------------------------------
+
+/// Task PN9 (docs/59 §7.5; docs/50 §3.3 — strict, bounded, one encoding per
+/// value): `install_attestation_key` is kind `0x1A`, then the key as
+/// `secret bytes<32>` — the length field always 32, then exactly 32
+/// octets, nothing else. A length of 31 or 33 (with that many octets), a
+/// length of 32 with 31 octets, a trailing octet, and the all-zero key are
+/// all refused `Malformed` — never decoded, never handed to keyd; a key of
+/// another length cannot be carried at all.
+#[test]
+fn the_attestation_key_request_is_strict() {
+    let body = request_body(&Call::InstallAttestationKey {
+        key: samples::attestation_key(),
+    });
+    let mut expected = vec![0x4B, 0x44, 0x01, request_kind::INSTALL_ATTESTATION_KEY];
+    expected.extend_from_slice(&32u32.to_be_bytes());
+    expected.extend_from_slice(&samples::ATTESTATION_KEY);
+    assert_eq!(body, expected);
+    let Ok(Call::InstallAttestationKey { key }) = decode_request(&body) else {
+        panic!("decodes as the install");
+    };
+    assert_eq!(key.expose(), &samples::ATTESTATION_KEY);
+
+    let with = |length: u32, octets: &[u8]| {
+        let mut body = vec![0x4B, 0x44, 0x01, request_kind::INSTALL_ATTESTATION_KEY];
+        body.extend_from_slice(&length.to_be_bytes());
+        body.extend_from_slice(octets);
+        body
+    };
+    let mut trailing = body.clone();
+    trailing.push(0);
+    for bad in [
+        with(31, &[0x6B; 31]),
+        with(33, &[0x6B; 33]),
+        with(32, &[0x6B; 31]),
+        with(0, &[]),
+        with(u32::MAX, &[0x6B; 32]),
+        trailing,
+        body[..body.len() - 1].to_vec(),
+    ] {
+        assert_eq!(
+            refusal_of(&bad),
+            Some(Refused::Malformed),
+            "{} octets",
+            bad.len()
+        );
+    }
+    // The all-zero key: a well-formed field, refused by the typed layer.
+    let zero = with(32, &[0u8; 32]);
+    assert!(matches!(
+        decode_request(&zero),
+        Err(Rejection::Value(ipc_keyd::ConversionError::AttestationKey))
+    ));
+    assert_eq!(refusal_of(&zero), Some(Refused::Malformed));
+    // The carrier holds exactly 32 octets, never all zero.
+    for octets in [&[0x6B; 31][..], &[0x6B; 33][..], &[][..], &[0u8; 32][..]] {
+        assert!(ipc_keyd::AttestationKeyOctets::from_slice(octets).is_none());
+    }
+    // Encoding a wire request whose key is not 32 octets is refused.
+    for length in [0usize, 31, 33] {
+        let request =
+            KeydRequest::InstallAttestationKey(ipc_keyd::wire::InstallAttestationKeyRequest {
+                key: ipc::Secret::from_slice(&vec![0x6B; length]),
+            });
+        assert!(encode_frame(KEYD_CHANNEL, Direction::Request, &request).is_err());
+    }
+    // The reply: kind 0x9A, no payload; a failure is `Error` (0xF3).
+    let ok = reply_body(&Answer::InstallAttestationKey(Ok(())));
+    assert_eq!(
+        ok,
+        vec![0x4B, 0x44, 0x01, reply_kind::INSTALL_ATTESTATION_KEY]
+    );
+    assert_eq!(reply_kind::INSTALL_ATTESTATION_KEY, 0x9A);
+}
+
+/// docs/50 §8.2 ("secret-bearing types without a Debug that prints
+/// content"), §3.3; docs/CLEAN-ROOM.md; docs/59 §7.4 (the key is never exported):
+/// neither the typed call, the wire request, nor the request decoded on the
+/// server shows the attestation key's octets in any rendering — each says
+/// it is redacted.
+#[test]
+fn the_attestation_key_never_shows_in_debug() {
+    let call = Call::InstallAttestationKey {
+        key: samples::attestation_key(),
+    };
+    let wire = call.to_wire().unwrap();
+    let decoded = decode_request(&request_body(&call)).unwrap();
+    for text in [
+        format!("{call:?}"),
+        format!("{wire:?}"),
+        format!("{decoded:?}"),
+        format!("{call:#?}"),
+        format!("{wire:#?}"),
+    ] {
+        assert!(!text.contains("107"), "{text}");
+        assert!(!text.contains("6b") && !text.contains("6B"), "{text}");
+        assert!(text.contains("redacted"), "{text}");
+    }
+}
+
+// ---- dird's attested name resolutions (tasks PN11, PN11b; docs/59 §7.5) -----
+
+/// The `issue_tgs_rep` call of the samples (with its service resolution).
+fn tgs_call() -> Call {
+    samples::calls()
+        .into_iter()
+        .find(|c| matches!(c, Call::IssueTgsRep { .. }))
+        .unwrap()
+}
+
+/// The armored `issue_as_rep` sample for the change-password service (both
+/// key sets by their resolutions).
+fn as_call() -> Call {
+    samples::calls()
+        .into_iter()
+        .find(|c| {
+            matches!(
+                c,
+                Call::IssueAsRep {
+                    server: AsServerArgument::ChangePasswordService(_),
+                    ..
+                }
+            )
+        })
+        .unwrap()
+}
+
+/// The unarmored `issue_as_rep` sample for a TGT (the krbtgt by its handle).
+fn tgt_call() -> Call {
+    samples::calls()
+        .into_iter()
+        .find(|c| {
+            matches!(
+                c,
+                Call::IssueAsRep {
+                    server: AsServerArgument::LocalTgt(_),
+                    armor: None,
+                    ..
+                }
+            )
+        })
+        .unwrap()
+}
+
+/// docs/59 §7.1, §7.5: the resolutions cross the channel unchanged — every
+/// field and the tag (which this layer carries, never checks: keyd verifies
+/// it, §7.2 step 1); the AS request carries the client's and, for the
+/// change-password service, the service's in place of its handle (task
+/// PN11b); a TGT's request carries the krbtgt's handle and no server
+/// resolution.
+#[test]
+fn the_resolutions_cross_the_channel_unchanged() {
+    for call in [as_call(), tgs_call()] {
+        let decoded = decode_request(&request_body(&call)).unwrap();
+        let pairs = match (&call, &decoded) {
+            (
+                Call::IssueAsRep {
+                    client: a,
+                    server: AsServerArgument::ChangePasswordService(b),
+                    ..
+                },
+                Call::IssueAsRep {
+                    client: x,
+                    server: AsServerArgument::ChangePasswordService(y),
+                    ..
+                },
+            ) => vec![(a, x), (b, y)],
+            (Call::IssueTgsRep { service: a, .. }, Call::IssueTgsRep { service: x, .. }) => {
+                vec![(a, x)]
+            }
+            _ => panic!("the same operation"),
+        };
+        for (sent, received) in pairs {
+            assert_eq!(sent.resolution(), received.resolution());
+            assert_eq!(sent.tag(), received.tag());
+        }
+    }
+    let Ok(Call::IssueAsRep {
+        server: AsServerArgument::LocalTgt(krbtgt),
+        ..
+    }) = decode_request(&request_body(&tgt_call()))
+    else {
+        panic!("a TGT's request keeps its krbtgt handle");
+    };
+    assert_eq!(krbtgt, samples::KRBTGT);
+}
+
+/// The fields of `payload` as the channel encodes them (no envelope).
+fn payload_octets(payload: &impl ipc::Payload) -> Vec<u8> {
+    let mut writer = ipc::Writer::new(ipc_keyd::REQUEST_LIMIT);
+    payload.write_fields(&mut writer).unwrap();
+    writer.into_payload().to_vec()
+}
+
+/// The octets of `resolution` as the channel encodes it (its fields, no
+/// envelope).
+fn resolution_octets(resolution: &ipc_keyd::wire::WireNameResolution) -> usize {
+    payload_octets(resolution).len()
+}
+
+/// A `KeyHandle` in the channel's encoding — `PrincipalId` (16 octets) ‖
+/// purpose `u8` (the closed table of crate ipc-keyd `wire`: 1
+/// PrincipalLongterm … 5 ChangePasswordService) — as the layouts before
+/// task PN11b carried it. Spec: docs/50 §3.3 (keyd types row).
+fn handle_octets(principal: u8, purpose_code: u8) -> Vec<u8> {
+    let mut octets = vec![principal; 16];
+    octets.push(purpose_code);
+    octets
+}
+
+/// docs/50 §3.3 (exact version, strict, bounded, no trailing octet — "a
+/// mismatched pair fails closed"); docs/59 §7.5; task PN11b
+/// (docs/questions/Q-1067): a request in a layout before task PN11b is
+/// refused (`Malformed`), never misread — the PN11 layouts (the client's
+/// and the server's handles before the proof, the template's client
+/// principal, the change-password service's resolution behind an option
+/// marker; the service's handle before the TGS context) and the layouts
+/// before PN11 (the same without the resolutions), each built from this
+/// layout's fields with the samples' handles and with made-up ones of every
+/// purpose code; so is a request of this layout cut short, or followed by
+/// an extra octet. `KEYD_VERSION` stays 1.
+#[test]
+fn a_request_of_an_old_layout_is_refused_not_misread() {
+    let header = |kind: u8| vec![0x4B, 0x44, 0x01, kind];
+    let handles: Vec<(u8, u8)> = [(0xA1, 1), (0x7B, 2), (0x5E, 3), (0x00, 4), (0xFF, 5)]
+        .into_iter()
+        .collect();
+    let mut old_layouts = Vec::new();
+    for call in [as_call(), tgt_call()] {
+        let Ok(KeydRequest::IssueAsRep(wire)) = call.to_wire() else {
+            panic!("the AS request");
+        };
+        let server_resolution = match &wire.server {
+            ipc_keyd::wire::WireAsServer::ChangePasswordService(resolution) => {
+                Some(payload_octets(resolution.as_ref()))
+            }
+            ipc_keyd::wire::WireAsServer::LocalTgt(_) => None,
+        };
+        for &(octet, code) in &handles {
+            // client handle ‖ server handle ‖ proof ‖ armor? ‖ client
+            // principal ‖ the template's other fields …
+            let mut pre_pn11 = header(request_kind::ISSUE_AS_REP);
+            pre_pn11.extend(handle_octets(octet, 1));
+            pre_pn11.extend(handle_octets(octet ^ 0x0F, code));
+            pre_pn11.extend(payload_octets(&wire.proof));
+            match &wire.armor {
+                Some(armor) => {
+                    pre_pn11.push(1);
+                    pre_pn11.extend(armor.as_bytes());
+                }
+                None => pre_pn11.push(0),
+            }
+            pre_pn11.extend([octet; 16]);
+            pre_pn11.extend(payload_octets(&wire.template));
+            // … ‖ the client's resolution ‖ option(the server's).
+            let mut pn11 = pre_pn11.clone();
+            pn11.extend(payload_octets(wire.client_resolution.as_ref()));
+            match &server_resolution {
+                Some(octets) => {
+                    pn11.push(1);
+                    pn11.extend(octets);
+                }
+                None => pn11.push(0),
+            }
+            old_layouts.push(pre_pn11);
+            old_layouts.push(pn11);
+        }
+    }
+    let Ok(KeydRequest::IssueTgsRep(wire)) = tgs_call().to_wire() else {
+        panic!("the TGS request");
+    };
+    for &(octet, code) in &handles {
+        // service handle ‖ ctx ‖ template (‖ the service's resolution).
+        let mut pre_pn11 = header(request_kind::ISSUE_TGS_REP);
+        pre_pn11.extend(handle_octets(octet, code));
+        pre_pn11.extend(wire.ctx.as_bytes());
+        pre_pn11.extend(payload_octets(&wire.template));
+        let mut pn11 = pre_pn11.clone();
+        pn11.extend(payload_octets(wire.service_resolution.as_ref()));
+        old_layouts.push(pre_pn11);
+        old_layouts.push(pn11);
+    }
+    assert_eq!(old_layouts.len(), 30);
+    for (index, old) in old_layouts.iter().enumerate() {
+        assert_eq!(
+            refusal_of(old),
+            Some(Refused::Malformed),
+            "old layout {index}"
+        );
+    }
+    // This layout decodes (the control), and a cut or extended one does not.
+    for call in [as_call(), tgt_call(), tgs_call()] {
+        let body = request_body(&call);
+        assert!(decode_request(&body).is_ok());
+        for cut in 1..=64 {
+            let short = &body[..body.len() - cut];
+            assert_eq!(refusal_of(short), Some(Refused::Malformed), "cut {cut}");
+        }
+        let mut trailing = body.clone();
+        trailing.push(0);
+        assert_eq!(refusal_of(&trailing), Some(Refused::Malformed));
+    }
+}
+
+/// Task PN11b (docs/50 §3.3: enum = `u8` from a closed table): the server
+/// of `issue_as_rep` is one closed choice — code 1 the krbtgt's handle,
+/// code 2 the change-password service's resolution; another code is
+/// refused (`Malformed`), and so is a code followed by the other variant's
+/// field (a handle where a resolution belongs, or the reverse), so a server
+/// named both ways, or by neither, has no encoding.
+#[test]
+fn the_as_server_is_one_closed_choice() {
+    for call in [as_call(), tgt_call()] {
+        let body = request_body(&call);
+        let Ok(KeydRequest::IssueAsRep(wire)) = call.to_wire() else {
+            panic!("the AS request");
+        };
+        let server = payload_octets(&wire.server);
+        let start = body.len() - server.len();
+        assert_eq!(&body[start..], server.as_slice());
+        for code in [0u8, 3, 0x80, 0xFF] {
+            let mut other = body.clone();
+            other[start] = code;
+            assert_eq!(refusal_of(&other), Some(Refused::Malformed), "code {code}");
+        }
+        // The other variant's code before this variant's field.
+        let mut swapped = body.clone();
+        swapped[start] = if body[start] == 1 { 2 } else { 1 };
+        assert_eq!(refusal_of(&swapped), Some(Refused::Malformed));
+    }
+}
+
+/// docs/59 §7.1 (the bounds: 1..=16 components, each and every realm at
+/// most 1024 octets): a resolution outside them is refused by the typed
+/// layer (`ConversionError::NameResolution` ⇒ `Malformed`) — here a
+/// canonical name with one component of 1025 octets (within the DER bound,
+/// outside the component bound; 17 components krb-proto itself never
+/// encodes or decodes); and the wire bounds are exactly the
+/// largest resolution keyd-types admits (a realm of 1025 octets is refused
+/// at the codec; the largest name and realm fit, and the largest request —
+/// an armored change-password AS whose two resolutions are the largest,
+/// task PN11b's layout — fits in one request body: docs/questions/Q-1081).
+#[test]
+fn the_resolution_bounds_are_the_resolutions() {
+    use ipc_keyd::channel::{
+        LARGEST_RESOLUTION, MAX_KDC_PART_BODY, MAX_REQUEST_BODY, MAX_RESOLUTION_NAME,
+        MAX_RESOLUTION_REALM,
+    };
+    assert_eq!(MAX_RESOLUTION_REALM, 1024);
+    assert_eq!(MAX_RESOLUTION_NAME, 16_468);
+    assert_eq!(LARGEST_RESOLUTION, 35_064);
+    assert_eq!(MAX_KDC_PART_BODY, 80 * 1024);
+    assert_eq!(MAX_REQUEST_BODY, 149 * 1024);
+    assert!(MAX_KDC_PART_BODY as usize + 2 * LARGEST_RESOLUTION < MAX_REQUEST_BODY as usize);
+
+    let Ok(KeydRequest::IssueTgsRep(mut wire)) = tgs_call().to_wire() else {
+        panic!("the TGS request");
+    };
+    // One component of 1025 octets: well-formed DER within the field's
+    // bound, outside a resolution's component bound.
+    let long = "c".repeat(1025);
+    wire.service_resolution.canonical_name =
+        ipc::DerBlob::new(samples::name(1, &[long.as_str()]).encode().unwrap());
+    let body = encode_frame(
+        KEYD_CHANNEL,
+        Direction::Request,
+        &KeydRequest::IssueTgsRep(wire),
+    )
+    .unwrap()
+    .body()
+    .to_vec();
+    assert!(matches!(
+        decode_request(&body),
+        Err(Rejection::Value(ipc_keyd::ConversionError::NameResolution))
+    ));
+    assert_eq!(refusal_of(&body), Some(Refused::Malformed));
+
+    // A realm longer than the bound is refused when encoding.
+    let Ok(KeydRequest::IssueTgsRep(mut wire)) = tgs_call().to_wire() else {
+        panic!("the TGS request");
+    };
+    wire.service_resolution.realm_as_sent = vec![b'R'; 1025];
+    assert!(encode_frame(
+        KEYD_CHANNEL,
+        Direction::Request,
+        &KeydRequest::IssueTgsRep(wire)
+    )
+    .is_err());
+
+    // The largest resolution keyd-types admits crosses: 16 components of
+    // 1024 octets, realms of 1024 octets.
+    let part = "p".repeat(1024);
+    let parts: Vec<&str> = vec![part.as_str(); 16];
+    let big_name = samples::name(1, &parts);
+    let big_realm = krb_proto::Realm::new(&"R".repeat(1024)).unwrap();
+    let resolution = keyd_types::NameResolution::new(keyd_types::NameResolutionFields {
+        realm_as_sent: big_realm.clone(),
+        name_as_sent: big_name.clone(),
+        canonical_realm: big_realm,
+        canonical_name: big_name,
+        principal: keyd_types::PrincipalId::from_bytes([0x11; 16]),
+        key_purpose: keyd_types::KeyPurpose::Service,
+        snapshot: u64::MAX,
+        issued_at: samples::time(3),
+    })
+    .unwrap();
+    let largest = keyd_types::AttestedNameResolution::new(resolution, [0xEE; 32]);
+    let Ok(KeydRequest::IssueTgsRep(wire)) = tgs_call().to_wire() else {
+        panic!("the TGS request");
+    };
+    let Ok(KeydRequest::IssueTgsRep(big)) = (Call::IssueTgsRep {
+        service: Box::new(largest.clone()),
+        ctx: wire.ctx,
+        template: samples::tgs_template(true),
+    })
+    .to_wire() else {
+        panic!("the TGS request");
+    };
+    // Within the bound (which allows each DER header its longest form, and
+    // the longest name-type: an upper bound, not this name's exact size).
+    assert!(resolution_octets(&big.service_resolution) <= LARGEST_RESOLUTION);
+    let Call::IssueAsRep {
+        proof,
+        armor,
+        template,
+        ..
+    } = as_call()
+    else {
+        panic!("the AS call");
+    };
+    let call = Call::IssueAsRep {
+        client: Box::new(largest.clone()),
+        server: AsServerArgument::ChangePasswordService(Box::new(largest.clone())),
+        proof,
+        armor,
+        template,
+    };
+    let body = request_body(&call);
+    assert!(body.len() <= MAX_REQUEST_BODY as usize);
+    let Ok(Call::IssueAsRep {
+        client,
+        server: AsServerArgument::ChangePasswordService(server),
+        ..
+    }) = decode_request(&body)
+    else {
+        panic!("decodes");
+    };
+    assert_eq!(client.resolution(), largest.resolution());
+    assert_eq!(server.resolution(), largest.resolution());
 }

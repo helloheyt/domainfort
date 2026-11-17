@@ -477,7 +477,7 @@ fn host_record(apex: &Name, parts: HostRecordParts) -> Result<HostRecord, ZoneIm
         return Err(ZoneImageError::HostAddressCount);
     }
     for (index, address) in parts.addresses.iter().enumerate() {
-        if address.is_loopback() || address.is_unspecified() || address.is_multicast() {
+        if !is_host_address(*address) {
             return Err(ZoneImageError::AddressNotAllowed);
         }
         if parts.addresses[..index].contains(address) {
@@ -497,6 +497,19 @@ fn host_record(apex: &Name, parts: HostRecordParts) -> Result<HostRecord, ZoneIm
 /// Spec: RFC 1035 §3.1.
 fn below_apex(apex: &Name, prefix: &[&[u8]]) -> Option<Name> {
     Name::from_labels(prefix.iter().copied().chain(apex.labels())).ok()
+}
+
+/// Whether `address` may be a host's A record address: never loopback,
+/// unspecified or multicast. The one statement of the rule — the image
+/// validates every host with it, and the directory's write checker (task
+/// DN6, crates/directory-admin, through crates/directory-pip) accepts a
+/// registered address only by it, so a stored address the image would
+/// refuse cannot be written (docs/52 C14: one rule, one place).
+///
+/// Spec: docs/54 §4.4, §5.5 ("not loopback/unspecified/multicast");
+/// docs/questions/Q-614 item 8.
+pub fn is_host_address(address: Ipv4Addr) -> bool {
+    !(address.is_loopback() || address.is_unspecified() || address.is_multicast())
 }
 
 /// Whether `label` is an RFC 1035 §2.3.1 preferred-syntax label: it starts

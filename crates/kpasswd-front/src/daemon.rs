@@ -70,7 +70,7 @@
 
 use crate::audit::{self, AuditGate, AUDIT_WINDOW};
 use crate::connection;
-use crate::log::{note, Counters, Counts, Failure, Noise, Note};
+use crate::log::{audit_undelivered, note, Counters, Counts, Failure, Noise, Note};
 use crate::reply::{InvalidRealm, ReplyEncoder};
 use config::{is_internal, KpasswdFrontSettings, Network};
 use core::fmt;
@@ -529,20 +529,16 @@ pub async fn serve(
     control.state.serving.store(false, Ordering::SeqCst);
     drop(context);
     // The one flush waits (bounded) for the last counts and summaries, then
-    // the audit link ends (crate::audit).
-    let unacknowledged = gate
+    // the audit link ends (crate::audit); the report names every summary
+    // auditd did not acknowledge and every count never sent as one
+    // (docs/questions/Q-990 item 4, A-166; Q-995).
+    let unflushed = gate
         .close(AUDIT_FLUSH_GRACE, async {
             audit_task.abort();
             let _ = audit_task.await;
         })
-        .await
-        .events();
-    if unacknowledged > 0 {
-        note(
-            Note::AuditUnacknowledged,
-            Some(u64::try_from(unacknowledged).unwrap_or(u64::MAX)),
-        );
-    }
+        .await;
+    audit_undelivered(unflushed);
     note(Note::Stopped, None);
     Ok(())
 }

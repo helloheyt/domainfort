@@ -79,7 +79,7 @@ use crate::limits::{
     FORWARD_ANSWER_TIMEOUT, FORWARD_LIMITS, FORWARD_QUEUE_CAPACITY, REFRESH_INTERVAL, REFRESH_WAIT,
     TCP_MESSAGE_LIMITS, UDP_LIMITS,
 };
-use crate::log::{note, Note, Thinned, ZONE_UNAVAILABLE};
+use crate::log::{audit_undelivered, note, Note, Thinned, ZONE_UNAVAILABLE};
 use crate::source::is_served;
 use crate::tcp::{accept_tcp, TcpContext, TcpLimits};
 use crate::udp::serve_udp;
@@ -713,20 +713,16 @@ where
     // thread ends, and with it the last sender of the zone thread's channel.
     drop(shared);
     // The one flush of every daemon (`ipc_audit_client::AuditGate::close`,
-    // docs/52 R6 (b)), then the audit link ends.
-    let unacknowledged = gate
+    // docs/52 R6 (b)), then the audit link ends; the report names every
+    // summary auditd did not acknowledge and every count never sent as one
+    // (docs/questions/Q-990 item 4, A-166; Q-995).
+    let unflushed = gate
         .close(AUDIT_FLUSH_GRACE, async {
             audit_task.abort();
             let _ = audit_task.await;
         })
-        .await
-        .events();
-    if unacknowledged > 0 {
-        note(
-            Note::AuditUnacknowledged,
-            Some(u64::try_from(unacknowledged).unwrap_or(u64::MAX)),
-        );
-    }
+        .await;
+    audit_undelivered(unflushed);
     note(Note::Stopped, None);
     Ok(Stopped {
         zone: zone_thread,

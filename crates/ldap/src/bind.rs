@@ -35,7 +35,9 @@
 //! RFC 4752 profile without a security layer over TLS with channel binding
 //! (R49-6), keyd's `open_and_verify_service_ticket` (A-46, L6a) behind a
 //! trait like `kdc::KeyCustody`, the Subject of docs/49 §3.2 from the
-//! account source, and a [`crate::session::BoundIdentity`] on success. It
+//! ticket-subject lookup (directory-pip `TicketSubjects`, the `TicketClient`
+//! context — docs/59 §6.2: "bind in GSSAPI"), and a
+//! [`crate::session::BoundIdentity`] on success. It
 //! is reached only after the TLS check above, so a GSSAPI token is never
 //! examined on a cleartext connection.
 //!

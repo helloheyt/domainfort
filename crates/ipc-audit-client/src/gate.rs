@@ -35,8 +35,9 @@
 //!   grace ([`AUDIT_FLUSH_GRACE`] in every daemon) until every queued event
 //!   is acknowledged — the [`FlushWait`] rule says whether a link that counts
 //!   as unreachable ends the wait early (keyd, the kdc) or not (dird, A-87;
-//!   admind) — then end the audit link, then report what is still
-//!   unacknowledged ([`Unflushed`]).
+//!   admind) — then end the audit link, then report what auditd did not
+//!   receive ([`Unflushed`]: the events still unacknowledged **and** the
+//!   counts still held — docs/questions/Q-990 item 4, A-166; Q-995).
 //!
 //! # The gate itself
 //!
@@ -109,6 +110,20 @@
 //! counts still held to leave as a summary, so the pace never holds counts
 //! past a stop it could have delivered them in.
 //!
+//! # Every count that never reached auditd is in the stop's report (docs/questions/Q-995)
+//!
+//! The flush waits for held counts only while auditd is reachable and only
+//! for the grace (A-166); before Q-995 the counts still held when it gave up
+//! were in no report — [`Unflushed`] counted events only. Class: "a count
+//! that never reached auditd is invisible at stop". The root change: the
+//! value the one way to finish a gate returns ([`AuditGate::close`] →
+//! [`Unflushed`]) holds every count the window still has
+//! (`suppressed_noise`, `refused_gating`, `unrecorded_outcomes`) beside the
+//! unacknowledged events (a summary already queued is one of those events),
+//! read even through a poisoned lock; and its whole-report reading
+//! ([`Unflushed::undelivered`]) yields each kind as an [`Undelivered`]
+//! variant that every daemon maps onto a note with an exhaustive `match`.
+//!
 //! [`HEARTBEAT`]: crate::HEARTBEAT
 //!
 //! Spec: docs/52 §3.11 (R6 (a), (b)), §7 R6, §2 rows 20, 23, 38 (N5);
@@ -116,7 +131,7 @@
 //! docs/questions/Q-218 (A-57), Q-252 items 8, 9 (A-64), Q-260 item 2
 //! (A-67), Q-313 (A-82), Q-350 item 11 (A-87), Q-365 (A-88), Q-560 /
 //! A-115 (the follow-up), Q-570 §5 item a (A-118), Q-630; Q-961 item 5,
-//! Q-988 items 4, 5, Q-989 (A-165).
+//! Q-988 items 4, 5, Q-989 (A-165), Q-990 item 4 (A-166), Q-995.
 
 use core::future::Future;
 use core::time::Duration;
@@ -245,23 +260,102 @@ pub enum FlushWait {
     UntilAcknowledgedOrUnreachable,
 }
 
-/// What a stop left unacknowledged ([`AuditGate::close`]): events in the
-/// window (and reservations still outstanding) when the audit link ended —
-/// lost with the process (the bounded loss of docs/questions/Q-252 item 9).
+/// One kind of audit data a stop could not deliver to auditd, with its count
+/// — a part of [`Unflushed`] ([`Unflushed::undelivered`]). Counts only: no
+/// event content, no secret.
 ///
-/// Spec: docs/questions/Q-313 (A-82: "reports what was not acknowledged").
-#[must_use = "a stop reports what auditd did not acknowledge"]
+/// Spec: docs/questions/Q-313 (A-82); docs/50 §8.1 (`WindowSummary` =
+/// `suppressed_noise ‖ refused_gating ‖ unrecorded_outcomes`); A-57, A-88;
+/// docs/questions/Q-990 item 4 (A-166), Q-995.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Undelivered {
+    /// Events in the window auditd did not acknowledge, plus reservations
+    /// still outstanding. A `WindowSummary` already queued is one of these
+    /// events, with the counts it carries (they are not counted again
+    /// below).
+    Events(u64),
+    /// Noise counted for a `WindowSummary` that never left the window
+    /// (`suppressed_noise`).
+    SuppressedNoise(u64),
+    /// Gating reservations refused, counted for a `WindowSummary` that never
+    /// left the window (`refused_gating`).
+    RefusedGating(u64),
+    /// Outcome records lost after their intent or decision was recorded,
+    /// counted for a `WindowSummary` that never left the window
+    /// (`unrecorded_outcomes`).
+    UnrecordedOutcomes(u64),
+}
+
+impl Undelivered {
+    /// The count of this kind.
+    #[must_use]
+    pub fn count(self) -> u64 {
+        match self {
+            Undelivered::Events(count)
+            | Undelivered::SuppressedNoise(count)
+            | Undelivered::RefusedGating(count)
+            | Undelivered::UnrecordedOutcomes(count) => count,
+        }
+    }
+}
+
+/// What a stop could not deliver to auditd ([`AuditGate::close`], the only
+/// way a stop finishes a gate): the events in the window (and reservations
+/// still outstanding) when the audit link ended, **and** the counts the
+/// window still held — never queued as a summary because the pace held
+/// them past the grace, or auditd was unreachable, or the window was full.
+/// Both are lost with the process (the bounded loss of docs/questions/Q-252
+/// item 9). Every count the gate took is either acknowledged by auditd, in
+/// an unacknowledged event here, or one of the counts here — none is
+/// invisible at stop (class of docs/questions/Q-995).
+///
+/// Read it whole through [`Unflushed::undelivered`] — the stop's report, one
+/// entry per kind, which each daemon maps onto its notes with an exhaustive
+/// `match`, so a kind added later reaches every daemon's report or fails to
+/// compile there.
+///
+/// Spec: docs/questions/Q-313 (A-82: "reports what was not acknowledged"),
+/// Q-990 item 4 (A-166: counts that never left reported), Q-995.
+#[must_use = "a stop reports what auditd did not receive"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Unflushed {
     events: usize,
+    suppressed_noise: u64,
+    refused_gating: u64,
+    unrecorded_outcomes: u64,
 }
 
 impl Unflushed {
-    /// Events not acknowledged plus outstanding reservations (0 after a
-    /// clean stop).
+    /// The events part alone: events not acknowledged plus outstanding
+    /// reservations (0 after a clean stop) — for a stop result that keeps
+    /// that number; the counts that never left are in
+    /// [`Unflushed::undelivered`].
     #[must_use]
     pub fn events(self) -> usize {
         self.events
+    }
+
+    /// Everything the stop could not deliver, one entry per kind whose count
+    /// is not zero, in a fixed order (events, then the counts in
+    /// `WindowSummary` order); empty after a clean stop. The stop's whole
+    /// report.
+    /// Spec: docs/questions/Q-313 (A-82), Q-990 item 4 (A-166), Q-995.
+    pub fn undelivered(self) -> impl Iterator<Item = Undelivered> {
+        [
+            Undelivered::Events(u64::try_from(self.events).unwrap_or(u64::MAX)),
+            Undelivered::SuppressedNoise(self.suppressed_noise),
+            Undelivered::RefusedGating(self.refused_gating),
+            Undelivered::UnrecordedOutcomes(self.unrecorded_outcomes),
+        ]
+        .into_iter()
+        .filter(|part| part.count() > 0)
+    }
+
+    /// Whether nothing was lost: every event acknowledged, no reservation
+    /// outstanding, no count held.
+    #[must_use]
+    pub fn is_clean(self) -> bool {
+        self.undelivered().next().is_none()
     }
 }
 
@@ -761,13 +855,15 @@ impl AuditGate {
     ///    meanwhile;
     /// 2. end the audit link (`end_link`: the daemon aborts its audit task
     ///    and awaits it);
-    /// 3. report what is still unacknowledged — lost with the process.
+    /// 3. report what auditd did not receive — the events still
+    ///    unacknowledged and the counts still held ([`Unflushed`]) — lost
+    ///    with the process.
     ///
     /// Spec: docs/questions/Q-313 (A-82: "waits, bounded, for auditd's
     /// acknowledgement of every queued audit event before closing, and
     /// reports what was not acknowledged"), Q-350 item 11 (A-87), Q-252 item
-    /// 9, Q-961 item 6, Q-988 item 1, Q-989 (A-165); docs/52 §3.11 R6 (b);
-    /// docs/50 §3.6, §8.1.
+    /// 9, Q-961 item 6, Q-988 item 1, Q-989 (A-165), Q-990 item 4 (A-166),
+    /// Q-995; docs/52 §3.11 R6 (b); docs/50 §3.6, §8.1.
     pub async fn close<S, F, E>(
         &self,
         grace: Duration,
@@ -785,8 +881,26 @@ impl AuditGate {
             sleep(FLUSH_POLL).await;
         }
         end_link.await;
+        self.undelivered()
+    }
+
+    /// The stop's report ([`AuditGate::close`] step 3): the window's events
+    /// not acknowledged plus its outstanding reservations, and the three
+    /// counts it still holds. Read through a poisoned lock too: the report
+    /// only reads, and a window a panicking holder left behind is lost, not
+    /// delivered — reporting it as empty would hide the loss (fail closed
+    /// toward visibility; Q-995).
+    /// Spec: docs/questions/Q-313 (A-82), Q-990 item 4 (A-166), Q-995.
+    fn undelivered(&self) -> Unflushed {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         Unflushed {
-            events: self.outstanding(),
+            events: outstanding_in(&state.window),
+            suppressed_noise: state.window.suppressed_noise(),
+            refused_gating: state.window.refused_gating(),
+            unrecorded_outcomes: state.window.unrecorded_outcomes(),
         }
     }
 }
@@ -1142,7 +1256,7 @@ mod tests {
             async {},
         ));
         assert_eq!(client.join().unwrap(), [noise_summary(5)]);
-        assert_eq!(unflushed.events(), 0);
+        assert!(unflushed.is_clean(), "{unflushed:?}");
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(gate.inspect(SendWindow::suppressed_noise), Some(0));
 
@@ -1157,8 +1271,129 @@ mod tests {
             let started = Instant::now();
             let unflushed = run_ready(gate.close(grace, wait, blocking_sleep, async {}));
             assert_eq!(unflushed.events(), 0, "{wait:?}");
+            // Q-990 item 4 (A-166), Q-995: not waited for, but reported.
+            assert_eq!(
+                unflushed.undelivered().collect::<Vec<_>>(),
+                [Undelivered::SuppressedNoise(1)],
+                "{wait:?}"
+            );
             assert!(started.elapsed() < grace, "{wait:?}: not waited for");
         }
+    }
+
+    /// docs/questions/Q-990 item 4 (A-166: "reporting counts that never left
+    /// in `Unflushed`"), Q-995 (class "a count that never reached auditd is
+    /// invisible at stop"); A-57, A-88 (the three counts of a
+    /// `WindowSummary`): every count the window still holds when the stop
+    /// gives up is in the report, kind by kind, in `WindowSummary` order —
+    /// (a) auditd unreachable, under both wait rules; (b) auditd reachable
+    /// but the pace holding the counts past the grace; while (c) a summary
+    /// already queued and not acknowledged is reported as the event it is,
+    /// its counts not counted twice.
+    #[test]
+    fn close_reports_the_counts_that_never_left() {
+        // (a) Noise, a refused reservation (a window of one slot, full) and
+        // a lost outcome, then auditd gone.
+        for wait in [
+            FlushWait::UntilAcknowledged,
+            FlushWait::UntilAcknowledgedOrUnreachable,
+        ] {
+            let gate = AuditGate::new(WindowConfig::new(1, 0).unwrap());
+            gate.set_reachable(true);
+            let slot = gate.reserve().unwrap();
+            assert!(gate.reserve().is_none(), "full: refused and counted");
+            gate.release(slot);
+            gate.count_noise_n(2);
+            gate.count_unrecorded_outcome();
+            gate.set_reachable(false);
+            let grace = Duration::from_millis(100);
+            let unflushed = run_ready(gate.close(grace, wait, blocking_sleep, async {}));
+            assert_eq!(
+                unflushed.undelivered().collect::<Vec<_>>(),
+                [
+                    Undelivered::SuppressedNoise(2),
+                    Undelivered::RefusedGating(1),
+                    Undelivered::UnrecordedOutcomes(1),
+                ],
+                "{wait:?}"
+            );
+            assert_eq!(unflushed.events(), 0, "{wait:?}");
+            assert!(!unflushed.is_clean(), "{wait:?}");
+        }
+
+        // (b) auditd reachable, the pace holding new counts, a grace shorter
+        // than the pace and no client to send them: reported, not lost
+        // silently.
+        let gate = open_gate();
+        gate.count_noise();
+        auditd_acknowledges(&gate);
+        gate.count_noise_n(4);
+        assert!(matches!(gate.next_send(), NextSend::Paced(_)));
+        let grace = Duration::from_millis(50);
+        assert!(grace < SUMMARY_PACE);
+        let unflushed = run_ready(gate.close(
+            grace,
+            FlushWait::UntilAcknowledgedOrUnreachable,
+            blocking_sleep,
+            async {},
+        ));
+        assert_eq!(
+            unflushed.undelivered().collect::<Vec<_>>(),
+            [Undelivered::SuppressedNoise(4)]
+        );
+
+        // (c) The summary already queued (in flight, not acknowledged): one
+        // event, and no count beside it.
+        let gate = open_gate();
+        gate.count_noise_n(3);
+        let in_flight = gate.next_batch().unwrap();
+        assert_eq!(decoded(&in_flight), [noise_summary(3)]);
+        gate.set_reachable(false);
+        let unflushed = run_ready(gate.close(
+            Duration::from_millis(100),
+            FlushWait::UntilAcknowledgedOrUnreachable,
+            blocking_sleep,
+            async {},
+        ));
+        assert_eq!(
+            unflushed.undelivered().collect::<Vec<_>>(),
+            [Undelivered::Events(1)]
+        );
+        assert_eq!(unflushed.events(), 1);
+    }
+
+    /// docs/questions/Q-995 (the same class, a poisoned lock): a window whose
+    /// lock a panicking holder poisoned can deliver nothing — the flush does
+    /// not wait for it — and its events and counts are still in the report,
+    /// not reported as delivered (before Q-995: 0).
+    #[test]
+    fn close_reports_a_poisoned_window_whole() {
+        let gate = Arc::new(open_gate());
+        for n in 0..2 {
+            let slot = gate.reserve().unwrap();
+            gate.commit(slot, &Change(n).intent_event()).unwrap();
+        }
+        gate.count_noise_n(3);
+        let poisoner = {
+            let gate = Arc::clone(&gate);
+            std::thread::spawn(move || {
+                gate.with_steps(|_| panic!("a holder panics: the gate's lock is poisoned"))
+            })
+        };
+        assert!(poisoner.join().is_err());
+        assert!(gate.reserve().is_none(), "poisoned: audit not available");
+        let started = Instant::now();
+        let unflushed = run_ready(gate.close(
+            Duration::from_secs(10),
+            FlushWait::UntilAcknowledged,
+            blocking_sleep,
+            async {},
+        ));
+        assert!(started.elapsed() < Duration::from_secs(5), "not waited for");
+        assert_eq!(
+            unflushed.undelivered().collect::<Vec<_>>(),
+            [Undelivered::Events(2), Undelivered::SuppressedNoise(3)]
+        );
     }
 
     /// R6 (b), Q-313: a clean stop — everything acknowledged — reports 0 and
@@ -1179,6 +1414,8 @@ mod tests {
             },
         ));
         assert_eq!(unflushed.events(), 0);
+        assert!(unflushed.is_clean());
+        assert_eq!(unflushed.undelivered().count(), 0, "an empty report");
         assert!(ended);
     }
 

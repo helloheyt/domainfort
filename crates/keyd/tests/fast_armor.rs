@@ -170,7 +170,7 @@ fn service_ticket_is_not_an_armor_ticket() {
     let ctx = open_tgt(&mut f, &alice_tgt, 90, 90);
     let tgs = f
         .keyd
-        .issue_tgs_rep(&KDC, &SERVICE, &ctx.ctx_id, &tgs_template(90), &now())
+        .issue_tgs(&KDC, &SERVICE, &ctx.ctx_id, &tgs_template(90), &now())
         .unwrap();
     let service_session = key_from(
         &EncTgsRepPart::decode(&open(&alice_tgt.session, 8, &tgs.enc_part))

@@ -3,7 +3,7 @@
 //! ldap-front terminates TLS (rustls), frames LDAP and re-encodes it to the
 //! canonical form, and talks only to dird (one Unix connection per client
 //! connection) and auditd (docs/50 §2.4, R50-10). It listens on TCP 389
-//! (StartTLS) and/or 636 (LDAPS) (§4.2).
+//! (StartTLS, always) and, optionally, LDAPS (§4.2, as amended by A-178).
 //!
 //! **No secrets.** The DC's TLS private key is never a setting: the file names
 //! only the **paths** of the operator-supplied DER certificate and key. The key
@@ -25,8 +25,20 @@
 //! the source of every accepted connection (crates/ldap-front) — and dird
 //! no longer maps a reported address at all (docs/questions/Q-580).
 //!
+//! **StartTLS on port 389, always** (task DN10c, A-176 on docs/questions/
+//! Q-1016 item 4; task DN10d, A-178 on Q-1025 item 3): the zone advertises
+//! LDAP at `_ldap._tcp` on port 389 (crates/dns-zone, from
+//! [`crate::StandardPort::Ldap`]) whenever it is served, so `ldap_listen` is
+//! **required** (`MissingKey` — an LDAPS-only file is refused by the daemon
+//! itself, not only by provision) and every one of its addresses must be on
+//! that port (`NonStandardPort`). Port 389 is listened on under every
+//! outcome of P-64 (A-176), so the rule does not wait for it. LDAPS has no
+//! SRV record ([MS-ADTS] §6.3.2.3) and stays optional beside it, on any
+//! port.
+//!
 //! Spec: docs/50 R50-10, R50-12, R50-15, §2.4, §3.6, §4.1, §4.2, §5.3, §7.1;
-//! docs/52 §7 R14.
+//! docs/52 §7 R14; [MS-ADTS] v20261026 §6.3.2.3; RFC 4511 §5.2;
+//! docs/questions/Q-1024, Q-1025 item 3 (A-178).
 
 use core::net::SocketAddr;
 use core::time::Duration;
@@ -38,11 +50,15 @@ use crate::schema::{
     self, Account, Distinct, Endpoint, AUDITD_UID, AUDIT_SOCKET, DIRD_DEADLINE, DIRD_LDAP_SOCKET,
     DIRD_UID, INTERNAL_NETWORKS, RUN_AS_GID, RUN_AS_UID,
 };
+use crate::standard_port::StandardPort;
 use crate::value::{self, AbsolutePath, Network};
 
-/// Key: TCP listeners for LDAP with StartTLS (port 389). Spec: docs/50 §4.2.
+/// Key: TCP listeners for LDAP with StartTLS — required (at least one), port
+/// 389 ([`crate::StandardPort::Ldap`], the only port accepted). Spec: docs/50
+/// §4.2 (A-178); docs/questions/Q-1024, Q-1025 item 3.
 const LDAP_LISTEN: &str = "ldap_listen";
-/// Key: TCP listeners for LDAPS (port 636). Spec: docs/50 §4.2.
+/// Key: TCP listeners for LDAPS (optional; port 636, or any — no SRV record
+/// advertises LDAPS). Spec: docs/50 §4.2; docs/questions/Q-1024 item 3.
 const LDAPS_LISTEN: &str = "ldaps_listen";
 /// Key: path of the DC certificate (DER). Spec: docs/50 R50-12, §5.3.
 const TLS_CERTIFICATE_PATH: &str = "tls_certificate_path";
@@ -131,10 +147,10 @@ pub struct LdapFrontSettings {
 /// Spec: docs/50 §4.2, §4.3 step 6 (on 636 TLS starts at the first octet, on
 /// 389 only after StartTLS); docs/questions/Q-230 item 7.
 fn check_disjoint(
-    ldap: Option<&Located<Vec<SocketAddr>>>,
+    ldap: &Located<Vec<SocketAddr>>,
     ldaps: Option<&Located<Vec<SocketAddr>>>,
 ) -> Result<(), Error> {
-    let (Some(ldap), Some(ldaps)) = (ldap, ldaps) else {
+    let Some(ldaps) = ldaps else {
         return Ok(());
     };
     if ldap
@@ -173,37 +189,44 @@ impl LdapFrontSettings {
     ];
 
     /// Parses and validates ldap-front's file. Required: `run_as_uid`,
-    /// `run_as_gid`, at least one of `ldap_listen` / `ldaps_listen` (no
-    /// address in both), `internal_networks` (every listener address inside
-    /// one of them), `tls_certificate_path`, `tls_private_key_path`,
+    /// `run_as_gid`, `ldap_listen` (StartTLS — the endpoint the zone
+    /// advertises, task DN10d; every address on port 389 — `NonStandardPort`,
+    /// task DN10c), `internal_networks` (every listener address inside one
+    /// of them), `tls_certificate_path`, `tls_private_key_path`,
     /// `dird_ldap_socket` + `dird_uid`, `audit_socket`, `auditd_uid`.
-    /// Optional: the timeouts (docs/50 value as default and ceiling) and
-    /// `dird_deadline` (61s ..= 65s, default 65s).
+    /// Optional: `ldaps_listen` (no address also in `ldap_listen`), the
+    /// timeouts (docs/50 value as default and ceiling) and `dird_deadline`
+    /// (61s ..= 65s, default 65s).
     ///
     /// # Errors
     /// Any rule of the format or of this schema (see [`crate::ErrorKind`]).
     ///
     /// Spec: docs/50 R50-10, R50-12, R50-15, §3.6, §4.1, §4.2, §5.3, §7.1;
-    /// docs/52 §7 R14.
+    /// docs/52 §7 R14; docs/questions/Q-1024, Q-1025 item 3.
     pub fn parse(input: &[u8]) -> Result<Self, Error> {
         let doc = Document::parse(input, Self::KEYS)?;
         let mut all = Distinct::default();
         let run_as = schema::account(&doc, &mut all)?;
-        let ldap = doc.optional(LDAP_LISTEN, |text| {
+        // Task DN10d (A-178 on Q-1025 item 3): the zone advertises LDAP at
+        // `_ldap._tcp` on port 389, so the StartTLS listener is required —
+        // the rule lives in the file of the daemon that serves the endpoint
+        // (an LDAPS-only file is refused here, whoever wrote it).
+        let ldap = doc.required(LDAP_LISTEN, |text| {
             value::list(text, value::listener_address)
         })?;
         let ldaps = doc.optional(LDAPS_LISTEN, |text| {
             value::list(text, value::listener_address)
         })?;
-        if ldap.is_none() && ldaps.is_none() {
-            return Err(Error::file(ErrorKind::NoListener));
-        }
-        check_disjoint(ldap.as_ref(), ldaps.as_ref())?;
+        // Task DN10c (A-176 on Q-1016 item 4): every StartTLS listener is on
+        // port 389. LDAPS is advertised by no SRV record, so its port is not
+        // fixed here.
+        schema::check_standard_port(Some(&ldap), LDAP_LISTEN, StandardPort::Ldap)?;
+        check_disjoint(&ldap, ldaps.as_ref())?;
         let internal_networks = doc
             .required(INTERNAL_NETWORKS, |text| value::list(text, value::network))?
             .value;
         schema::check_internal(
-            [(ldap.as_ref(), LDAP_LISTEN), (ldaps.as_ref(), LDAPS_LISTEN)],
+            [(Some(&ldap), LDAP_LISTEN), (ldaps.as_ref(), LDAPS_LISTEN)],
             &internal_networks,
         )?;
         let tls_certificate_path = schema::path(&doc, &mut all, TLS_CERTIFICATE_PATH)?;
@@ -226,7 +249,7 @@ impl LdapFrontSettings {
         };
         Ok(LdapFrontSettings {
             run_as,
-            ldap_listen: ldap.map_or_else(Vec::new, |located| located.value),
+            ldap_listen: ldap.value,
             ldaps_listen: ldaps.map_or_else(Vec::new, |located| located.value),
             internal_networks,
             tls_certificate_path,
@@ -244,15 +267,17 @@ impl LdapFrontSettings {
         self.run_as
     }
 
-    /// The StartTLS listeners (port 389); may be empty if LDAPS is
-    /// configured. Spec: docs/50 §4.2.
+    /// The StartTLS listeners: at least one, every one on port 389
+    /// ([`crate::StandardPort::Ldap`]) — the zone advertises `_ldap._tcp`
+    /// there (docs/questions/Q-1024, Q-1025 item 3).
+    /// Spec: docs/50 §4.2 (A-178).
     #[must_use]
     pub fn ldap_listen(&self) -> &[SocketAddr] {
         &self.ldap_listen
     }
 
-    /// The LDAPS listeners (port 636); may be empty if StartTLS is
-    /// configured. Spec: docs/50 §4.2.
+    /// The LDAPS listeners (port 636, or any); may be empty — LDAPS is
+    /// optional beside StartTLS. Spec: docs/50 §4.2 (A-178).
     #[must_use]
     pub fn ldaps_listen(&self) -> &[SocketAddr] {
         &self.ldaps_listen

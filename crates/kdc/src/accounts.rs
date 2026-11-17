@@ -16,6 +16,24 @@
 //! holds at most one record per (realm, name) and role; returning two
 //! (RFC 4120 7.5.9 KDC_ERR_PRINCIPAL_NOT_UNIQUE) is not expressible here.
 //!
+//! Every record also carries the **resolution** dird attests for it (task
+//! PN10; docs/59 §7.1, §7.5): the `keyd_types::AttestedNameResolution` of
+//! the lookup that produced the record — which realm and name were asked,
+//! which canonical name and key set they resolved to, when — tagged with
+//! dird's attestation key. Since task PN11 the KDC forwards it to keyd,
+//! which verifies it before it binds a key (docs/59 §7.2), and reads two of
+//! its facts for its own decisions — as it reads every other field of the
+//! record dird sent: which kind of server a looked-up name is (its key
+//! set's purpose) and the canonical name the PDP judges (docs/questions/
+//! Q-1009 items 4-5). A record states its key set **once**: the keyd
+//! handle is the resolution's `(principal, key_purpose)`
+//! ([`ClientAccount::key`], [`ServiceAccount::key`]) — no field restates
+//! it, so a record whose handle and resolution disagree is not
+//! representable (task PN10c; docs/questions/Q-1060 item 1 (e)). This
+//! crate links no MAC (D182): the tag is opaque octets here, and records
+//! have no `PartialEq` because a tag is compared only in constant time, by
+//! keyd (crate name-attestation; docs/questions/Q-1046 item 4).
+//!
 //! [`InMemoryAccounts`] is the in-memory implementation used by the tests and
 //! the fuzz target. The directory-backed implementation (dirstore + the AD
 //! schema subset of [MS-ADSC] / [MS-ADA1-3]) is the `directory-pip` crate
@@ -25,11 +43,13 @@
 //! Spec: main-session decisions 3, 4, 8; docs/11 §1 (Subject: principal,
 //! groups, tier — from authoritative data, never client-claimed, P3); docs/25
 //! §4 (re-evaluation at use, D53); RFC 4120 3.1.3, 3.3.3.1, 5.2.7.5, 6.2,
-//! 7.5.9; docs/50 §3.7 (R50-8); docs/questions/Q-217 (A-56).
+//! 7.5.9; docs/50 §3.7 (R50-8); docs/questions/Q-217 (A-56); docs/59 §7.1,
+//! §7.2 step 4, §7.5, §10 (the PN10 row); docs/questions/Q-1011 items 1, 8
+//! (A-173), Q-1060 item 1 (e) (A-190).
 
 use crate::names::{same_name, same_realm};
 use dtyp::Sid;
-use keyd_types::KeyHandle;
+use keyd_types::{AttestedNameResolution, KeyHandle, NameResolution};
 use krb_proto::{EtypeInfo2Entry, KerberosString, KerberosTime, PrincipalName, Realm};
 use pdp::Tier;
 use std::collections::{BTreeMap, BTreeSet};
@@ -122,12 +142,10 @@ pub enum ArmorPolicy {
 /// TGS time). Not secret.
 ///
 /// Spec: main-session decision 3; docs/11 §1 (Subject); RFC 4120 5.2.7.5;
-/// docs/48 §3.1, §7.2 (`kind`, `armor_policy`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// docs/48 §3.1, §7.2 (`kind`, `armor_policy`); docs/59 §7.1, §7.5
+/// (`resolution`, which also names the key set — [`ClientAccount::key`]).
+#[derive(Debug, Clone)]
 pub struct ClientAccount {
-    /// keyd handle of the client's long-term key set (purpose
-    /// `PrincipalLongterm`, docs/10 §4).
-    pub key: KeyHandle,
     /// The account SID: the PDP Subject principal ([MS-DTYP] 2.4.2).
     pub sid: Sid,
     /// Expanded group SIDs: the PDP Subject groups (docs/11 §1).
@@ -137,15 +155,46 @@ pub struct ClientAccount {
     /// Account state.
     pub state: AccountState,
     /// One entry per enctype of the client's keys: etype, salt and s2kparams
-    /// (RFC 4120 5.2.7.5). Must describe the key set keyd holds for `key`.
+    /// (RFC 4120 5.2.7.5). Must describe the key set keyd holds for
+    /// [`ClientAccount::key`].
     pub etype_info: Vec<EtypeInfo2Entry>,
     /// User or computer (docs/48 §3.1; Q-127 interim (b)).
     pub kind: AccountKind,
     /// Whether an unarmored AS is allowed (docs/48 §7.2 layer 1).
     pub armor_policy: ArmorPolicy,
+    /// dird's attested resolution of the name this record was looked up by
+    /// (module documentation): forwarded to keyd with `issue_as_rep` (task
+    /// PN11). It is also the record's one statement of its key set
+    /// ([`ClientAccount::key`]). Not secret.
+    /// Spec: docs/59 §7.1, §7.5; docs/questions/Q-1011 items 1, 8, Q-1060
+    /// item 1 (e).
+    pub resolution: AttestedNameResolution,
+}
+
+/// The key set a resolution names: its `(principal, key_purpose)` — the
+/// one derivation of a record's keyd handle (task PN10c).
+/// Spec: docs/59 §7.1 (`principal: PrincipalId, key_purpose`), §7.2 step 4
+/// ("`principal == handle.principal` and `key_purpose == handle.purpose`");
+/// docs/10 §1 (`KeyHandle { principal, purpose }`).
+fn resolved_handle(resolution: &NameResolution) -> KeyHandle {
+    KeyHandle::new(resolution.principal(), resolution.key_purpose())
 }
 
 impl ClientAccount {
+    /// keyd handle of the client's long-term key set (purpose
+    /// `PrincipalLongterm`, docs/10 §4): the key set dird's resolution
+    /// names. The record states it only there — there is no second
+    /// statement for it to disagree with (task PN10c; class "one record
+    /// states one fact twice", Q-1060 item 1 (e)). The KDC hands it to keyd
+    /// only for `verify_preauth`, which takes no resolution
+    /// (docs/questions/Q-1080); `issue_as_rep` takes the resolution itself
+    /// and keyd looks the key set up by it (task PN11b, docs/questions/
+    /// Q-1067), so no handle travels beside a resolution.
+    /// Spec: docs/59 §7.1, §7.2 step 4; docs/10 §1, §4.
+    pub fn key(&self) -> KeyHandle {
+        resolved_handle(self.resolution.resolution())
+    }
+
     /// `true` if this account may make an unarmored AS request (the
     /// bootstrap): a computer account whose policy is BootstrapAllowed.
     /// BootstrapAllowed on any other kind of account counts as Required —
@@ -170,15 +219,36 @@ impl ClientAccount {
 ///
 /// Spec: main-session decisions 3, 8; RFC 4120 3.1.3 ("information from the
 /// Kerberos database indicating acceptable encryption methods for the
-/// application server").
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// application server"); docs/59 §7.1, §7.5 (`resolution`, which also
+/// names the key set — [`ServiceAccount::key`]).
+#[derive(Debug, Clone)]
 pub struct ServiceAccount {
-    /// keyd handle of the service key set (purpose `Service`, docs/10 §5).
-    pub key: KeyHandle,
     /// Account state.
     pub state: AccountState,
     /// Encryption types the service accepts for its session keys.
     pub enctypes: Vec<i32>,
+    /// dird's attested resolution of the name this record was looked up by
+    /// (module documentation): forwarded to keyd with `issue_tgs_rep` (and,
+    /// for the change-password service, `issue_as_rep` — task PN11); its key
+    /// set's purpose says which kind of server the name is, and its
+    /// canonical name is what the PDP judges (Q-1009 items 4-5); it is also
+    /// the record's one statement of its key set ([`ServiceAccount::key`]).
+    /// Not secret.
+    /// Spec: docs/59 §7.1, §7.5; docs/questions/Q-1011 items 1, 8, Q-1009,
+    /// Q-1060 item 1 (e).
+    pub resolution: AttestedNameResolution,
+}
+
+impl ServiceAccount {
+    /// keyd handle of the service key set (purpose `Service`,
+    /// `AdminService` or `ChangePasswordService`, docs/10 §5; Q-1009 item
+    /// 3): the key set dird's resolution names, stated only there (see
+    /// [`ClientAccount::key`]). No keyd call takes it since task PN11b: the
+    /// KDC hands keyd the resolution (docs/questions/Q-1067).
+    /// Spec: docs/59 §7.1, §7.2 step 4; docs/10 §1, §5.
+    pub fn key(&self) -> KeyHandle {
+        resolved_handle(self.resolution.resolution())
+    }
 }
 
 /// The account source could not answer. The request fails closed either
@@ -389,18 +459,43 @@ impl NamedPrincipal {
 
 #[cfg(test)]
 mod tests {
+    //! Sources: main-session decisions 3, 4, 8; RFC 4120 3.3.3.1, 6.2;
+    //! docs/48 §3.1, §7.2-§7.3; docs/59 §7.1 (the resolution a record
+    //! carries — here dird's statement made up for the record, tagged with
+    //! a test key by crate name-attestation's signer, a dev-dependency).
+    //! Every value is constructed by hand.
     use super::*;
-    use keyd_types::{KeyPurpose, PrincipalId};
+    use keyd_types::{KeyPurpose, NameResolution, NameResolutionFields, PrincipalId};
 
     fn principal(parts: &[&str], name_type: i32) -> NamedPrincipal {
         NamedPrincipal::from_text("EXAMPLE.ORG", name_type, parts).unwrap()
     }
 
+    /// The resolution dird would attest for `who` resolving to `key`
+    /// (docs/59 §7.1), tagged with a test key. The unit tests' one helper
+    /// (the integration tests' is tests/common `test_resolution`).
+    fn resolution(who: &NamedPrincipal, key: KeyHandle) -> AttestedNameResolution {
+        let resolution = NameResolution::new(NameResolutionFields {
+            realm_as_sent: who.realm.clone(),
+            name_as_sent: who.name.clone(),
+            canonical_realm: who.realm.clone(),
+            canonical_name: who.name.clone(),
+            principal: key.principal,
+            key_purpose: key.purpose,
+            snapshot: 1,
+            issued_at: KerberosTime::new(2026, 11, 16, 10, 0, 0).unwrap(),
+        })
+        .unwrap();
+        let test_key = name_attestation::AttestationKey::from_bytes(&[0x4B; 32]).unwrap();
+        name_attestation::tag(&test_key, &resolution).unwrap()
+    }
+
     fn service() -> ServiceAccount {
+        let key = KeyHandle::new(PrincipalId::from_bytes([1; 16]), KeyPurpose::Service);
         ServiceAccount {
-            key: KeyHandle::new(PrincipalId::from_bytes([1; 16]), KeyPurpose::Service),
             state: AccountState::ACTIVE,
             enctypes: vec![18],
+            resolution: resolution(&principal(&["host", "a.example.org"], 3), key),
         }
     }
 
@@ -428,13 +523,13 @@ mod tests {
         );
         source.set_unavailable(true);
         assert_eq!(
-            source.service(&p.realm, &p.name),
-            Err(AccountSourceError::Unavailable)
+            source.service(&p.realm, &p.name).err(),
+            Some(AccountSourceError::Unavailable)
         );
         source.set_failing(true);
         assert_eq!(
-            source.client(&p.realm, &p.name),
-            Err(AccountSourceError::Failed)
+            source.client(&p.realm, &p.name).err(),
+            Some(AccountSourceError::Failed)
         );
         source.set_failing(false);
         assert!(source.service(&p.realm, &p.name).unwrap().is_some());
@@ -446,11 +541,11 @@ mod tests {
     /// may armor.
     #[test]
     fn bootstrap_and_armor_need_a_computer_account() {
+        let key = KeyHandle::new(
+            PrincipalId::from_bytes([2; 16]),
+            KeyPurpose::PrincipalLongterm,
+        );
         let account = |kind, armor_policy| ClientAccount {
-            key: KeyHandle::new(
-                PrincipalId::from_bytes([2; 16]),
-                KeyPurpose::PrincipalLongterm,
-            ),
             sid: Sid::new(dtyp::SECURITY_NT_AUTHORITY, &[21, 1, 2, 3, 1000]).unwrap(),
             groups: BTreeSet::new(),
             tier: Tier::Tier2,
@@ -458,6 +553,7 @@ mod tests {
             etype_info: Vec::new(),
             kind,
             armor_policy,
+            resolution: resolution(&principal(&["ws01$"], 1), key),
         };
         let cases = [
             (
@@ -480,6 +576,44 @@ mod tests {
             assert_eq!(a.may_bootstrap(), bootstrap, "{kind:?} {policy:?}");
             assert_eq!(a.may_armor(), armor, "{kind:?} {policy:?}");
         }
+    }
+
+    /// docs/59 §7.1, §7.2 step 4 (the resolution's `principal` and
+    /// `key_purpose` name the key set); docs/questions/Q-1060 item 1 (e)
+    /// (task PN10c): a record's keyd handle is derived from its resolution
+    /// — the one statement — for a client and for each service purpose, so
+    /// a record whose resolution names a key set cannot carry another one.
+    #[test]
+    fn a_records_key_set_is_the_one_its_resolution_names() {
+        for purpose in [
+            KeyPurpose::Service,
+            KeyPurpose::AdminService,
+            KeyPurpose::ChangePasswordService,
+        ] {
+            let key = KeyHandle::new(PrincipalId::from_bytes([3; 16]), purpose);
+            let mut account = service();
+            account.resolution = resolution(&principal(&["host", "a.example.org"], 3), key);
+            assert_eq!(account.key(), key, "{purpose:?}");
+        }
+        let key = KeyHandle::new(
+            PrincipalId::from_bytes([4; 16]),
+            KeyPurpose::PrincipalLongterm,
+        );
+        let account = ClientAccount {
+            sid: Sid::new(dtyp::SECURITY_NT_AUTHORITY, &[21, 1, 2, 3, 1001]).unwrap(),
+            groups: BTreeSet::new(),
+            tier: Tier::Tier2,
+            state: AccountState::ACTIVE,
+            etype_info: Vec::new(),
+            kind: AccountKind::User,
+            armor_policy: ArmorPolicy::Required,
+            resolution: resolution(&principal(&["alice"], 1), key),
+        };
+        assert_eq!(account.key(), key);
+        assert_eq!(
+            account.key().principal,
+            account.resolution.resolution().principal()
+        );
     }
 
     /// Decision 8 states and the RFC 4120 3.3.3.1 hot-list.

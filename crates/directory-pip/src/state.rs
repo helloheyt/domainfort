@@ -12,7 +12,7 @@
 
 use crate::error::Fault;
 use crate::salt::AccountKind;
-use crate::time::{filetime_floor, from_seconds, since_1601};
+use crate::time::{filetime_floor, since_1601};
 use ad_schema::flags::user_account_control::{
     ADS_UF_ACCOUNT_DISABLE, ADS_UF_DONT_EXPIRE_PASSWD, ADS_UF_INTERDOMAIN_TRUST_ACCOUNT,
     ADS_UF_NORMAL_ACCOUNT, ADS_UF_PASSWORD_EXPIRED, ADS_UF_SERVER_TRUST_ACCOUNT,
@@ -20,7 +20,7 @@ use ad_schema::flags::user_account_control::{
 };
 use kdc::AccountState;
 use keyd_types::kerberos_time_seconds;
-use krb_proto::KerberosTime;
+use krb_proto::{kerberos_time_from_seconds, KerberosTime};
 
 /// The account-type bits of userAccountControl, of which exactly one is
 /// set. Spec: [MS-SAMR] 3.1.1.6 item 20 ("MUST contain one and only one of
@@ -196,7 +196,7 @@ pub(crate) fn revoked_before(
     // last_revoked` (RFC 4120 5.2.3: whole seconds).
     last_revoked
         .checked_add(1)
-        .and_then(from_seconds)
+        .and_then(kerberos_time_from_seconds)
         .ok_or(Fault::Unavailable)
 }
 

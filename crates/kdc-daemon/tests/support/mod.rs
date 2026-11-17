@@ -69,7 +69,12 @@ pub struct Handles {
     pub files: KeyHandle,
 }
 
-/// The directory context of the identities (realm EXAMPLE.ORG).
+/// The directory context of the identities (realm EXAMPLE.ORG), with
+/// dird's signer under the fixtures' test key (task PN10: the account
+/// records carry dird's attested resolution — crates/directory-daemon
+/// support `resolution_signer`, which issues at the fixtures' `now`, the
+/// instant the in-process keyd judges it at: one clock per test world —
+/// A-190; dird's daemon clock in that support's `params` is the same).
 pub fn context() -> DirectoryContext {
     DirectoryContext::new(
         ad_schema::phase1().unwrap(),
@@ -77,6 +82,7 @@ pub fn context() -> DirectoryContext {
         dird::naming_context(),
     )
     .unwrap()
+    .with_name_resolution_signer(dird::resolution_signer())
 }
 
 impl Handles {
@@ -88,13 +94,17 @@ impl Handles {
         use kdc::AccountSource as _;
         Handles {
             krbtgt: view.krbtgt_handle(&dird::domain_sid()).unwrap(),
-            alice: view.client(&realm(), &alice_name()).unwrap().unwrap().key,
-            ws1: view.client(&realm(), &machine_name()).unwrap().unwrap().key,
+            alice: view.client(&realm(), &alice_name()).unwrap().unwrap().key(),
+            ws1: view
+                .client(&realm(), &machine_name())
+                .unwrap()
+                .unwrap()
+                .key(),
             files: view
                 .service(&realm(), &service_name())
                 .unwrap()
                 .unwrap()
-                .key,
+                .key(),
         }
     }
 }
@@ -138,6 +148,10 @@ pub fn directory_keyd(
         )
         .unwrap();
     }
+    // The ceremony hands keyd dird's attestation key (task PN11: keyd
+    // verifies the resolutions the kdc forwards with it).
+    keyd.install_attestation_key(&ADMIN, crate::common::test_attestation_key(), &now())
+        .unwrap();
     crate::common::grant_user(
         &mut keyd,
         &handles.alice,

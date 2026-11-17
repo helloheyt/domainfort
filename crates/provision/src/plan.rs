@@ -11,10 +11,32 @@
 //! octets, never the NULL GUID, all distinct — [MS-ADTS] 3.1.1.5.2.4), the
 //! NodeId (16 octets, never all zero — docs/29 §2 as cited in docs/51 §4.3
 //! step 2; directory-admin refuses a zero node id), the integrity key (32
-//! octets, `dirstore::INTEGRITY_KEY_LEN`). A source failure, a NULL or
-//! repeated GUID or a zero node id stops the run before anything is written
-//! (fail closed; no retry — a CSPRNG that repeats is broken). The readiness
-//! threshold of D74 is a documented residual until P-18 (A-77).
+//! octets, `dirstore::INTEGRITY_KEY_LEN`), and — task PN12 — the
+//! name-resolution attestation key (32 octets, never all zero; docs/59 §7.4).
+//! A source failure, a NULL or repeated GUID, a zero node id or an all-zero
+//! attestation key stops the run before anything is written (fail closed; no
+//! retry — a CSPRNG that repeats is broken). The readiness threshold of D74
+//! is a documented residual until P-18 (A-77).
+//!
+//! # The attestation key (task PN12)
+//!
+//! One draw, two files, written by the installer from this one buffer: dird's
+//! key file (root:0400 — the rule dird's one key-file reader applies,
+//! crates/directory-daemon `startup::read_attestation_key`) and keyadm's input
+//! copy (keyadm's uid, 0400 — the rule of keyadm's reader, crates/keyadm
+//! `attestation_key`), which `keyadm ceremony` installs in keyd before the
+//! seal (Role::Admin, ceremony only, its intent acknowledged — task PN9). So
+//! dird tags with exactly the key keyd verifies with, and no channel ever
+//! carries the key from one daemon to the other: keyd never exports it (D28 /
+//! D29) and dird never hands it out. The key is held in
+//! `ipc_keyd::AttestationKeyOctets` — the carrier keyadm sends keyd, which
+//! cannot hold the all-zero key (the one statement of that rule on this side
+//! of the D182 line: this crate links no crypto, so not crate
+//! name-attestation) — wiped on drop, never printed (its `Debug` is
+//! redacted), never in the manifest or a configuration file (dird's file
+//! names only the path — A-60). Spec: docs/59 §7.4, §10 (PN12);
+//! docs/questions/Q-1011 item 2 (A-173), Q-1039 item 1 (A-183), Q-1048
+//! (A-187), Q-1055.
 //!
 //! # The objects (step 5) — creation order
 //!
@@ -24,7 +46,7 @@
 //! | 2 | Tier-0 OU | organizationalUnit | NC root | — | `ou` |
 //! | 3 | workstations OU (optional) | organizationalUnit | NC root | — | `ou` |
 //! | 4 | krbtgt | user | Tier-0 OU | 502 (fixed) | cn = sAMAccountName = "krbtgt"; UAC = N; accountExpires = never; no pwdLastSet |
-//! | 5 | DC computer | computer | Tier-0 OU | counter | cn = name, sAMAccountName = name‖"$"; UAC = ST; dNSHostName = fqdn; accountExpires = never; no SPN |
+//! | 5 | DC computer | computer | Tier-0 OU | counter | cn = name, sAMAccountName = name‖"$"; UAC = ST; dNSHostName = fqdn; accountExpires = never; no SPN; its host record = the `--dc-address` values (task DN10b — the zone's A record of the DC, docs/54 §3.1) |
 //! | 6 | LDAP service | computer | Tier-0 OU | counter | as 5 with UAC = WT and SPN `ldap/<fqdn>` |
 //! | 7 | admin service | computer | Tier-0 OU | counter | as 5 with UAC = WT and SPN `admind/<fqdn>` |
 //! | 8 | change-password service (task K9) | computer | Tier-0 OU | counter | as 5 with UAC = WT and SPN `kadmin/changepw` (RFC 3244 §2) |
@@ -46,7 +68,8 @@
 //! 3.1.1.9.2; [MS-ADTS] v20261026 3.1.1.5.2.4, 6.1.3; [MS-DTYP] v20241119
 //! 2.4.2.4; docs/46 §4.4, §5.4, §8.1; docs/47 §1.4, §4.1, §6.3; RFC 3244
 //! §2 and docs/53 R53-6, §5.2, §10 (K9) for row 8; A-72, A-75, A-76, A-79,
-//! A-83, A-84, A-89, A-117, P-22; docs/questions/Q-964 item 13, Q-972.
+//! A-83, A-84, A-89, A-117, P-22; docs/questions/Q-964 item 13, Q-972;
+//! docs/59 §7.4, §10 (PN12) for the attestation key.
 
 use core::fmt;
 use std::collections::BTreeSet;
@@ -55,13 +78,18 @@ use ad_schema::flags::group_type::{GROUP_TYPE_ACCOUNT_GROUP, GROUP_TYPE_SECURITY
 use ad_schema::flags::user_account_control::{
     ADS_UF_NORMAL_ACCOUNT, ADS_UF_SERVER_TRUST_ACCOUNT, ADS_UF_WORKSTATION_TRUST_ACCOUNT,
 };
+use config::DirdSettings;
 use directory_admin::{
-    computer_sam, filetime, new_object_descriptor, RandomSource, ACCOUNT_EXPIRES_NEVER,
-    RID_END_EXCLUSIVE, RID_FIRST,
+    computer_sam, filetime, new_object_descriptor, DnsRegistration, RandomSource,
+    ACCOUNT_EXPIRES_NEVER, RID_END_EXCLUSIVE, RID_FIRST,
 };
-use directory_pip::{account_salt, dstime_of, AccountKind, NamingContext, NC_RDN_ATTRIBUTE};
+use directory_pip::{
+    account_salt, dstime_of, host_address_value, registrable, AccountKind, NamingContext,
+    HOST_ADDRESS, NC_RDN_ATTRIBUTE,
+};
 use dirstore::{AttrId, ClassId, NodeId, INTEGRITY_KEY_LEN};
 use dtyp::{Guid, SecurityDescriptor, Sid, GUID_PACKET_LEN, SECURITY_NT_AUTHORITY};
+use ipc_keyd::{AttestationKeyOctets, ATTESTATION_KEY_OCTETS};
 use keyd_types::CHANGE_PASSWORD_SERVICE_NAME;
 use krb_proto::{KerberosTime, Realm};
 use pdp::Dn;
@@ -72,7 +100,7 @@ use zeroize::Zeroizing;
 use crate::configs::{domain_configs, ConfigFile, Daemon};
 use crate::descriptor::domain_root_descriptor;
 use crate::ids::{integer32, integer64, object_ref, text, ClassIds, SchemaIds};
-use crate::input::{Account, DomainInput, InputError, Paths, KRBTGT_NAME};
+use crate::input::{Account, DomainInput, InputError, InputErrorKind, Paths, KRBTGT_NAME};
 use crate::policy::{domain_policy, CreatableClasses, DomainPolicyInput};
 
 /// SECURITY_NT_NON_UNIQUE: the first SubAuthority of a domain SID.
@@ -113,6 +141,22 @@ impl IntegrityKeyMaterial {
 impl fmt::Debug for IntegrityKeyMaterial {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("IntegrityKeyMaterial(<redacted>)")
+    }
+}
+
+/// The owner of keyadm's input copy of the attestation key: keyadm's uid
+/// (its reader requires the running account's file — crates/keyadm
+/// `attestation_key`; docs/51 §4.4's password-file rule as PN9 adopted it)
+/// and root's group — the input names no gid for keyadm, a tool started
+/// directly as its account (docs/questions/Q-347 item 2), and the file's mode
+/// (0400) gives its group nothing; root's group is the group every file the
+/// installer creates as root already has.
+/// Spec: docs/questions/Q-1039 item 1 (A-183), Q-1055.
+#[must_use]
+pub const fn keyadm_key_owner(keyadm_uid: u32) -> Owner {
+    Owner {
+        uid: keyadm_uid,
+        gid: Owner::ROOT.gid,
     }
 }
 
@@ -211,6 +255,10 @@ pub enum PlanError {
     Salt,
     /// A planned RID or SID could not be formed.
     Sid,
+    /// dird's generated file names no DNS registration networks the write
+    /// checker accepts (task DN10b: the provisioning session's zone comes
+    /// from that file).
+    DnsRegistration,
 }
 
 impl fmt::Display for PlanError {
@@ -232,6 +280,9 @@ impl fmt::Display for PlanError {
             PlanError::ManifestRoundTrip => f.write_str("manifest did not parse back"),
             PlanError::Salt => f.write_str("a first administrator's salt cannot be formed"),
             PlanError::Sid => f.write_str("a SID could not be formed"),
+            PlanError::DnsRegistration => {
+                f.write_str("dird's generated file names no usable DNS registration networks")
+            }
         }
     }
 }
@@ -277,6 +328,8 @@ pub struct Plan {
     /// This DC's node id (dird's `node_id`, every write's `origin_node`).
     pub node_id: NodeId,
     key: IntegrityKeyMaterial,
+    /// The name-resolution attestation key (task PN12; module documentation).
+    attestation_key: AttestationKeyOctets,
     /// The objects, in creation order.
     pub objects: Vec<PlannedObject>,
     /// The policy.
@@ -291,6 +344,38 @@ pub struct Plan {
     pub paths: Paths,
     /// The owner of the database file (dird's account).
     pub store_owner: Owner,
+    /// The owner of keyadm's input copy of the attestation key (task PN12;
+    /// [`keyadm_key_owner`]).
+    pub keyadm_key_owner: Owner,
+    /// The provisioning session's host-record networks: dird's
+    /// `dns_registrable_networks` as its own schema parsed them back (task
+    /// DN10b; docs/questions/Q-1014).
+    pub dns_registration: DnsRegistration,
+}
+
+/// The registrable networks of dird's generated file, as dird's own schema
+/// parses them (crate config `DirdSettings::dns_service`), as the write
+/// checker's rule (`DnsRegistration::new`: at least one, all IPv4).
+///
+/// # Errors
+/// [`PlanError::DnsRegistration`]; a file its schema refuses
+/// ([`PlanError::Config`] — already checked by `parse_back`).
+///
+/// Spec: docs/54 §5.5; docs/questions/Q-1001 item 3, Q-1003 items 1-2,
+/// Q-1014.
+fn dird_dns_registration(configs: &[ConfigFile]) -> Result<DnsRegistration, PlanError> {
+    let dird = configs
+        .iter()
+        .find(|file| file.daemon == Daemon::Dird)
+        .ok_or(PlanError::DnsRegistration)?;
+    let settings = DirdSettings::parse(dird.text().as_bytes())
+        .map_err(|e| PlanError::Config(Daemon::Dird, e))?;
+    let networks = settings
+        .dns_service()
+        .ok_or(PlanError::DnsRegistration)?
+        .registrable_networks()
+        .to_vec();
+    DnsRegistration::new(networks).map_err(|_| PlanError::DnsRegistration)
 }
 
 /// The draws of step 2.
@@ -299,6 +384,7 @@ struct Draws {
     guids: Vec<Guid>,
     node_id: NodeId,
     key: IntegrityKeyMaterial,
+    attestation_key: AttestationKeyOctets,
 }
 
 /// Fill `out` from the CSPRNG. Spec: A-15 ("read_exact, fail closed").
@@ -336,11 +422,21 @@ fn draw<R: RandomSource>(rng: &mut R, objects: usize) -> Result<Draws, PlanError
     }
     let mut key = Zeroizing::new([0u8; INTEGRITY_KEY_LEN]);
     fill(rng, key.as_mut_slice())?;
+    // Task PN12 (docs/59 §7.4; A-173 on docs/questions/Q-1011 item 2:
+    // "drawn by `provision`"): the attestation key, last, into a zeroizing
+    // buffer (wiped when this returns) and from there into its carrier,
+    // which refuses the all-zero key — a source that gives it is broken
+    // (fail closed, like a zero node id).
+    let mut attestation = Zeroizing::new([0u8; ATTESTATION_KEY_OCTETS]);
+    fill(rng, attestation.as_mut_slice())?;
+    let attestation_key = AttestationKeyOctets::from_slice(attestation.as_slice())
+        .ok_or(PlanError::RandomUnusable)?;
     Ok(Draws {
         sub,
         guids,
         node_id: NodeId(node),
         key: IntegrityKeyMaterial(key),
+        attestation_key,
     })
 }
 
@@ -544,13 +640,28 @@ impl Plan {
                 values,
             }
         };
-        specs.push(computer(
+        // Task DN10b: the DC's own host record — its addresses as the
+        // internal host-address attribute (four octets each, RFC 1035
+        // §3.4.1; ad-schema `HOST_ADDRESS`), written with the DC account's
+        // create through the one checker's host-record rule (docs/54 §3.1:
+        // "written in `provision domain` only"; docs/questions/Q-1003 item 2).
+        let mut dc = computer(
             ObjectRole::DcComputer,
             &n.dc_name,
             ADS_UF_SERVER_TRUST_ACCOUNT,
             None,
             rid_dc,
+        );
+        dc.values.push((
+            HOST_ADDRESS,
+            checked
+                .dc_addresses
+                .iter()
+                .copied()
+                .map(host_address_value)
+                .collect(),
         ));
+        specs.push(dc);
         // The service objects: one SPN each, host in lower case (docs/10
         // §5b / A-46; RFC 4120 §6.2.1 as cited in docs/47 §1.3); WT
         // (docs/51 §4.3 step 5); the admin class per A-73.
@@ -741,6 +852,25 @@ impl Plan {
                 .map_err(|e| PlanError::Config(file.daemon, e))?;
         }
 
+        // Task DN10b: the provisioning session's zone — the registrable
+        // networks of dird's own parsed file (one rule set, dird's: the
+        // session and dird judge a host record against the same networks),
+        // and every DC address registrable in them by the write checker's own
+        // rule (directory-pip `registrable`), refused here with the flag's
+        // name before anything is written; the checker judges them again at
+        // the write (docs/54 §3.1, §5.5; docs/questions/Q-1003 item 2, Q-1014).
+        let dns_registration = dird_dns_registration(&configs)?;
+        if !checked
+            .dc_addresses
+            .iter()
+            .all(|address| registrable(*address, dns_registration.networks()))
+        {
+            return Err(PlanError::Input(InputError::new(
+                "dc-address",
+                InputErrorKind::DcAddressNotRegistrable,
+            )));
+        }
+
         // Step 8: the manifest, through the builder (which parses its own
         // canonical text, A-86).
         let guid_of = |role: ObjectRole| {
@@ -793,6 +923,7 @@ impl Plan {
             domain_sid,
             node_id: draws.node_id,
             key: draws.key,
+            attestation_key: draws.attestation_key,
             objects,
             policy,
             policy_file,
@@ -800,12 +931,20 @@ impl Plan {
             manifest,
             paths: input.paths.clone(),
             store_owner: Owner::from(input.accounts.dird),
+            keyadm_key_owner: keyadm_key_owner(input.accounts.keyadm_uid),
+            dns_registration,
         })
     }
 
     /// The integrity key (installer only). Spec: docs/51 §4.3 step 4.
     pub(crate) fn integrity_key(&self) -> &IntegrityKeyMaterial {
         &self.key
+    }
+
+    /// The attestation key (installer only: dird's file and keyadm's copy
+    /// are written from it). Spec: docs/59 §7.4, §10 (PN12).
+    pub(crate) fn attestation_key(&self) -> &AttestationKeyOctets {
+        &self.attestation_key
     }
 
     /// The planned object of `role`, if any.

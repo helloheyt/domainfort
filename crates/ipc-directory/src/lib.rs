@@ -39,8 +39,10 @@
 //!
 //! No message carries a role, a uid, a `now`, a key or a password: the
 //! caller is the connection's peer (docs/50 §3.2); account records carry key
-//! **handles** only, and salts are public string-to-key hints (RFC 4120
-//! 5.2.7.5). Nothing on this channel is secret.
+//! **handles** only — each record's one handle is the principal and purpose
+//! of its attested resolution (task PN10c) — and salts are public
+//! string-to-key hints (RFC 4120 5.2.7.5). Nothing on this channel is
+//! secret.
 //!
 //! # Security
 //!

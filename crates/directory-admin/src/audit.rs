@@ -248,11 +248,11 @@ impl EventBase {
                     base.names.push(name(AdminNameKind::UserPrincipalName, upn));
                 }
             }
+            // No dNSHostName in the request (task PN6b): the derived one is
+            // added by the create once it is computed (`derived_host_name`).
             Operation::CreateComputer(c) => {
                 base.parent = Some(c.parent);
                 base.names.push(name(AdminNameKind::Name, &c.name));
-                base.names
-                    .push(name(AdminNameKind::DnsHostName, &c.dns_host_name));
                 if let Some(spn) = &c.spn {
                     base.names
                         .push(name(AdminNameKind::ServicePrincipalName, spn));
@@ -308,6 +308,24 @@ impl EventBase {
             }
         }
         base
+    }
+
+    /// The dNSHostName a `CreateComputer` derived (task PN6b): the request
+    /// carries none, so the create names, once it has computed it, the value
+    /// it will write — the log keeps showing which host a new computer
+    /// holds (Q-340 item 4's names, the `DnsHostName` kind). Recorded at
+    /// most once: the create computes it once per evaluation (`Name`, the
+    /// optional SPN and this stay within `MAX_TARGET_NAMES`).
+    /// Spec: crate ipc-audit `AdminNameKind::DnsHostName`; docs/51 §5.7
+    /// item 1; docs/questions/Q-340 item 4, Q-1036 item 1, Q-1044 item 5.
+    pub(crate) fn derived_host_name(&mut self, host: &str) {
+        if !self
+            .names
+            .iter()
+            .any(|n| n.kind == AdminNameKind::DnsHostName)
+        {
+            self.names.push(name(AdminNameKind::DnsHostName, host));
+        }
     }
 
     /// The fields a `ChangePolicy` request determines (task A16): the

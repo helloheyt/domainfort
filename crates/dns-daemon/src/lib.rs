@@ -81,8 +81,9 @@
 //!   audit heartbeat at most (the shared gate's summary pace — Q-989); at a
 //!   stop the flush waits, bounded and while auditd is reachable, for the
 //!   counts still held; counts it cannot deliver (auditd unreachable, the
-//!   grace spent) are lost with the process and stay on the operational log
-//!   — docs/questions/Q-961 item 6, Q-989.
+//!   grace spent) are lost with the process and stay on the operational log,
+//!   where the stop's report also names how many never reached auditd —
+//!   docs/questions/Q-961 item 6, Q-989, Q-995.
 //! - No TKEY forwarding and no UDP UPDATE forwarding: dns-zone does not mark
 //!   them yet (DN9 / DR2); dird's replies are relayed on TCP without a
 //!   dns-zone `Reply::from_forwarded` (DR2) — Q-952.

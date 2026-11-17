@@ -10,3 +10,6 @@ datatracker.ietf.org
 pubs.opengroup.org
 www.itu.int
 csrc.nist.gov
+manpages.debian.org
+www.debian.org
+sourceware.org

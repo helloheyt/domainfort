@@ -19,8 +19,8 @@ mod common;
 
 use common::*;
 use directory_admin::{CreateGroup, Membership, Operation, RefusalStatus, Reply};
+use directory_pip::TicketSubjects;
 use ipc_audit::{AdminRefusal, DecisionResult, DirAdminStage};
-use kdc::AccountSource;
 
 /// groupType of a global security group and of a global distribution group
 /// ([MS-ADTS] 2.2.12: GROUP_TYPE_ACCOUNT_GROUP 0x2, GROUP_TYPE_SECURITY_ENABLED
@@ -58,17 +58,21 @@ fn add(group: dtyp::Guid, member: dtyp::Guid) -> Operation {
     Operation::AddMember(Membership { group, member })
 }
 
-/// Whether the account source (directory-pip's closure) resolves the account
-/// — i.e. it can log in.
+/// Whether directory-pip's ticket-subject lookup (its closure — the one
+/// expansion the KDC's account records carry too, R47-8) resolves the
+/// account — i.e. it can be a Subject (task PN10b: no account source, no
+/// signer).
 fn resolves(d: &Domain, sam: &str) -> bool {
-    d.view().client(&realm(), &ticket(sam).cname).is_ok()
+    d.view()
+        .ticket_subject(&realm(), &ticket(sam).cname)
+        .is_ok()
 }
 
 /// The number of groups in the account's closure, as directory-pip computes
 /// it.
 fn closure_size(d: &Domain, sam: &str) -> usize {
     d.view()
-        .client(&realm(), &ticket(sam).cname)
+        .ticket_subject(&realm(), &ticket(sam).cname)
         .unwrap()
         .unwrap()
         .groups

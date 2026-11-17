@@ -292,7 +292,7 @@ impl KerberosTime {
 /// divisible by 400) — the calendar of X.680 46.2's "calendar date". The
 /// crate's one calendar: [`KerberosTime::new`] validates with it and the
 /// time scale (crate::time) counts with it.
-pub(crate) fn is_leap_year(year: u16) -> bool {
+fn is_leap_year(year: u16) -> bool {
     (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 

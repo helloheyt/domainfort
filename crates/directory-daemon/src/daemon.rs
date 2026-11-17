@@ -8,9 +8,22 @@
 //!    `auditd_uid` and that auditd answers `Ping` (R50-3, R50-16).
 //! 2. **the directory** — open the redb file (dird is its only owner, R50-2)
 //!    with the integrity key (a wrong key ⇒ `Error::Tamper`, docs/50 §7.5),
-//!    build the directory context, take the tier map of the loaded policy,
-//!    and check the domain (naming-context root, domain SID, krbtgt account)
-//!    — then spawn the engine thread (R50-7).
+//!    refuse a store without the `principal-namespace` marker (task PN10:
+//!    a store whose principals did not all get their namespace keys from
+//!    the one checker is not opened — docs/59 §5.5; re-provision), build
+//!    the directory context, take the tier map of the loaded policy, and
+//!    check the domain (naming-context root, domain SID, krbtgt account) —
+//!    then spawn the engine thread (R50-7). Every directory context dird
+//!    builds — the directory-view, LDAP, admin, kpasswd and DNS services'
+//!    — comes from one constructor ([`dird_context`]) that installs the
+//!    manifest's provisioned service objects (Q-1019 (a); Q-1043), so no
+//!    service can forget them. dird's name-resolution signer (its
+//!    attestation key and its clock — docs/59 §7.4) is installed on the
+//!    directory-view (KDC channel) context only ([`kdc_channel_context`];
+//!    task PN10b): the KDC channel is the one consumer of the account
+//!    source whose records carry it; the other services' subject checks
+//!    read directory-pip's ticket-subject lookup, which attests nothing
+//!    (docs/59 §6.2, §6.4; docs/questions/Q-1047, A-187).
 //! 3. **the LDAP service** (task P10) — the engine (`ldap::Engine` with the
 //!    naming context and `dns_host_name`), the PDP snapshot of the same
 //!    policy file, its own directory context and tier map, the audit gate
@@ -21,7 +34,10 @@
 //!    bind, set the socket file's mode, accept (docs/50 §3.1; the one
 //!    stale-socket removal is the root-side preparation's, before the drop —
 //!    an occupied path fails the bind, task R15b). The admin socket is not
-//!    bound (task P13).
+//!    bound (task P13). The optional services follow — the admin and
+//!    kpasswd services (tasks A8, K7) and, independent of them, the DNS
+//!    service on `dird-dns.sock` (task DN10a, crate::dns_service): each
+//!    that cannot start is logged and the others run.
 //! 5. **until stopped** — [`DaemonControl::stop`]: stop accepting, answer
 //!    new requests `Unavailable`, wait (bounded) for queued requests, then
 //!    wait (bounded by [`AUDIT_FLUSH_GRACE`], the bound keyd and the kdc
@@ -30,7 +46,9 @@
 //!    dropped — and only then end the audit task; the events still
 //!    unacknowledged are reported (the log note
 //!    `AuditUnacknowledged` with their count, and
-//!    [`Stopped::unacknowledged_audit_events`]); remove the socket files,
+//!    [`Stopped::unacknowledged_audit_events`]), and so are the counts never
+//!    sent as a summary (one note per kind; [`Stopped::unflushed_audit`] —
+//!    docs/questions/Q-995); remove the socket files,
 //!    return; the caller drops the runtime, after which the engine threads
 //!    end and are joined ([`Stopped::join`]).
 //!
@@ -48,11 +66,13 @@
 use crate::admin_engine::AdminWorker;
 use crate::admin_listener::{self, AdminServeContext};
 use crate::admin_service::{
-    admin_service_handle, check_manifest, key_targets, protected_objects, AdminParams,
-    AdminServeParams, NotStarted,
+    admin_service_handle, check_manifest, key_targets, protected_objects, service_object_guids,
+    AdminParams, AdminServeParams, NotStarted,
 };
 use crate::audit_link::{self, AuditEndpoint, AuditLinkError};
 use crate::clock::SharedClock;
+use crate::dns_listener::{self, DnsServeContext};
+use crate::dns_service::{DnsNotStarted, DnsParams, DnsServeParams, DnsWorker, SerialAdvance};
 use crate::engine::{DirectoryEngine, EngineError, EnginePanicked, EngineThread};
 use crate::kpasswd_engine::KpasswdWorker;
 use crate::kpasswd_listener::{self, KpasswdServeContext};
@@ -63,19 +83,23 @@ use crate::ldap_audit::AuditGate;
 use crate::ldap_engine::LdapService;
 use crate::ldap_listener::{self, LdapServeContext};
 use crate::listener::{accept_loop, ServeContext};
-use crate::log::{note, Note};
+use crate::log::{audit_undelivered, note, Note};
 use crate::operation_ids::OperationIds;
 use crate::policy::{tier_map, DevelopmentPolicy};
 use core::fmt;
 use core::time::Duration;
-use directory_pip::{DirectoryContext, NamingContext};
+use directory_pip::{DirectoryContext, NamingContext, ViewError};
 use dirstore::{IntegrityKey, Store};
+use dtyp::Guid;
 use ipc_audit::WindowConfig;
-use ipc_directory_server::ViewLimits;
+use ipc_audit_client::Unflushed;
+use ipc_directory_server::{ResolutionSigner, SharedAttestationKey, ViewLimits};
+use ipc_dns_server::DnsFronts;
 use ipc_kpasswd::KpasswdFronts;
 use ipc_ldap_server::Fronts;
 use keyd_types::KeydConfig;
 use ldap::{Engine, EngineConfig, RootDseConfig};
+use std::collections::BTreeSet;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -163,6 +187,11 @@ pub struct DaemonParams {
     /// The DC's DNS host name, reported by the rootDSE ([MS-ADTS]
     /// 3.1.1.3.2.4).
     pub dns_host_name: String,
+    /// dird's name-resolution attestation key (task PN10; docs/59 §7.4),
+    /// read from `attestation_key_path` as root before the drop
+    /// (`startup::read_attestation_key`). Never printed (its `Debug` shows
+    /// no octet).
+    pub attestation_key: SharedAttestationKey,
 }
 
 impl From<DaemonParams> for ServeParams {
@@ -192,6 +221,7 @@ impl From<DaemonParams> for ServeParams {
             dns_host_name: params.dns_host_name,
             audit_window: WindowConfig::DEFAULT,
             clock: SharedClock::system(),
+            attestation_key: params.attestation_key,
         }
     }
 }
@@ -241,8 +271,12 @@ pub struct ServeParams {
     pub dns_host_name: String,
     /// The LDAP events' sender window (A-57; `WindowConfig::DEFAULT`).
     pub audit_window: WindowConfig,
-    /// The LDAP engine's clock (the system clock; tests inject one).
+    /// The LDAP engine's clock (the system clock; tests inject one) — also
+    /// the clock dird's name-resolution signer (on the KDC channel's context
+    /// only, task PN10b) stamps `issued_at` with (task PN10; docs/59 §7.1).
     pub clock: SharedClock,
+    /// dird's name-resolution attestation key (task PN10; docs/59 §7.4).
+    pub attestation_key: SharedAttestationKey,
 }
 
 /// Where the directory comes from.
@@ -331,6 +365,11 @@ pub enum DaemonError {
     /// The LDAP socket could not be bound or its mode set (an occupied path
     /// included, as for [`DaemonError::Bind`]).
     LdapBind,
+    /// The store has no `principal-namespace` marker (task PN10): its
+    /// principals did not all get their namespace keys from the one checker
+    /// — a store from before task PN5, or written beneath the checker. dird
+    /// does not open it; re-provision (docs/59 §5.5).
+    NoPrincipalNamespace,
 }
 
 impl fmt::Display for DaemonError {
@@ -354,6 +393,9 @@ impl fmt::Display for DaemonError {
                 f.write_str("LDAP engine refused the naming context or the DNS host name")
             }
             DaemonError::LdapBind => f.write_str("dird-ldap socket could not be bound"),
+            DaemonError::NoPrincipalNamespace => f.write_str(
+                "directory store has no principal-namespace marker: re-provision it",
+            ),
         }
     }
 }
@@ -409,8 +451,10 @@ pub struct Stopped {
     admin_engine: Option<EngineThread>,
     /// The kpasswd thread, if the kpasswd service ran (task K7).
     kpasswd_engine: Option<EngineThread>,
+    /// The DNS thread, if the DNS service ran (task DN10a).
+    dns_engine: Option<EngineThread>,
     engine_failed: bool,
-    unacknowledged: usize,
+    unflushed: Unflushed,
 }
 
 impl Stopped {
@@ -422,16 +466,26 @@ impl Stopped {
 
     /// The LDAP audit events auditd had not acknowledged when the stop
     /// ended the audit task (after waiting up to [`AUDIT_FLUSH_GRACE`]):
-    /// lost with the process (Q-252 item 9). 0 after a clean stop.
+    /// lost with the process (Q-252 item 9). 0 after a clean stop. Only the
+    /// events part: the whole report is [`Stopped::unflushed_audit`].
     /// Spec: docs/50 R50-17, §8.1; docs/questions/Q-313 (A-82).
     #[must_use]
     pub fn unacknowledged_audit_events(&self) -> usize {
-        self.unacknowledged
+        self.unflushed.events()
     }
 
-    /// Wait for the engine threads (the admin thread and the kpasswd
-    /// thread too, if their services ran); call after the runtime was
-    /// dropped.
+    /// Everything the stop could not deliver to auditd — the events above
+    /// and the counts never sent as a summary (`suppressed_noise`,
+    /// `refused_gating`, `unrecorded_outcomes`): the shared flush's whole
+    /// report (`ipc_audit_client::AuditGate::close`), read with
+    /// `Unflushed::undelivered` (docs/questions/Q-990 item 4, A-166; Q-995).
+    /// Spec: docs/questions/Q-313 (A-82), Q-995.
+    pub fn unflushed_audit(&self) -> Unflushed {
+        self.unflushed
+    }
+
+    /// Wait for the engine threads (the admin, kpasswd and DNS threads
+    /// too, if their services ran); call after the runtime was dropped.
     ///
     /// # Errors
     /// [`EnginePanicked`] if any unwound.
@@ -440,7 +494,8 @@ impl Stopped {
         let ldap = self.ldap_engine.join();
         let admin = self.admin_engine.map_or(Ok(()), EngineThread::join);
         let kpasswd = self.kpasswd_engine.map_or(Ok(()), EngineThread::join);
-        directory.and(ldap).and(admin).and(kpasswd)
+        let dns = self.dns_engine.map_or(Ok(()), EngineThread::join);
+        directory.and(ldap).and(admin).and(kpasswd).and(dns)
     }
 }
 
@@ -497,6 +552,85 @@ fn bind_ldap(path: &Path) -> Result<UnixListener, DaemonError> {
     bind(path).map_err(|_| DaemonError::LdapBind)
 }
 
+/// What every directory context of dird carries besides the schema, keyd's
+/// configuration and the naming context: the provisioned service objects
+/// (task PN10). **Not** the name-resolution signer (task PN10b): the admin,
+/// kpasswd, DNS and LDAP services receive these parts and never a signer.
+/// They still see `ServeParams` (and so the attestation key's handle);
+/// that only [`kdc_channel_context`] builds and installs a signer is pinned
+/// by a source scan (crates/directory-pip
+/// tests/only_the_kdc_channel_attests.rs; docs/questions/Q-1047, A-187).
+/// Spec: docs/59 §4.3, §6.2, §7.5; docs/questions/Q-1019 (a), Q-1027 item
+/// 7, Q-1043, Q-1047.
+#[derive(Clone)]
+struct ContextParts {
+    /// The manifest's provisioned service objects (empty without the admin
+    /// service, which is where dird reads its manifest).
+    service_objects: BTreeSet<Guid>,
+}
+
+impl ContextParts {
+    /// The parts of the admin service's manifest, when the admin service is
+    /// configured: its service objects (`admin_service::service_object_guids`
+    /// — the set the write PEP protects, one derivation). Without the
+    /// manifest the set is empty, and the one lookup path resolves no
+    /// reserved name (crate directory-pip `resolve`, step 8 — fail closed).
+    /// Spec: docs/59 §4.3; docs/questions/Q-1019 (a), Q-1027 items 6, 7,
+    /// Q-1043, Q-1046.
+    fn new(admin: Option<&AdminServeParams>) -> ContextParts {
+        let service_objects = admin
+            .map(|admin| service_object_guids(&admin.manifest))
+            .unwrap_or_default();
+        ContextParts { service_objects }
+    }
+}
+
+/// The one constructor of dird's directory contexts (module documentation,
+/// step 2): `DirectoryContext::new` over `schema`, keyd's configuration and
+/// the naming context, with the provisioned service objects — so every
+/// lookup re-derives the keys the checker stored (Q-1019 (a)). **No**
+/// name-resolution signer: the admin, kpasswd, DNS and LDAP services' subject
+/// checks read directory-pip's ticket-subject lookup, which attests nothing
+/// (task PN10b; docs/59 §6.2, §6.4), and their service-object checks call the
+/// one lookup path directly (task PN10) — so their account source, never
+/// read, would answer `Failed` (fail closed). Only
+/// [`kdc_channel_context`] adds the signer.
+/// Spec: docs/59 §4.3, §6.2, §6.4; docs/questions/Q-1019 (a), Q-1027 item
+/// 7, Q-1043 (A-185), Q-1047 (A-187); docs/52 C14 (one constructor).
+fn dird_context(
+    schema: ad_schema::Phase1Schema,
+    params: &ServeParams,
+    parts: &ContextParts,
+) -> Result<DirectoryContext, ViewError> {
+    Ok(
+        DirectoryContext::new(schema, &params.keyd, params.naming_context.clone())?
+            .with_service_objects(parts.service_objects.clone()),
+    )
+}
+
+/// The directory-view (KDC channel) context — the only one that carries
+/// dird's name-resolution signer (task PN10b): [`dird_context`] plus a
+/// `ResolutionSigner` built here, from `params`'s attestation key and dird's
+/// clock, so every `Client` / `Service` record the KDC channel answers
+/// carries dird's attested resolution (docs/59 §7.5). The signer is built
+/// in this function and handed to no other: the KDC channel is the one
+/// consumer of the account source (docs/questions/Q-1047 item 1 — class "a
+/// component obtains a capability it does not need").
+/// Spec: docs/59 §7.1, §7.4, §7.5; docs/questions/Q-1011 item 2 (A-173),
+/// Q-1046 items 4-5, Q-1047 (A-187).
+fn kdc_channel_context(
+    schema: ad_schema::Phase1Schema,
+    params: &ServeParams,
+    parts: &ContextParts,
+) -> Result<DirectoryContext, ViewError> {
+    let clock = params.clock.clone();
+    let signer = Arc::new(ResolutionSigner::new(
+        params.attestation_key.clone(),
+        Arc::new(move || clock.now()),
+    ));
+    Ok(dird_context(schema, params, parts)?.with_name_resolution_signer(signer))
+}
+
 /// Wait until `done()` or `grace` passed.
 async fn wait_until(grace: Duration, done: impl Fn() -> bool) {
     let start = Instant::now();
@@ -520,9 +654,11 @@ struct AdminRunning {
 /// `dird-admin.sock`, accept. Any failure ⇒ [`NotStarted`]: dird's other
 /// services run regardless (docs/51 §4.6).
 /// Spec: docs/51 §4.6, §5.3, §7.1, §7.5; A-73; docs/questions/Q-386.
+#[allow(clippy::too_many_arguments)]
 fn start_admin(
     admin: AdminServeParams,
     params: &ServeParams,
+    parts: &ContextParts,
     store: &Arc<Store>,
     policy: &DevelopmentPolicy,
     gate: &Arc<AuditGate>,
@@ -537,8 +673,7 @@ fn start_admin(
         &params.dns_host_name,
     )?;
     let schema = ad_schema::phase1().map_err(|_| NotStarted::Configuration)?;
-    let ctx = DirectoryContext::new(schema.clone(), &params.keyd, params.naming_context.clone())
-        .map_err(|_| NotStarted::Configuration)?;
+    let ctx = dird_context(schema.clone(), params, parts).map_err(|_| NotStarted::Configuration)?;
     let tiers = tier_map(policy).map_err(|_| NotStarted::Configuration)?;
     let snapshot = policy.snapshot().map_err(|_| NotStarted::Configuration)?;
     let service = {
@@ -647,6 +782,7 @@ fn start_kpasswd(
     kpasswd: KpasswdServeParams,
     admin: &AdminServeParams,
     params: &ServeParams,
+    parts: &ContextParts,
     store: &Arc<Store>,
     policy: &DevelopmentPolicy,
     gate: &Arc<AuditGate>,
@@ -655,7 +791,7 @@ fn start_kpasswd(
 ) -> Result<KpasswdRunning, KpasswdNotStarted> {
     let factory = kpasswd.keyd.clone().ok_or(KpasswdNotStarted::NoKeyd)?;
     let schema = ad_schema::phase1().map_err(|_| KpasswdNotStarted::Configuration)?;
-    let ctx = DirectoryContext::new(schema.clone(), &params.keyd, params.naming_context.clone())
+    let ctx = dird_context(schema.clone(), params, parts)
         .map_err(|_| KpasswdNotStarted::Configuration)?;
     let tiers = tier_map(policy).map_err(|_| KpasswdNotStarted::Configuration)?;
     let snapshot = policy
@@ -729,6 +865,113 @@ fn start_kpasswd(
     })
 }
 
+/// A running DNS service (task DN10a).
+struct DnsRunning {
+    context: Arc<DnsServeContext>,
+    accept: JoinHandle<()>,
+    thread: EngineThread,
+    socket: PathBuf,
+}
+
+/// Start the DNS service (task DN10a; docs/54 §4.6): its own directory
+/// context and tier map of the loaded policy, the serial-only write's door
+/// (task DN10b), then the DNS thread, whose first step is the start
+/// ([`DnsWorker::start`]): the zone must project — a directory whose zone
+/// cannot be projected (no DC host address, no zone serial counter, …)
+/// would serve nothing, so the service does not start and says why — then
+/// the start's serial advance through the one checker, its decision
+/// acknowledged by auditd (docs/questions/Q-1002 item 4 (b): zone values
+/// changed in dird's file are never served under an earlier SERIAL), then
+/// the first projection. Only then `dird-dns.sock` is bound and accepted
+/// on. Independent of the admin and kpasswd services: the zone image and
+/// the serial advance need neither keyd nor the write PEP
+/// (docs/questions/Q-1000 item 1). Any failure ⇒ [`DnsNotStarted`]: dird's
+/// other services run (the admin service's precedent, docs/51 §4.6); a
+/// provisioned dnsd then stops at its dird check (docs/54 §4.8 — fail
+/// closed).
+/// Spec: docs/54 §4.3, §4.4, §4.6, §4.8, §5.4; docs/50 R50-3, R50-7;
+/// docs/questions/Q-1002 (A-172).
+#[allow(clippy::too_many_arguments)]
+async fn start_dns(
+    dns: DnsServeParams,
+    params: &ServeParams,
+    parts: &ContextParts,
+    store: &Arc<Store>,
+    policy: &DevelopmentPolicy,
+    gate: &Arc<AuditGate>,
+    state: &Arc<ControlState>,
+    ids: &Arc<OperationIds>,
+) -> Result<(DnsRunning, u32), DnsNotStarted> {
+    let schema = ad_schema::phase1().map_err(|_| DnsNotStarted::Configuration)?;
+    let writer = directory_admin::ZoneSerialWriter::new(&schema)
+        .map_err(|_| DnsNotStarted::Configuration)?;
+    let ctx = dird_context(schema, params, parts).map_err(|_| DnsNotStarted::Configuration)?;
+    let tiers = tier_map(policy).map_err(|_| DnsNotStarted::Configuration)?;
+    let advance = SerialAdvance::new(
+        writer,
+        Arc::clone(gate),
+        Arc::clone(ids),
+        dns.min_serial_advance_interval,
+    );
+    let worker = DnsWorker::new(
+        Arc::clone(store),
+        ctx,
+        tiers,
+        dns.zone.clone(),
+        params.clock.clone(),
+        advance,
+    );
+    let ended = Arc::clone(state);
+    let (started, start) = tokio::sync::oneshot::channel();
+    let (handle, thread) = worker
+        .spawn(dns.queue_capacity, started, move || {
+            ended.engine_ended.store(true, Ordering::SeqCst);
+            ended.stopping.store(true, Ordering::SeqCst);
+            ended.stop.notify_one();
+        })
+        .map_err(|_| DnsNotStarted::Spawn)?;
+    // The start runs on the DNS thread (its acknowledgement wait must not
+    // block this runtime, which runs the audit client); the thread ends at
+    // once when it fails.
+    let serial = match start.await {
+        Ok(Ok(serial)) => serial,
+        Ok(Err(reason)) => {
+            drop(handle);
+            let _ = thread.join();
+            return Err(reason);
+        }
+        Err(_) => {
+            drop(handle);
+            let _ = thread.join();
+            return Err(DnsNotStarted::Spawn);
+        }
+    };
+    let listener = match bind(&dns.socket) {
+        Ok(listener) => listener,
+        Err(_) => {
+            drop(handle);
+            let _ = thread.join();
+            return Err(DnsNotStarted::Bind);
+        }
+    };
+    let context = Arc::new(DnsServeContext::new(
+        DnsFronts::new(dns.dnsd_uid),
+        params.frame_timeout,
+        dns.max_connections,
+        handle,
+    ));
+    let accept = tokio::spawn(dns_listener::accept_loop(listener, Arc::clone(&context)));
+    Ok((
+        DnsRunning {
+            context,
+            accept,
+            thread,
+            socket: dns.socket,
+        },
+        serial,
+    ))
+}
+
 /// Run dird's directory-view service and its LDAP service until
 /// [`DaemonControl::stop`] (module documentation); no admin service. The
 /// product parameters run with the daemon's production constants (docs/52
@@ -747,6 +990,7 @@ pub async fn serve(
 ) -> Result<Stopped, DaemonError> {
     serve_with(
         ServeParams::from(params),
+        None,
         None,
         None,
         source,
@@ -784,14 +1028,16 @@ pub async fn serve_with_admin(
     policy: DevelopmentPolicy,
     control: DaemonControl,
 ) -> Result<Stopped, DaemonError> {
-    serve_with_services(params, admin, None, source, policy, control).await
+    serve_with_services(params, admin, None, None, source, policy, control).await
 }
 
 /// [`serve_with_admin`], plus — when `kpasswd` is given — the kpasswd
-/// service on `dird-kpasswd.sock` (task K7; docs/53 §5.6). The kpasswd
-/// service runs only with the admin service, whose settings it shares (the
-/// ticket-age threshold, the manifest, the node-id, keyd); when it cannot
-/// start, dird logs why and runs its other services.
+/// service on `dird-kpasswd.sock` (task K7; docs/53 §5.6), and — when `dns`
+/// is given — the DNS service on `dird-dns.sock` (task DN10a; docs/54
+/// §4.6). The kpasswd service runs only with the admin service, whose
+/// settings it shares (the ticket-age threshold, the manifest, the node-id,
+/// keyd); the DNS service needs neither. When either cannot start, dird
+/// logs why and runs its other services.
 ///
 /// # Errors
 /// [`DaemonError`] for a start-up failure of the directory-view or LDAP
@@ -802,12 +1048,13 @@ pub async fn serve_with_admin(
 /// admin service's keyd and dird's realm) and its production bounds
 /// (docs/52 C18).
 ///
-/// Spec: docs/53 §5.6; docs/51 §4.6, §7; docs/50 R50-3, R50-7; docs/52
-/// §3.18.
+/// Spec: docs/53 §5.6; docs/54 §4.6; docs/51 §4.6, §7; docs/50 R50-3,
+/// R50-7; docs/52 §3.18.
 pub async fn serve_with_services(
     params: DaemonParams,
     admin: Option<AdminParams>,
     kpasswd: Option<KpasswdParams>,
+    dns: Option<DnsParams>,
     source: StoreSource,
     policy: DevelopmentPolicy,
     control: DaemonControl,
@@ -817,10 +1064,12 @@ pub async fn serve_with_services(
     let kpasswd =
         kpasswd.map(|kpasswd| KpasswdServeParams::production(kpasswd, keyd.as_ref(), &realm));
     let admin = admin.map(|admin| AdminServeParams::production(admin, &realm));
+    let dns = dns.map(DnsServeParams::production);
     serve_with(
         ServeParams::from(params),
         admin,
         kpasswd,
+        dns,
         source,
         policy,
         control,
@@ -843,6 +1092,7 @@ pub async fn serve_with(
     params: ServeParams,
     admin: Option<AdminServeParams>,
     kpasswd: Option<KpasswdServeParams>,
+    dns: Option<DnsServeParams>,
     source: StoreSource,
     policy: DevelopmentPolicy,
     control: DaemonControl,
@@ -863,9 +1113,16 @@ pub async fn serve_with(
         } => Arc::new(open_store(&path, key, owner_uid)?),
         StoreSource::Opened(OpenedStore(store)) => store,
     };
+    // Task PN10: a store without the principal-namespace marker is not
+    // opened (docs/59 §5.5; Q-1043, A-185) — whichever source it came from.
+    if !directory_pip::principal_namespace_marked(&store).map_err(|_| DaemonError::Store)? {
+        return Err(DaemonError::NoPrincipalNamespace);
+    }
+    let parts = ContextParts::new(admin.as_ref());
     let schema = ad_schema::phase1().map_err(|_| DaemonError::Schema)?;
-    let ctx = DirectoryContext::new(schema, &params.keyd, params.naming_context.clone())
-        .map_err(|_| DaemonError::Context)?;
+    // The KDC channel's context — the one context with dird's signer (task
+    // PN10b; docs/questions/Q-1047).
+    let ctx = kdc_channel_context(schema, &params, &parts).map_err(|_| DaemonError::Context)?;
     let tiers = tier_map(&policy).map_err(|_| DaemonError::Policy)?;
     let limits = ViewLimits {
         max_views: params.max_views,
@@ -880,8 +1137,7 @@ pub async fn serve_with(
     //    the engine, the audit gate. No zone table: the zone is the
     //    front's, from its peer uid (docs/52 R14).
     let ldap_schema = ad_schema::phase1().map_err(|_| DaemonError::Schema)?;
-    let ldap_ctx = DirectoryContext::new(ldap_schema, &params.keyd, params.naming_context.clone())
-        .map_err(|_| DaemonError::Context)?;
+    let ldap_ctx = dird_context(ldap_schema, &params, &parts).map_err(|_| DaemonError::Context)?;
     let ldap_tiers = tier_map(&policy).map_err(|_| DaemonError::Policy)?;
     let snapshot = policy.snapshot().map_err(|_| DaemonError::PolicySnapshot)?;
     let ldap_engine = Engine::new(EngineConfig {
@@ -981,7 +1237,16 @@ pub async fn serve_with(
     let admin_running = match admin {
         None => None,
         Some(admin) => {
-            match start_admin(admin, &params, &store, &policy, &gate, &control.state, &ids) {
+            match start_admin(
+                admin,
+                &params,
+                &parts,
+                &store,
+                &policy,
+                &gate,
+                &control.state,
+                &ids,
+            ) {
                 Ok(running) => {
                     note(Note::AdminListening, None);
                     Some(running)
@@ -1002,6 +1267,7 @@ pub async fn serve_with(
             kpasswd,
             admin,
             &params,
+            &parts,
             &store,
             &policy,
             &gate,
@@ -1023,6 +1289,34 @@ pub async fn serve_with(
                 Some(KpasswdNotStarted::NoAdminService.code()),
             );
             None
+        }
+    };
+    // The DNS service (task DN10a), optional and independent of the admin
+    // service: a failure is logged and dird serves on without it.
+    let dns_running = match dns {
+        None => None,
+        Some(dns) => {
+            match start_dns(
+                dns,
+                &params,
+                &parts,
+                &store,
+                &policy,
+                &gate,
+                &control.state,
+                &ids,
+            )
+            .await
+            {
+                Ok((running, serial)) => {
+                    note(Note::DnsListening, Some(u64::from(serial)));
+                    Some(running)
+                }
+                Err(reason) => {
+                    note(Note::DnsNotStarted, Some(reason.code()));
+                    None
+                }
+            }
         }
     };
     drop(store);
@@ -1053,6 +1347,14 @@ pub async fn serve_with(
         }
         None => None,
     };
+    let dns_parts = match dns_running {
+        Some(running) => {
+            running.accept.abort();
+            let _ = running.accept.await;
+            Some((running.context, running.thread, running.socket))
+        }
+        None => None,
+    };
     control.state.serving.store(false, Ordering::SeqCst);
     context.start_draining();
     ldap_context.start_draining();
@@ -1061,6 +1363,9 @@ pub async fn serve_with(
     }
     if let Some((kpasswd_context, _, _)) = kpasswd_parts.as_ref() {
         kpasswd_context.start_draining();
+    }
+    if let Some((dns_context, _, _)) = dns_parts.as_ref() {
+        dns_context.start_draining();
     }
     wait_until(DRAIN_GRACE, || {
         context.in_flight() == 0
@@ -1071,6 +1376,9 @@ pub async fn serve_with(
             && kpasswd_parts
                 .as_ref()
                 .is_none_or(|(kpasswd_context, _, _)| kpasswd_context.in_flight() == 0)
+            && dns_parts
+                .as_ref()
+                .is_none_or(|(dns_context, _, _)| dns_context.in_flight() == 0)
     })
     .await;
     // Q-313 (A-82: "waits, bounded, for auditd's acknowledgement of every
@@ -1080,22 +1388,18 @@ pub async fn serve_with(
     // audit task keeps reconnecting (crate::audit_link) and a link that
     // dropped just before the stop can still deliver within the bound
     // (docs/questions/Q-350 item 11). The one flush of every daemon
-    // (`ipc_audit_client::AuditGate::close`, docs/52 R6).
-    let unacknowledged = gate
+    // (`ipc_audit_client::AuditGate::close`, docs/52 R6). The report names
+    // every event auditd did not acknowledge and every count never sent as
+    // a summary (docs/questions/Q-990 item 4, A-166; Q-995).
+    let unflushed = gate
         .close(AUDIT_FLUSH_GRACE, async {
             audit_task.abort();
             let _ = audit_task.await;
         })
-        .await
-        .events();
-    if unacknowledged > 0 {
-        note(
-            Note::AuditUnacknowledged,
-            Some(u64::try_from(unacknowledged).unwrap_or(u64::MAX)),
-        );
-    }
+        .await;
+    audit_undelivered(unflushed);
     // Whether an engine ended before the stop asked for it — read before
-    // the admin and kpasswd contexts are dropped below: dropping a context
+    // the admin, kpasswd and DNS contexts are dropped below: dropping a context
     // drops its thread's queue, which ends that thread (its `on_exit` then
     // marks it ended), and a thread ended by the stop is no failure.
     let engine_failed = control.state.engine_ended.load(Ordering::SeqCst);
@@ -1109,6 +1413,10 @@ pub async fn serve_with(
         let _ = std::fs::remove_file(&socket);
         thread
     });
+    let dns_engine = dns_parts.map(|(_, thread, socket)| {
+        let _ = std::fs::remove_file(&socket);
+        thread
+    });
     if engine_failed {
         note(Note::EngineStopped, None);
     }
@@ -1118,7 +1426,8 @@ pub async fn serve_with(
         ldap_engine: ldap_thread,
         admin_engine,
         kpasswd_engine,
+        dns_engine,
         engine_failed,
-        unacknowledged,
+        unflushed,
     })
 }

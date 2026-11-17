@@ -393,6 +393,9 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> fmt::Debug for Keyd<S, A, E> {
             )
             .field("decisions", &self.decisions.len())
             .field("ceremony", &self.ceremony)
+            // Whether the store holds the attestation key — never the key
+            // (it has no Debug; A-190: it lives in the store).
+            .field("attestation_key_installed", &self.has_attestation_key())
             .finish()
     }
 }
@@ -439,11 +442,28 @@ fn authorize(
         return Err(Deny::denied(AuditReason::RoleNotPermitted));
     }
     for (slot, handle) in handles {
-        if !purpose_permitted(op, *slot, handle.purpose) {
-            return Err(Deny::denied(AuditReason::PurposeMismatch));
-        }
+        admit_resolved(op, *slot, handle)?;
     }
     Ok(())
+}
+
+/// Check (b) of [`authorize`] alone — the handle's purpose matches its slot
+/// in the capability table (`PurposeMismatch` otherwise) — for a handle
+/// keyd derived itself from a name resolution it verified (task PN11b): the
+/// key set of an issuance that no handle in the request names (the AS
+/// client, the change-password service, the TGS service). The role and the
+/// hold-down were checked at admission ([`Keyd::admit`]), before the
+/// resolution's fields were used (docs/59 §7.2 step 1: the tag before any
+/// field); the capability table stays the one definition of which purposes
+/// a slot accepts.
+/// Spec: docs/10 §2 ("(b) the KeyPurpose of the handle matches the
+/// operation"), §12 I3; docs/59 §7.1, §7.2; docs/questions/Q-1067.
+pub(crate) fn admit_resolved(op: Operation, slot: HandleSlot, handle: &KeyHandle) -> Internal<()> {
+    if purpose_permitted(op, slot, handle.purpose) {
+        Ok(())
+    } else {
+        Err(Deny::denied(AuditReason::PurposeMismatch))
+    }
 }
 
 /// Fill `out` from the entropy source; failure is `Unavailable` (fail

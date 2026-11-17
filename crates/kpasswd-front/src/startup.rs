@@ -27,6 +27,7 @@
 use crate::daemon::Listeners;
 use config::KpasswdFrontSettings;
 use core::fmt;
+use core::net::SocketAddr;
 use daemon_sandbox::{HardeningPlan, PlanError, ProcessIdentity};
 use protected_file::{configuration_file_rule, OpenError};
 use std::fs::File;
@@ -132,19 +133,29 @@ pub fn read_settings(path: &Path, owner: u32) -> Result<KpasswdFrontSettings, St
     KpasswdFrontSettings::parse(&contents).map_err(|error| StartupError::Config(error.to_string()))
 }
 
-/// Bind the configured TCP listeners (port 464 in a deployment; crates/
-/// config refuses unspecified, multicast and port-0 addresses and any
-/// address outside the internal networks). TCP only: no UDP socket is ever
-/// created (A-117; docs/questions/Q-602 (a)). Called as root, before the
-/// drop (module documentation).
+/// Bind the configured TCP listeners (port 464 — the port the zone
+/// advertises: crates/config refuses any other, task DN10c — and refuses
+/// unspecified, multicast and port-0 addresses and any address outside the
+/// internal networks). TCP only: no UDP socket is ever created (A-117;
+/// docs/questions/Q-602 (a)). Called as root, before the drop (module
+/// documentation).
 ///
 /// # Errors
 /// [`StartupError::Bind`].
 ///
-/// Spec: docs/53 R53-3, §3.3; RFC 3244 §2 ("TCP port 464"); docs/50 §6.2.
+/// Spec: docs/53 R53-3, §3.3; RFC 3244 §2 ("TCP port 464"); [MS-ADTS]
+/// §6.3.2.3; docs/50 §6.2; docs/questions/Q-1024.
 pub fn bind_listeners(settings: &KpasswdFrontSettings) -> Result<Listeners, StartupError> {
-    let tcp = settings
-        .listen()
+    bind_addresses(settings.listen())
+}
+
+/// The binding itself, over the addresses [`bind_listeners`] takes from the
+/// settings — its only product caller, so every address is one the front's
+/// schema accepted (port 464). Crate-private: the in-crate test binds it on
+/// a loopback port the system picks (task DN10c — no product path takes an
+/// address that is not from the file).
+pub(crate) fn bind_addresses(addresses: &[SocketAddr]) -> Result<Listeners, StartupError> {
+    let tcp = addresses
         .iter()
         .map(|address| {
             std::net::TcpListener::bind(address)

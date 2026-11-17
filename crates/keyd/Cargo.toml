@@ -42,6 +42,24 @@ keyd-types = { path = "../keyd-types" }
 krb-crypto = { path = "../krb-crypto" }
 # Typed RFC 4120 messages with strict DER (EncTicketPart, EncASRepPart, ...).
 krb-proto = { path = "../krb-proto" }
+# The verifier's side of dird's name-resolution attestation (task PN8;
+# docs/59 §7.2, §7.4; decision A-173 — docs/questions/Q-1011): the
+# `AttestationKey` keyd holds (installed in the ceremony, never exported) and
+# `verify`, whose proof type `AuthenticatedNameResolution` is the only way to
+# keyd's `VerifiedNameResolution`. Our own workspace crate; it links
+# HMAC-SHA-256 (RustCrypto `hmac` + `sha2`, already in the lock) and the
+# crypto-free keyd-types — no new third-party package (docs/CLEAN-ROOM.md). Only
+# dird and keyd link it (crates/keyd-types tests/no_crypto_dependency.rs,
+# crates/kdc-daemon tests/no_store_or_crypto.rs); keyd never calls its
+# signer `tag` (tests/attestation_key_custody.rs).
+name-attestation = { path = "../name-attestation" }
+# The one name equivalence of the principal namespace (task PN1; docs/59
+# §4.2, §7.2; class C49): the door `store::bound_by` compares the key set's
+# bound name with a verified resolution's canonical name by the namespace
+# key (`key_of_request`), never octet for octet — keyd holds no second
+# equivalence. Our own pure leaf crate (krb-proto, keyd-types; no I/O, no
+# crypto, no external crate).
+principal-names = { path = "../principal-names" }
 # RustCrypto `zeroize` (already in the workspace lock via krb-crypto/krb-proto):
 # wipes plaintext passwords, session keys and key-bearing buffers on drop.
 zeroize = { version = "1.9", default-features = false, features = ["alloc"] }

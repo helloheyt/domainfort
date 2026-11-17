@@ -63,7 +63,9 @@ use crate::audit_convert::ldap_event;
 use crate::log::{note, Note};
 use core::future::Future;
 use core::time::Duration;
-use ipc_audit::{DirAdminEvent, EventBody, ReportedAddress, Reservation, WindowConfig};
+use ipc_audit::{
+    DirAdminEvent, EventBody, ReportedAddress, Reservation, WindowConfig, ZoneSerialEvent,
+};
 use ipc_audit_client::{AckedIntent, FlushWait, IntentRecord, PendingIntent, Unflushed};
 use ipc_ldap::ReportedPeer;
 use ldap::{AuditEvent, AuditOperation};
@@ -206,6 +208,29 @@ impl AuditGate {
         let result = self
             .core
             .commit(reservation, &EventBody::DirAdmin(Box::new(event.clone())))
+            .map_err(|_| RecordLost);
+        self.wake.notify_one();
+        result
+    }
+
+    /// Put one `ZoneSerial` outcome event (dird's serial-only zone write —
+    /// task DN10b, crate::dns_service) into its reserved slot; returns its
+    /// sequence number, and wakes the audit client to send it. The decision
+    /// event goes through [`AuditGate::begin_intent`] like every decision.
+    ///
+    /// # Errors
+    /// [`RecordLost`] (cannot happen for an event built from ipc-audit's
+    /// types): the caller counts the lost outcome.
+    ///
+    /// Spec: docs/51 §5.7 item 2; docs/questions/Q-1013; A-85.
+    pub(crate) fn commit_zone_serial(
+        &self,
+        reservation: Reservation,
+        event: &ZoneSerialEvent,
+    ) -> Result<u64, RecordLost> {
+        let result = self
+            .core
+            .commit(reservation, &EventBody::ZoneSerial(Box::new(event.clone())))
             .map_err(|_| RecordLost);
         self.wake.notify_one();
         result

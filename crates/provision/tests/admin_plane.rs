@@ -170,6 +170,12 @@ impl Domain {
         let policy = policy_file.snapshot().unwrap();
         let realm = Realm::new("EXAMPLE.TEST").unwrap();
         let nc = NamingContext::new(&["example", "test"]).unwrap();
+        // No signer (task PN10c; A-189): the write PEP's subject check reads
+        // the ticket's subject through `TicketSubjects` — the one lookup
+        // path, no KDC record, no attested resolution — and only dird's KDC
+        // channel attests (docs/questions/Q-1050 item 1, Q-1051 item 1).
+        // Nothing these tests run reads a KDC record (tests/install.rs
+        // does, and keeps its signer).
         let ctx = DirectoryContext::new(
             ad_schema::phase1().unwrap(),
             &KeydConfig::new(realm.clone()),
@@ -493,7 +499,6 @@ fn the_first_administrator_can_run_every_admin_operation_under_the_tier0_ou() {
         Operation::CreateComputer(CreateComputer {
             parent: ou,
             name: "ws9".into(),
-            dns_host_name: "ws9.example.test".into(),
             spn: Some("host/ws9.example.test".into()),
         }),
         "alice",

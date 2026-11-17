@@ -17,7 +17,10 @@
 //!
 //! [`changes_key_state`]: the six operations that install, rotate, retire or
 //! destroy long-term key versions — `set_secret`, `create_key`, `rotate_key`,
-//! `rotate_krbtgt`, `retire_kvno`, `destroy_key_set` (docs/10 §6, §7).
+//! `rotate_krbtgt`, `retire_kvno`, `destroy_key_set` (docs/10 §6, §7) — the
+//! change-password completion (task K3, a password install), and — task PN9 —
+//! `install_attestation_key`, which installs the long-term attestation key
+//! (docs/59 §7.4; docs/questions/Q-1033 item 3, A-177).
 //!
 //! **Not key state — bookkeeping.** The AS failure throttle and the
 //! `verify_secret` throttle (A-34), the replay cache (D33) and the one-time

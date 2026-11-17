@@ -15,6 +15,7 @@ use kdc::{AccountSource, AccountSourceError};
 use keyd::{KeyHandle, KeyPurpose, PrincipalId};
 use krb_proto::constants::{KRB_NT_ENTERPRISE, KRB_NT_PRINCIPAL, KRB_NT_SRV_HST, KRB_NT_SRV_INST};
 use krb_proto::KerberosString;
+use std::collections::BTreeSet;
 
 fn client(
     view: &impl AccountSource,
@@ -42,7 +43,7 @@ fn exact_sam_account_name_hit() {
     let d = Dir::standard("exact-hit");
     let view = d.view();
     let alice = client(&view, &["alice"]).unwrap().expect("alice");
-    assert_eq!(alice.key, key_of(ALICE, KeyPurpose::PrincipalLongterm));
+    assert_eq!(alice.key(), key_of(ALICE, KeyPurpose::PrincipalLongterm));
     assert_eq!(alice.sid, sid_of(ALICE));
     let etypes: Vec<i32> = alice.etype_info.iter().map(|e| e.etype).collect();
     assert_eq!(etypes, vec![18, 17]);
@@ -50,11 +51,35 @@ fn exact_sam_account_name_hit() {
         assert_eq!(entry.salt.as_ref().unwrap().as_str(), "EXAMPLE.TESTalice");
         assert_eq!(entry.s2kparams, None);
     }
-    // The name-type is not significant (RFC 4120 §6.2).
+    // The name-type is not significant (RFC 4120 §6.2): the same record...
     let other_type = view
         .client(&realm(), &name(KRB_NT_ENTERPRISE, &["alice"]))
-        .unwrap();
-    assert_eq!(other_type, Some(alice));
+        .unwrap()
+        .expect("alice under another name-type");
+    assert_eq!(other_type.key(), alice.key());
+    assert_eq!(other_type.sid, alice.sid);
+    assert_eq!(other_type.groups, alice.groups);
+    assert_eq!(other_type.tier, alice.tier);
+    assert_eq!(other_type.state, alice.state);
+    assert_eq!(other_type.etype_info, alice.etype_info);
+    assert_eq!(other_type.kind, alice.kind);
+    assert_eq!(other_type.armor_policy, alice.armor_policy);
+    // ... and a resolution of the same key set that states the name as sent,
+    // name-type included (docs/59 §7.1: what dird saw; task PN10).
+    let (sent, plain) = (
+        other_type.resolution.resolution(),
+        alice.resolution.resolution(),
+    );
+    assert_eq!(sent.name_as_sent(), &name(KRB_NT_ENTERPRISE, &["alice"]));
+    assert_eq!(plain.name_as_sent(), &name(KRB_NT_PRINCIPAL, &["alice"]));
+    assert_eq!(
+        sent.canonical_name().name_string,
+        plain.canonical_name().name_string
+    );
+    assert_eq!(
+        (sent.principal(), sent.key_purpose()),
+        (plain.principal(), plain.key_purpose())
+    );
 }
 
 /// docs/48 §3.1, §7.2 ("derived by the AccountSource from authoritative
@@ -89,7 +114,7 @@ fn case_differing_name_is_refused_at_the_byte_compare() {
     let d = Dir::standard("case");
     let view = d.view();
     for spelled in ["Alice", "ALICE", "aLiCe"] {
-        assert_eq!(client(&view, &[spelled]), Ok(None), "{spelled}");
+        assert_eq!(found(&client(&view, &[spelled])), Ok(false), "{spelled}");
     }
 }
 
@@ -100,30 +125,30 @@ fn no_fallbacks() {
     let d = Dir::standard("no-fallbacks");
     let view = d.view();
     // alice's userPrincipalName is alice@example.test: never used.
-    assert_eq!(client(&view, &["alice@example.test"]), Ok(None));
+    assert_eq!(found(&client(&view, &["alice@example.test"])), Ok(false));
     assert_eq!(
-        view.client(&realm(), &name(KRB_NT_ENTERPRISE, &["alice@example.test"])),
-        Ok(None)
+        found(&view.client(&realm(), &name(KRB_NT_ENTERPRISE, &["alice@example.test"]))),
+        Ok(false)
     );
-    assert_eq!(client(&view, &["alice", "example.test"]), Ok(None));
+    assert_eq!(found(&client(&view, &["alice", "example.test"])), Ok(false));
     // No "$" retry for a computer.
-    assert_eq!(client(&view, &["ws01"]), Ok(None));
+    assert_eq!(found(&client(&view, &["ws01"])), Ok(false));
     assert!(client(&view, &["ws01$"]).unwrap().is_some());
     // Realm: octet for octet (RFC 4120 §6.1).
     for other in ["example.test", "OTHER.TEST"] {
         let r = krb_proto::Realm::new(other).unwrap();
         assert_eq!(
-            view.client(&r, &name(KRB_NT_PRINCIPAL, &["alice"])),
-            Ok(None)
+            found(&view.client(&r, &name(KRB_NT_PRINCIPAL, &["alice"]))),
+            Ok(false)
         );
         assert_eq!(
-            view.service(&r, &name(KRB_NT_SRV_HST, &["host", "ws01.example.test"])),
-            Ok(None)
+            found(&view.service(&r, &name(KRB_NT_SRV_HST, &["host", "ws01.example.test"]))),
+            Ok(false)
         );
     }
     // A name longer than any stored sAMAccountName cannot match.
     let long = "a".repeat(300);
-    assert_eq!(client(&view, &[long.as_str()]), Ok(None));
+    assert_eq!(found(&client(&view, &[long.as_str()])), Ok(false));
 }
 
 /// docs/47 §1.3 AS step 5: only user and computer objects are clients.
@@ -131,8 +156,8 @@ fn no_fallbacks() {
 fn groups_are_not_clients() {
     let d = Dir::standard("group-not-client");
     let view = d.view();
-    assert_eq!(client(&view, &["staff"]), Ok(None));
-    assert_eq!(client(&view, &["mail"]), Ok(None));
+    assert_eq!(found(&client(&view, &["staff"])), Ok(false));
+    assert_eq!(found(&client(&view, &["mail"])), Ok(false));
 }
 
 /// docs/47 §1.4 (R47-2): the krbtgt account is never a client or a service
@@ -142,10 +167,10 @@ fn groups_are_not_clients() {
 fn krbtgt_is_never_returned() {
     let d = Dir::standard("krbtgt");
     let view = d.view();
-    assert_eq!(client(&view, &["krbtgt"]), Ok(None));
+    assert_eq!(found(&client(&view, &["krbtgt"])), Ok(false));
     assert_eq!(
-        view.service(&realm(), &name(KRB_NT_SRV_INST, &["krbtgt", REALM])),
-        Ok(None)
+        found(&view.service(&realm(), &name(KRB_NT_SRV_INST, &["krbtgt", REALM]))),
+        Ok(false)
     );
     assert_eq!(
         view.krbtgt_handle(&domain_sid()),
@@ -155,14 +180,21 @@ fn krbtgt_is_never_returned() {
 
 /// docs/47 §1.3 step 6: the RID check stands alone — an RID-502 account
 /// under another sAMAccountName (breaking [MS-SAMR] 3.1.1.6 item 14) is
-/// still never a client, and is not accepted as the krbtgt account.
+/// still never a client, and is not accepted as the krbtgt account. Task
+/// PN4b (docs/59 §4.3, §5.1 N7, §6.1 steps 2-4): the one checker never
+/// writes such an account — `keys_of_names` refuses an RID-502 account not
+/// named "krbtgt" — so it is modelled as a record that changed beneath the
+/// checker: created as the user `kdcsvc` (its namespace key the checker's),
+/// its objectSid then the domain's RID 502. The lookup reaches it by its
+/// key, and the RID check refuses it.
 #[test]
 fn rid_502_is_refused_whatever_its_name() {
+    const KDCSVC: u32 = 45;
     let d = Dir::new("rid-502");
     let mut objects = d.standard_objects();
     objects.retain(|o| o.guid != guid(KRBTGT));
     objects.push(d.user(
-        KRBTGT,
+        KDCSVC,
         USERS_CN,
         "kdcsvc",
         &[
@@ -171,8 +203,10 @@ fn rid_502_is_refused_whatever_its_name() {
         ],
     ));
     d.create_all(objects);
+    assert!(client(&d.view(), &["kdcsvc"]).unwrap().is_some());
+    d.set(KDCSVC, "objectSid", vec![account_sid(502).encode()]);
     let view = d.view();
-    assert_eq!(client(&view, &["kdcsvc"]), Ok(None));
+    assert_eq!(found(&client(&view, &["kdcsvc"])), Ok(false));
     assert_eq!(
         view.krbtgt_handle(&domain_sid()),
         Err(AccountSourceError::Failed)
@@ -189,7 +223,7 @@ fn spn_lookup_on_computers() {
     let ws01 = service(&view, &["host", "ws01.example.test"])
         .unwrap()
         .expect("ws01");
-    assert_eq!(ws01.key, key_of(WS01, KeyPurpose::Service));
+    assert_eq!(ws01.key(), key_of(WS01, KeyPurpose::Service));
     assert_eq!(ws01.enctypes, vec![18, 17]);
     assert!(ws01.state.usable_at(&now()));
     // Exact: no case folding (A-27), no single component, no extra
@@ -203,7 +237,7 @@ fn spn_lookup_on_computers() {
         &["host", "ws01.example.test", "x"],
         &["cifs", "ws01.example.test"],
     ] {
-        assert_eq!(service(&view, parts), Ok(None), "{parts:?}");
+        assert_eq!(found(&service(&view, parts)), Ok(false), "{parts:?}");
     }
     // A DC computer serves its SPN too.
     assert!(service(&view, &["ldap", "dc01.example.test"])
@@ -213,8 +247,18 @@ fn spn_lookup_on_computers() {
 
 /// R2 (docs/52 §5 item 3; A-73): the admin service's two-part name
 /// `admind/<host>` resolves to its object's `AdminService` key set — the
-/// KDC seals its tickets there — and every other service name (another
-/// class, more components) to the `Service` key set.
+/// KDC seals its tickets there — and another class's name to the `Service`
+/// key set. Tasks PN4 / PN4b (docs/59 §4.4 N4, §6.1 steps 2-3; [MS-ADTS]
+/// 2.2.21, 3.1.1.5.3.1.1.4; docs/questions/Q-1018 item 6, Q-1026 item 3,
+/// Q-1042): a stored three-part SPN is a name the phase-1 namespace refuses
+/// (three parts only on the DC's object, task PN16) — the checker writes no
+/// key for it, so no request reaches it (`None`, where the R47-1 lookup
+/// used to hand out its `Service` key set) — and an object that came to
+/// hold one beneath the checker is refused when it is found by another of
+/// its keys (fail closed, `Failed`). Task PN10 (A-163 at the lookup;
+/// docs/questions/Q-1027 item 6): the admin service's object is a configured
+/// provisioned service object; the same store looked up without that set
+/// refuses its reserved name (`Failed` — fail closed).
 #[test]
 fn the_admin_service_name_names_the_admin_service_key_set() {
     let d = Dir::new("spn-admind");
@@ -245,27 +289,41 @@ fn the_admin_service_name_names_the_admin_service_key_set() {
                 vec![bits(uac::ADS_UF_WORKSTATION_TRUST_ACCOUNT)],
             ),
             ("pwdLastSet", vec![int64(PWD_LAST_SET)]),
-            (
-                "servicePrincipalName",
-                vec![b"admind/dc01.example.test/x".to_vec()],
-            ),
         ],
     ));
-    d.create_all(objects);
-    let view = d.view();
+    let services = BTreeSet::from([guid(60)]);
+    d.create_all_with_service_objects(objects, &services);
+    // The third component written beneath the checker.
+    d.set(
+        61,
+        "servicePrincipalName",
+        vec![b"admind/dc01.example.test/x".to_vec()],
+    );
+    let unlisted = d.view();
+    assert_eq!(
+        found(&service(&unlisted, &["admind", "dc01.example.test"])),
+        Err(AccountSourceError::Failed)
+    );
+    let configured = d.context_with(&services);
+    let view = configured.view(&d.store, &d.empty_tiers).unwrap();
     let admin = service(&view, &["admind", "dc01.example.test"])
         .unwrap()
         .expect("the admin service");
-    assert_eq!(admin.key, key_of(60, KeyPurpose::AdminService));
-    // A third component makes it another (plain) service name.
-    let other = service(&view, &["admind", "dc01.example.test", "x"])
-        .unwrap()
-        .expect("a plain service");
-    assert_eq!(other.key, key_of(61, KeyPurpose::Service));
+    assert_eq!(admin.key(), key_of(60, KeyPurpose::AdminService));
+    // A stored third component has no key (PN4b) and fails closed when its
+    // object is found by another key (PN4).
+    assert_eq!(
+        found(&service(&view, &["admind", "dc01.example.test", "x"])),
+        Ok(false)
+    );
+    assert_eq!(
+        found(&client(&view, &["admindx$"])),
+        Err(AccountSourceError::Failed)
+    );
     let ws01 = service(&view, &["host", "ws01.example.test"])
         .unwrap()
         .unwrap();
-    assert_eq!(ws01.key.purpose, KeyPurpose::Service);
+    assert_eq!(ws01.key().purpose, KeyPurpose::Service);
 }
 
 /// docs/53 R53-6, §5.2 (task K5: the change-password service's object,
@@ -274,8 +332,13 @@ fn the_admin_service_name_names_the_admin_service_key_set() {
 /// not significant); docs/47 §1.3 TGS step 3 (the unique index folds A–Z,
 /// Q-080; the final comparison is octet for octet); A-139 (one name rule):
 /// `kadmin/changepw` resolves to its object's `ChangePasswordService` key
-/// set under either name-type; a case variant matches no stored SPN; a
-/// third component is another (plain) service name.
+/// set under either name-type; a case variant matches no stored SPN. Tasks
+/// PN4 / PN4b (docs/59 §4.4 N4, §6.1 steps 2-3; Q-1026 item 3, Q-1042): a
+/// stored three-part SPN has no key (no request reaches it), and an object
+/// holding one beneath the checker is refused when found by another key —
+/// fail closed (`Failed`). Task PN10 (A-163 at the lookup; Q-1027 item 6):
+/// the change-password service's object is a configured provisioned service
+/// object; without that set its reserved name is refused (`Failed`).
 #[test]
 fn the_change_password_service_name_names_its_key_set() {
     let d = Dir::new("spn-changepw");
@@ -303,23 +366,42 @@ fn the_change_password_service_name_names_its_key_set() {
                 vec![bits(uac::ADS_UF_WORKSTATION_TRUST_ACCOUNT)],
             ),
             ("pwdLastSet", vec![int64(PWD_LAST_SET)]),
-            ("servicePrincipalName", vec![b"kadmin/changepw/x".to_vec()]),
         ],
     ));
-    d.create_all(objects);
-    let view = d.view();
+    let services = BTreeSet::from([guid(62)]);
+    d.create_all_with_service_objects(objects, &services);
+    // The third component written beneath the checker.
+    d.set(
+        63,
+        "servicePrincipalName",
+        vec![b"kadmin/changepw/x".to_vec()],
+    );
+    let unlisted = d.view();
+    assert_eq!(
+        found(&service(&unlisted, &["kadmin", "changepw"])),
+        Err(AccountSourceError::Failed)
+    );
+    let configured = d.context_with(&services);
+    let view = configured.view(&d.store, &d.empty_tiers).unwrap();
     for name_type in [KRB_NT_SRV_INST, KRB_NT_PRINCIPAL] {
         let changepw = view
             .service(&realm(), &name(name_type, &["kadmin", "changepw"]))
             .unwrap()
             .expect("the change-password service");
-        assert_eq!(changepw.key, key_of(62, KeyPurpose::ChangePasswordService));
+        assert_eq!(
+            changepw.key(),
+            key_of(62, KeyPurpose::ChangePasswordService)
+        );
     }
-    assert_eq!(service(&view, &["KADMIN", "changepw"]), Ok(None));
-    let other = service(&view, &["kadmin", "changepw", "x"])
-        .unwrap()
-        .expect("a plain service");
-    assert_eq!(other.key, key_of(63, KeyPurpose::Service));
+    assert_eq!(found(&service(&view, &["KADMIN", "changepw"])), Ok(false));
+    assert_eq!(
+        found(&service(&view, &["kadmin", "changepw", "x"])),
+        Ok(false)
+    );
+    assert_eq!(
+        found(&client(&view, &["kpasswdx$"])),
+        Err(AccountSourceError::Failed)
+    );
 }
 
 /// docs/47 §1.3 TGS step 4, R47-13: an SPN can only be held by a computer
@@ -346,8 +428,11 @@ fn spn_cannot_be_held_by_a_user() {
     ));
     drop(txn);
     let view = d.view();
-    assert_eq!(service(&view, &["http", "web.example.test"]), Ok(None));
-    assert_eq!(service(&view, &["alice", "x"]), Ok(None));
+    assert_eq!(
+        found(&service(&view, &["http", "web.example.test"])),
+        Ok(false)
+    );
+    assert_eq!(found(&service(&view, &["alice", "x"])), Ok(false));
 }
 
 /// [MS-KILE] 3.1.1.2 (R47-4), worked by hand:
@@ -586,7 +671,11 @@ fn password_expired_bit() {
 
 /// docs/47 §4.1 (R47-5a): userAccountControl absent ⇒ not enabled (fail
 /// closed); a kind that contradicts the class ⇒ error ([MS-SAMR] 3.1.1.6
-/// items 20, 23, 24).
+/// items 20, 23, 24). Task PN4b (docs/59 §5.1 N7, §6.1 steps 2-4): the one
+/// checker writes no keys for such a record, so the contradiction is
+/// written beneath it, after the account was created consistent (its
+/// namespace key the checker's): the lookup reaches it by that key and
+/// refuses it.
 #[test]
 fn missing_or_inconsistent_user_account_control() {
     let s = state_of("uac-absent", &[("pwdLastSet", vec![int64(PWD_LAST_SET)])])
@@ -598,14 +687,19 @@ fn missing_or_inconsistent_user_account_control() {
         ("uac-user-st", uac::ADS_UF_SERVER_TRUST_ACCOUNT),
         ("uac-user-none", uac::ADS_UF_DONT_EXPIRE_PASSWD),
     ] {
+        let d = Dir::standard(test);
+        d.create_all(vec![d.user(
+            60,
+            STAFF_OU,
+            "carol",
+            &[
+                ("userAccountControl", normal()),
+                ("pwdLastSet", vec![int64(PWD_LAST_SET)]),
+            ],
+        )]);
+        d.set(60, "userAccountControl", vec![bits(bits_value)]);
         assert_eq!(
-            state_of(
-                test,
-                &[
-                    ("userAccountControl", vec![bits(bits_value)]),
-                    ("pwdLastSet", vec![int64(PWD_LAST_SET)]),
-                ]
-            ),
+            client(&d.view(), &["carol"]).map(|c| c.map(|c| c.state)),
             Err(AccountSourceError::Failed),
             "{test}"
         );

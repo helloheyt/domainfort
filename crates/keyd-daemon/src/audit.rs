@@ -39,7 +39,8 @@
 //! An issuing operation's reply can be withheld; a key-state change cannot be
 //! undone once keyd ran it (`keyd::changes_key_state`: `set_secret`,
 //! `create_key`, `rotate_key`, `rotate_krbtgt`, `retire_kvno`,
-//! `destroy_key_set`) — nor can a grant that loosens keyd's authorization be
+//! `destroy_key_set`, `complete_change_password`, and — task PN9 —
+//! `install_attestation_key`) — nor can a grant that loosens keyd's authorization be
 //! taken back once keyd registered it (`grant_set_secret`, task A15a;
 //! `keyd::requires_acknowledged_intent` covers both — docs/questions/Q-452).
 //! For those — once keyd's own authorization step admits them
@@ -194,7 +195,10 @@ pub const fn is_gating(operation: Operation) -> bool {
         | Operation::CompleteChangePassword
         | Operation::SealChangePasswordError
         // Task F3: the revocation has its one record in the window.
-        | Operation::RevokeDecision => true,
+        | Operation::RevokeDecision
+        // Task PN9: the attestation key's install — a key-state change, its
+        // intent and its outcome in the window.
+        | Operation::InstallAttestationKey => true,
         Operation::DescribeConfig | Operation::Ping => false,
     }
 }

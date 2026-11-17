@@ -205,8 +205,8 @@ fn inside_a_view_a_stale_connection_fails_the_query_without_sending_it() {
     let view = client.begin_view().unwrap();
     script.borrow_mut().stale.insert(0, TransportError::Closed);
     assert_eq!(
-        view.client(&realm(), &alice()),
-        Err(AccountSourceError::Unavailable)
+        view.client(&realm(), &alice()).err(),
+        Some(AccountSourceError::Unavailable)
     );
     assert!(!view.is_open());
     drop(view);

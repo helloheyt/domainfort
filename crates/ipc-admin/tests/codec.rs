@@ -101,7 +101,6 @@ fn forwarded() -> Vec<Operation> {
         Operation::CreateComputer {
             parent: guid(2),
             name: "ws02".into(),
-            dns_host_name: "ws02.example.test".into(),
             spn: Some("host/ws02.example.test".into()),
         },
         Operation::CreateGroup {

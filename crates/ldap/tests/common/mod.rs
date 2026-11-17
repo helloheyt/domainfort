@@ -9,8 +9,8 @@
 //!
 //! The policy is the phase-1 rootDSE policy of docs/49 §5.2 / Q-170: one
 //! anonymous-allowlist entry for `DirRead` on the rootDSE from the internal
-//! network (A-51), plus one Allow rule for the same. The PIP and the account
-//! source are minimal in-memory stand-ins.
+//! network (A-51), plus one Allow rule for the same. The PIP and the
+//! ticket-subject lookup are minimal in-memory stand-ins.
 //!
 //! Every value here is constructed by hand for these tests from the ASN.1 of
 //! RFC 4511 App. B and the decided design docs/49. No vector or fixture comes
@@ -20,9 +20,8 @@
 use std::cell::Cell;
 use std::collections::BTreeSet;
 
-use directory_pip::NamingContext;
+use directory_pip::{NamingContext, TicketSubject, TicketSubjectError, TicketSubjects};
 use dtyp::{SecurityDescriptor, Sid};
-use kdc::{AccountSource, AccountSourceError, ClientAccount, ServiceAccount};
 use krb_proto::{KerberosTime, PrincipalName, Realm};
 use ldap::{
     Engine, EngineConfig, Listener, Outcome, RateLimiter, RequestInputs, RootDseConfig, Session,
@@ -119,28 +118,21 @@ impl Pip for TestPip {
     }
 }
 
-/// An account source with no accounts that counts every lookup — the tests
-/// use it to show that no bind path looks a name up (P-14; docs/49 §3.1:
-/// refused "before any lookup of the name").
+/// A ticket-subject lookup (directory-pip `TicketSubjects` — what the
+/// engine's inputs carry since task PN10b) with no accounts that counts
+/// every lookup — the tests use it to show that no bind path looks a name
+/// up (P-14; docs/49 §3.1: refused "before any lookup of the name").
 #[derive(Default)]
-pub struct CountingAccounts {
+pub struct CountingSubjects {
     pub calls: Cell<u32>,
 }
 
-impl AccountSource for CountingAccounts {
-    fn client(
+impl TicketSubjects for CountingSubjects {
+    fn ticket_subject(
         &self,
         _realm: &Realm,
         _name: &PrincipalName,
-    ) -> Result<Option<ClientAccount>, AccountSourceError> {
-        self.calls.set(self.calls.get() + 1);
-        Ok(None)
-    }
-    fn service(
-        &self,
-        _realm: &Realm,
-        _name: &PrincipalName,
-    ) -> Result<Option<ServiceAccount>, AccountSourceError> {
+    ) -> Result<Option<TicketSubject>, TicketSubjectError> {
         self.calls.set(self.calls.get() + 1);
         Ok(None)
     }
@@ -231,7 +223,7 @@ pub struct Harness {
     pub session: Session,
     pub snapshot: PolicySnapshot,
     pub pip: TestPip,
-    pub accounts: CountingAccounts,
+    pub subjects: CountingSubjects,
     pub rate: TestRate,
 }
 
@@ -242,7 +234,7 @@ impl Harness {
             session: Session::new(7, listener),
             snapshot: root_dse_policy(),
             pip: TestPip::untiered(),
-            accounts: CountingAccounts::default(),
+            subjects: CountingSubjects::default(),
             rate: TestRate {
                 admit: true,
                 calls: 0,
@@ -255,7 +247,7 @@ impl Harness {
         let inputs = RequestInputs {
             snapshot: &self.snapshot,
             pip: &self.pip,
-            accounts: &self.accounts,
+            subjects: &self.subjects,
             rate: &mut self.rate,
             now: now(),
             transport,

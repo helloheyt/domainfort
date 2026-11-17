@@ -1,9 +1,11 @@
 //! The directory as a PEP receives it: [`PepView`] — the visibility gate,
 //! the locators that name the candidates the gate decides on, and the PIP /
-//! account-source traits a PEP needs to build its Subject and ask the PDP —
+//! ticket-subject traits a PEP needs to build its Subject and ask the PDP —
 //! and **no** raw read of an object (docs/52 R-a; decision A-103 on
 //! docs/questions/Q-486: "PEPs will receive only a gate, and `snapshot()`
-//! will not be public").
+//! will not be public") and **no** account source of the KDC (task PN10b:
+//! its records carry dird's attested name resolutions, which no PEP reads
+//! — docs/questions/Q-1047, A-187; crate::subject).
 //!
 //! # The class it closes (docs/52 §3.6, class C6, through a new PEP)
 //!
@@ -49,28 +51,33 @@
 //! - A located GUID is not content, but a PEP that wrote one it did not get
 //!   through the gate to the wire would reveal existence; no PEP does (the
 //!   LDAP engine renders only `VisibleObject`s).
-//! - The PIP and account-source traits ([`PepView::pip`],
-//!   [`PepView::accounts`]) answer for any principal or DN they are asked
+//! - The PIP and ticket-subject traits ([`PepView::pip`],
+//!   [`PepView::subjects`]) answer for any principal or DN they are asked
 //!   about — Q-486's accepted scope ("the account-source / PIP traits they
 //!   need"); they were handed to the PEPs before (crate ldap's
-//!   `RequestInputs`).
+//!   `RequestInputs`). Since task PN10b the Subject's facts come from the
+//!   `TicketClient` lookup (crate::subject), not from the KDC's account
+//!   source: a PEP holds no attested name resolution (docs/questions/
+//!   Q-1047, A-187).
 //!
 //! Spec: docs/52 §3.6 (C6), §7 (R10); docs/questions/Q-486 (R-a, A-103),
 //! Q-485, Q-487, Q-488; docs/11 §2 (the PEP), §6 (snapshot semantics), §7
 //! ("filter, do not fail"), §8; docs/49 §6.1; docs/51 §5.2 row 10;
-//! docs/questions/Q-485 (the visibility rule, as quoted there); A-55.
+//! docs/questions/Q-485 (the visibility rule, as quoted there); A-55;
+//! docs/59 §6.2, §6.4; docs/questions/Q-1047 (A-187).
 
 use dirstore::{AttrId, ChildCursor, ChildPage};
 use dtyp::Guid;
-use kdc::AccountSource;
 use pdp::{Context, Pip, PipError, PolicySnapshot, Subject};
 
+use crate::subject::TicketSubjects;
 use crate::view::{DirectoryContext, DirectoryView};
 use crate::visible::{VisibilityGate, VisibilityRule, VisibleObject};
 
 /// One request's directory as a PEP receives it (module documentation):
-/// the gate, the locators, the PIP and the account source over ONE view —
-/// never the view's raw snapshot. `Copy`: it is a borrow of the view.
+/// the gate, the locators, the PIP and the ticket-subject lookup over ONE
+/// view — never the view's raw snapshot, never the KDC's account source.
+/// `Copy`: it is a borrow of the view.
 /// Spec: docs/52 R-a; docs/questions/Q-486 (A-103); docs/11 §2, §6.
 #[derive(Clone, Copy)]
 pub struct PepView<'v, 'a> {
@@ -115,11 +122,14 @@ impl<'v, 'a> PepView<'v, 'a> {
         self.view
     }
 
-    /// The account source of this view, for the Subject of a verified
-    /// identity (docs/51 §5.3; docs/49 §4.4, R49-15).
-    /// Spec: docs/47 §1.3, §8.1.
+    /// The ticket-subject lookup of this view (crate::subject), for the
+    /// Subject of a verified identity (docs/51 §5.3; docs/49 §3.2, §4.4,
+    /// R49-15) — the facts the subject checks read, from the same snapshot
+    /// as the gate and the PIP, with no name resolution (task PN10b).
+    /// Spec: docs/59 §6.2, §6.4; docs/47 §8.1; docs/questions/Q-1047
+    /// (A-187).
     #[must_use]
-    pub fn accounts(&self) -> &'v dyn AccountSource {
+    pub fn subjects(&self) -> &'v dyn TicketSubjects {
         self.view
     }
 

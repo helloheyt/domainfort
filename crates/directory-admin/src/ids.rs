@@ -52,6 +52,13 @@ pub(crate) struct Ids {
     pub(crate) service_principal_name: AttrId,
     pub(crate) dns_host_name: AttrId,
     pub(crate) description: AttrId,
+    /// The internal host-address attribute (task DN6; ad-schema
+    /// `HOST_ADDRESS`): a computer's DNS host record (docs/54 §5.2).
+    pub(crate) host_address: AttrId,
+    /// The internal namespace attribute (task PN5; ad-schema
+    /// `PRINCIPAL_NAME_KEY`): every key a principal holds in the one
+    /// principal namespace, written by the checker only (docs/59 §4.6, N7).
+    pub(crate) principal_name_key: AttrId,
     /// schemaIDGUID of userAccountControl (`DirWrite(userAccountControl)`).
     pub(crate) uac_guid: Guid,
     /// schemaIDGUID of accountExpires (`DirWrite(accountExpires)`).
@@ -87,6 +94,18 @@ impl Ids {
         let user_account_control = attr("userAccountControl")?;
         let account_expires = attr("accountExpires")?;
         let member = attr("member")?;
+        // The internal attribute has no name; it must be in the schema.
+        let host_address = p1
+            .schema()
+            .attribute(ad_schema::HOST_ADDRESS)
+            .map(|d| d.id)
+            .ok_or(ConfigError::Schema)?;
+        // Likewise (task PN5; docs/59 §4.6): no name, in the schema.
+        let principal_name_key = p1
+            .schema()
+            .attribute(ad_schema::PRINCIPAL_NAME_KEY)
+            .map(|d| d.id)
+            .ok_or(ConfigError::Schema)?;
         Ok(Ids {
             cn: attr("cn")?,
             ou: attr("ou")?,
@@ -106,6 +125,8 @@ impl Ids {
             service_principal_name: attr("servicePrincipalName")?,
             dns_host_name: attr("dNSHostName")?,
             description: attr("description")?,
+            host_address,
+            principal_name_key,
             uac_guid: attr_guid(user_account_control)?,
             account_expires_guid: attr_guid(account_expires)?,
             member_guid: attr_guid(member)?,

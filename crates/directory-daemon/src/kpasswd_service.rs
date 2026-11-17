@@ -18,17 +18,24 @@
 //!
 //! # The change-password service's key set
 //!
-//! At start, dird resolves `kadmin/changepw` (RFC 3244 §2) exactly as the
-//! KDC resolves it for the AS (crate kdc `as_exchange.rs` A8a:
-//! `AccountSource::service`, the unique servicePrincipalName index, the
-//! stored value compared octet for octet, a computer object): its key set
-//! must be `(objectGUID, ChangePasswordService)` — the purpose the one
-//! derivation gives the name (`KeyPurpose::of_service_name`, docs/52 R2b).
-//! Absent, of another purpose, or unreadable ⇒ the kpasswd service does not
-//! start; dird's other services run. keyd checks the binding again on every
-//! request (A-19: the key set opens only tickets for `kadmin/changepw`).
-//! The provisioning manifest does not name this object yet (task K9 —
-//! docs/questions/Q-964 item 2).
+//! At start, dird resolves `kadmin/changepw` (RFC 3244 §2) through the one
+//! lookup path, in the provisioned service object's own context
+//! (`DirectoryView::canonical_principal`, `LookupCtx::ServiceObject` — task
+//! PN10; docs/59 §6.1, §6.2: the namespace probe, the stored value compared
+//! octet for octet under R47-1, a computer object) — the path the KDC's
+//! account source wraps for the AS (crate kdc `as_exchange.rs` A8a), but no
+//! KDC account record is built here and nothing is attested: this
+//! service's directory context carries **no** name-resolution signer —
+//! dird builds one only in `daemon::kdc_channel_context`, for the KDC
+//! channel (task PN10b; A-189 on docs/questions/Q-1050 item 6, Q-1051 item
+//! 4). Its key set must be `(objectGUID, ChangePasswordService)` — the
+//! purpose the one derivation gives the name (`KeyPurpose::of_service_name`,
+//! docs/52 R2b) — and exactly the provisioning manifest's change-password
+//! service handle (task K9; docs/questions/Q-964 item 4) —
+//! `change_password_service_handle`. Absent, of another purpose, or
+//! unreadable ⇒ the kpasswd service does not start; dird's other services
+//! run. keyd checks the binding again on every request (A-19: the key set
+//! opens only tickets for `kadmin/changepw`).
 //!
 //! # Parameters
 //!
@@ -55,17 +62,18 @@ use crate::registration::DecisionRegistration;
 use core::fmt;
 use core::net::IpAddr;
 use core::time::Duration;
-use directory_pip::DirectoryView;
+use directory_pip::{DirectoryView, LookupCtx};
 use ipc_kpasswd::{
     ApRepOctets, ChangePasswordRequest, KrbPrivOctets, ObservedAddress, SealedReply,
 };
-use kdc::AccountSource;
 use keyd_types::{
     AuthnError, ChangePasswordContext, ChangePasswordCtxId, HostAddr, KeyHandle, KeyPurpose,
     PrincipalId,
 };
 use krb_proto::constants::KRB_NT_SRV_INST;
-use krb_proto::{KerberosString, NonZeroResultCode, PrincipalName, Realm};
+use krb_proto::{
+    KerberosString, NonZeroResultCode, PrincipalName, Realm, CHANGE_PASSWORD_SERVICE_NAME,
+};
 use provision_manifest::Manifest;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -121,16 +129,22 @@ pub const CHANGE_PASSWORD_DECISION_LIFETIME_SECS: u32 = keyd_types::MAX_SET_SECR
 
 /// The change-password service's name, `kadmin/changepw` (RFC 3244 §2: "the
 /// service principal kadmin/changepw@REALM"), as dird resolves it in its
-/// directory. The name-type is a hint only (RFC 4120 §6.2; the directory
-/// resolves the components); NT-SRV-INST as the KDC fixtures use.
+/// directory: the components of the project's one definition,
+/// `krb_proto::CHANGE_PASSWORD_SERVICE_NAME` — the name keyd binds the key
+/// set to and the kdc classifies by (this function spelled the components
+/// as literals until docs/questions/Q-987 item 5 / A-165 folded them —
+/// Q-995). The name-type is a hint only (RFC 4120 §6.2: "not significant
+/// when checking for equivalence"; the directory resolves the components);
+/// NT-SRV-INST ("Service and other unique instance") as the KDC fixtures
+/// use.
 /// Spec: RFC 3244 §2; RFC 4120 §6.2; docs/53 §5.2.
 fn change_password_service_name() -> Option<PrincipalName> {
     Some(PrincipalName {
         name_type: KRB_NT_SRV_INST,
-        name_string: vec![
-            KerberosString::new("kadmin").ok()?,
-            KerberosString::new("changepw").ok()?,
-        ],
+        name_string: CHANGE_PASSWORD_SERVICE_NAME
+            .iter()
+            .map(|component| KerberosString::new(component).ok())
+            .collect::<Option<Vec<_>>>()?,
     })
 }
 
@@ -173,27 +187,33 @@ impl KpasswdNotStarted {
     }
 }
 
-/// The change-password service's key set: `kadmin/changepw` resolved as the
-/// KDC resolves it, which must give a `ChangePasswordService` key set **and**
-/// be exactly the manifest's change-password service handle (A-163;
-/// docs/questions/Q-964 item 4) — the same check the admin service's handle
-/// gets (`admin_service_handle`). Anything else ⇒ the service does not start
-/// (fail closed).
+/// The change-password service's key set: `kadmin/changepw` resolved through
+/// the one lookup path in the provisioned service object's context (the
+/// path the KDC's account source wraps; `view`'s context has no signer —
+/// only `daemon::kdc_channel_context` builds one, task PN10b), which must
+/// give a `ChangePasswordService` key set **and** be exactly the manifest's
+/// change-password service handle (A-163; docs/questions/Q-964 item 4) —
+/// the same check the admin service's handle gets (`admin_service_handle`).
+/// Anything else ⇒ the service does not start (fail closed).
 /// Spec: RFC 3244 §2; docs/53 §5.2; crate kdc `as_exchange.rs` A8a; docs/52
-/// R2b; docs/questions/Q-964 item 4, Q-975.
+/// R2b; docs/59 §6.2 (`ServiceObject`); docs/questions/Q-964 item 4, Q-975,
+/// Q-1050 item 6 (A-189).
 pub(crate) fn change_password_service_handle(
     view: &DirectoryView<'_>,
     realm: &Realm,
     manifest: &Manifest,
 ) -> Result<KeyHandle, KpasswdNotStarted> {
     let name = change_password_service_name().ok_or(KpasswdNotStarted::Configuration)?;
-    match view.service(realm, &name) {
-        Ok(Some(account))
-            if account.key.purpose == KeyPurpose::ChangePasswordService
-                && account.key.purpose == KeyPurpose::of_service_name(&name)
-                && account.key == manifest.change_password_service().handle =>
+    // Task PN10 (docs/59 §6.2; docs/questions/Q-1027 item 2): the provisioned
+    // service object's own context, through the one lookup path — no account
+    // record, and so no attested resolution, is built for dird's own check.
+    match view.canonical_principal(realm, &name, LookupCtx::ServiceObject) {
+        Ok(Some(resolved))
+            if resolved.key_purpose() == KeyPurpose::ChangePasswordService
+                && resolved.key_purpose() == KeyPurpose::of_service_name(&name)
+                && resolved.key_handle() == manifest.change_password_service().handle =>
         {
-            Ok(account.key)
+            Ok(resolved.key_handle())
         }
         Ok(_) => Err(KpasswdNotStarted::ServiceAbsent),
         Err(_) => Err(KpasswdNotStarted::DirectoryUnreadable),

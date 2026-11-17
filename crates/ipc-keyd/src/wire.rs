@@ -7,6 +7,7 @@
 //! | value | encoding |
 //! |---|---|
 //! | `KeyHandle` | 16-octet `PrincipalId` ‖ purpose `u8` (closed table: 1 PrincipalLongterm, 2 Krbtgt, 3 Service, 4 AdminService, 5 ChangePasswordService — task K4) |
+//! | server of `issue_as_rep` (0x02, [`WireAsServer`]) | `u8` (closed table: 1 LocalTgt ‖ the krbtgt's `KeyHandle`, 2 ChangePasswordService ‖ the service's [`WireNameResolution`] — task PN11b) |
 //! | binding of `open_and_verify_service_ticket` (0x07) | `u8 1` (Unbound) — the only value since Q-523; `u8 2` (OperationDigest) is refused: an operation-bound verification is its own kind, 0x15. No purpose travels: keyd derives it from the binding (R2) |
 //! | operation digest of `verify_operation_ticket` (0x15) / `OperationTicket` (0x95) | 32 octets |
 //! | end of the `ServiceContext` reply (0x87) | `u8 0` — the absent marker of the former `bound_operation: Option<[32]>`, the only value since Q-523 (an unbound verification is bound to no operation) |
@@ -18,6 +19,7 @@
 //! | `KerberosTime` | [`WireTime`]: year `u16` ‖ month ‖ day ‖ hour ‖ minute ‖ second (`u8` each), checked by `krb-proto` after the ipc layer |
 //! | raw octets keyd itself parses (`outer_req_body`, `req_body`, `ap_req_octets`) | `bytes<max>`, opaque |
 //! | password / candidate | [`Secret`] (zeroizing; `Debug` redacted) |
+//! | attestation key of `install_attestation_key` (0x1A) | `secret bytes<32>` with a length of **exactly** [`ATTESTATION_KEY_OCTETS`] (fewer `Truncated`, more `LengthOverBound`) — read from the frame straight into a zeroizing [`Secret`] (`Debug` redacted); the typed layer refuses the all-zero key (task PN9) |
 //! | salt | `bytes<max>`, UTF-8 checked after the ipc layer |
 //! | `AccountKind` of a grant | `u8` (closed table: 1 User, 2 Computer) |
 //! | grant / decision lifetime | `u32` seconds, relative — keyd adds its own clock's `now` |
@@ -63,6 +65,38 @@
 //! keyd opens (docs/53 R53-4). `KEYD_VERSION` stays 1 (the precedent of R9
 //! and Q-523; docs/questions/Q-661).
 //!
+//! **Task PN9 (append-only, docs/50 §3.3):** `install_attestation_key` is the
+//! appended kind 0x1A / 0x9A (docs/59 §7.5; docs/questions/Q-1033) — the
+//! key and nothing else: no role, no handle, no time. The key's octets are
+//! never in a `Debug`, an error or a log: [`Secret`] prints nothing, and no
+//! ipc error carries an octet. `KEYD_VERSION` stays 1 (the precedent of F3,
+//! K4, R9 and Q-523).
+//!
+//! **Task PN11 (docs/59 §7.5):** `issue_as_rep` (0x02) carries dird's
+//! attested name resolutions after its template — the client's, and an
+//! optional one for the change-password service — and `issue_tgs_rep`
+//! (0x05) the service's, after its template ([`WireNameResolution`]: two
+//! realms, two DER names, the key set's principal and purpose, the
+//! snapshot, the issue time, the 32-octet tag; every field within the
+//! bounds keyd-types puts on a resolution). The tag is carried, never
+//! checked here — keyd verifies it. The layouts of 0x02 / 0x05 change; an
+//! old-layout request is refused (`Truncated`), never misread.
+//! `KEYD_VERSION` stays 1 (the precedent of F3, K4, R9, PN9 and Q-523; no
+//! deployed peer — the same choice as the dird-kdc channel's in task PN10).
+//!
+//! **Task PN11b (docs/questions/Q-1067):** a resolved key set is named once
+//! — by its resolution. `issue_as_rep` (0x02) loses the client's handle,
+//! the template's client principal and the server's handle beside the
+//! change-password service's resolution: its layout is `proof ‖ armor? ‖
+//! template ‖ client_resolution ‖ server`, the server a closed choice
+//! ([`WireAsServer`]: this realm's krbtgt by its handle, or the
+//! change-password service by its resolution — never both, never neither).
+//! `issue_tgs_rep` (0x05) loses the service's handle: `ctx ‖ template ‖
+//! service_resolution`. An old-layout request is refused, never misread
+//! (tested). `KEYD_VERSION` stays 1 (the precedent of F3, K4, R9, PN9,
+//! PN11 and Q-523; no deployed peer — the same choice as the dird-kdc
+//! channel's in task PN10c).
+//!
 //! **Q-523 (append-only, docs/50 §3.3):** the operation-bound service-ticket
 //! verification was moved out of kind 0x07 into the appended kinds 0x15 /
 //! 0x95, whose answer has no context id. Kind 0x07 / 0x87 keep their layout
@@ -72,18 +106,22 @@
 //! A-102, R2 and R9; a mismatched pair fails closed either way).
 //!
 //! Spec: docs/50 §3.3, §3.4, R50-3, R50-4, R50-5; docs/10 §1-§9; A-56, A-59;
-//! docs/questions/Q-351 (A-87), Q-466 item 2 (A-102), Q-523, Q-575.
+//! docs/questions/Q-351 (A-87), Q-466 item 2 (A-102), Q-523, Q-575, Q-1067
+//! (task PN11b); docs/59 §7.1, §7.5.
 
 use crate::channel::{
-    reply_kind, request_kind, MAX_DECISION_APPROVERS, MAX_DESTROY_PAGE, MAX_ENCTYPES,
-    MAX_GRANT_TARGETS, MAX_REPLY_FIELD, MAX_REQUEST_FIELD, MAX_SALT, MAX_SEAL_PADATA, MAX_SECRET,
+    reply_kind, request_kind, ATTESTATION_KEY_FIELD, ATTESTATION_KEY_OCTETS,
+    MAX_DECISION_APPROVERS, MAX_DESTROY_PAGE, MAX_ENCTYPES, MAX_GRANT_TARGETS, MAX_REPLY_FIELD,
+    MAX_REQUEST_FIELD, MAX_RESOLUTION_NAME, MAX_RESOLUTION_REALM, MAX_SALT, MAX_SEAL_PADATA,
+    MAX_SECRET,
 };
 use ipc::{DerBlob, Error, MessageSet, Payload, Reader, Result, Secret, Writer};
 use keyd_types::{
     AccountKind, ArmorId, AuthnError, ChangePasswordCtxId, ChangePasswordVerdict, CtxId,
     DecisionId, EncTypeId, ExchangeId, FastConversation, HostAddr, IssueError, KeyHandle,
     KeyPurpose, Kvno, OperationDigest, PendingDestruction, PrincipalId, Role, ServiceCtxId,
-    TicketPolicy, ADDRESS_TYPE_IPV4, OPERATION_DIGEST_LEN, TOKEN_ID_LENGTH,
+    TicketPolicy, ADDRESS_TYPE_IPV4, NAME_RESOLUTION_TAG_LEN, OPERATION_DIGEST_LEN,
+    TOKEN_ID_LENGTH,
 };
 use krb_proto::{KerberosFlags, NonZeroResultCode, TicketFlags};
 
@@ -304,6 +342,84 @@ impl Payload for WireBinding {
     }
 }
 
+/// An attested name resolution (`keyd_types::AttestedNameResolution`, task
+/// PN11): the resolution dird stated for the lookup that produced an account
+/// record — realm and name as sent, canonical realm and name, the key set's
+/// principal and purpose, the snapshot, the issue time — and its 32-octet
+/// tag, as the KDC forwards it. Not secret (names, a handle, a time and a
+/// MAC tag). The tag's length is the type's, never a length on the wire
+/// (A-145 RC-4); this layer neither computes nor checks it (keyd verifies it
+/// — docs/59 §7.2). `PartialEq` compares the octets of a codec value
+/// (tests); no product code decides anything by it.
+///
+/// Layout: `realm:bytes<1024> ‖ name:DER<16468> ‖ realm:bytes<1024> ‖
+/// name:DER<16468> ‖ principal[16] ‖ purpose:u8 ‖ snapshot:u64 ‖ time(7) ‖
+/// tag[32]` — the purpose from this channel's own closed table (as the
+/// `KeyHandle` beside it).
+///
+/// Spec: docs/59 §7.1 (the fields; the bounds), §7.5 (`IssueAsRep` +
+/// `client_resolution`, `IssueTgsRep` + `service_resolution`); docs/50 §3.3.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireNameResolution {
+    /// The realm the request carried (KerberosString octets).
+    pub realm_as_sent: Vec<u8>,
+    /// The name the request carried (`PrincipalName` DER).
+    pub name_as_sent: DerBlob,
+    /// The canonical realm (KerberosString octets).
+    pub canonical_realm: Vec<u8>,
+    /// The canonical name (`PrincipalName` DER).
+    pub canonical_name: DerBlob,
+    /// The key set's principal.
+    pub principal: PrincipalId,
+    /// The key set's purpose.
+    pub key_purpose: KeyPurpose,
+    /// The snapshot (docs/59 §4.7).
+    pub snapshot: u64,
+    /// When dird issued it.
+    pub issued_at: WireTime,
+    /// dird's tag over the resolution (HMAC-SHA-256, crate name-attestation).
+    pub tag: [u8; NAME_RESOLUTION_TAG_LEN],
+}
+
+impl Payload for WireNameResolution {
+    /// Spec: docs/59 §7.1, §7.5; docs/50 §3.3.
+    fn write_fields(&self, writer: &mut Writer) -> Result<()> {
+        writer.write_bytes(&self.realm_as_sent, MAX_RESOLUTION_REALM)?;
+        writer.write_der(&self.name_as_sent, MAX_RESOLUTION_NAME)?;
+        writer.write_bytes(&self.canonical_realm, MAX_RESOLUTION_REALM)?;
+        writer.write_der(&self.canonical_name, MAX_RESOLUTION_NAME)?;
+        writer.write_array(self.principal.as_bytes())?;
+        writer.write_enum(purpose_code(self.key_purpose))?;
+        writer.write_u64(self.snapshot)?;
+        self.issued_at.write_fields(writer)?;
+        writer.write_array(&self.tag)
+    }
+
+    /// Spec: docs/59 §7.1, §7.5; docs/50 §3.3.
+    fn read_fields(reader: &mut Reader<'_>) -> Result<WireNameResolution> {
+        let realm_as_sent = read_owned(reader, MAX_RESOLUTION_REALM)?;
+        let name_as_sent = reader.read_der(MAX_RESOLUTION_NAME)?;
+        let canonical_realm = read_owned(reader, MAX_RESOLUTION_REALM)?;
+        let canonical_name = reader.read_der(MAX_RESOLUTION_NAME)?;
+        let principal = PrincipalId::from_bytes(reader.read_array()?);
+        let key_purpose = reader.read_enum(purpose_from_code)?;
+        let snapshot = reader.read_u64()?;
+        let issued_at = WireTime::read_fields(reader)?;
+        let tag = reader.read_array::<NAME_RESOLUTION_TAG_LEN>()?;
+        Ok(WireNameResolution {
+            realm_as_sent,
+            name_as_sent,
+            canonical_realm,
+            canonical_name,
+            principal,
+            key_purpose,
+            snapshot,
+            issued_at,
+            tag,
+        })
+    }
+}
+
 // ===========================================================================
 // Requests.
 // ===========================================================================
@@ -376,14 +492,15 @@ impl Payload for WireAuthnProof {
     }
 }
 
-/// `AsTicketTemplate`.
-/// Spec: docs/50 §3.4 (`template: AsTicketTemplate (client, crealm, cname,
-/// sname, starttime?, endtime, renew_till?, flags)`); docs/10 §4; keyd
-/// `AsTicketTemplate` (session_enctype, nonce).
+/// `AsTicketTemplate` — without a client principal since task PN11b: the
+/// ticket's client is the key set of the client's resolution (docs/59
+/// §7.1), so the template does not state it again.
+/// Spec: docs/50 §3.4 (`template: AsTicketTemplate (crealm, cname, sname,
+/// starttime?, endtime, renew_till?, flags)` — docs/50's `client` removed by
+/// task PN11b); docs/10 §4; keyd `AsTicketTemplate` (session_enctype,
+/// nonce); docs/questions/Q-1067.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireAsTemplate {
-    /// The client principal.
-    pub client: PrincipalId,
     /// Client realm, KerberosString octets.
     pub crealm: Vec<u8>,
     /// DER `PrincipalName` of the client.
@@ -407,7 +524,6 @@ pub struct WireAsTemplate {
 impl Payload for WireAsTemplate {
     /// Spec: docs/50 §3.4.
     fn write_fields(&self, writer: &mut Writer) -> Result<()> {
-        writer.write_array(self.client.as_bytes())?;
         writer.write_bytes(&self.crealm, MAX_REQUEST_FIELD)?;
         writer.write_der(&self.cname, MAX_REQUEST_FIELD)?;
         writer.write_der(&self.sname, MAX_REQUEST_FIELD)?;
@@ -421,7 +537,6 @@ impl Payload for WireAsTemplate {
 
     /// Spec: docs/50 §3.4.
     fn read_fields(reader: &mut Reader<'_>) -> Result<WireAsTemplate> {
-        let client = PrincipalId::from_bytes(reader.read_array()?);
         let crealm = read_owned(reader, MAX_REQUEST_FIELD)?;
         let cname = reader.read_der(MAX_REQUEST_FIELD)?;
         let sname = reader.read_der(MAX_REQUEST_FIELD)?;
@@ -432,7 +547,6 @@ impl Payload for WireAsTemplate {
         let session_enctype = read_enctype(reader)?;
         let nonce = reader.read_u32()?;
         Ok(WireAsTemplate {
-            client,
             crealm,
             cname,
             sname,
@@ -446,45 +560,111 @@ impl Payload for WireAsTemplate {
     }
 }
 
-/// `issue_as_rep`. Spec: docs/50 §3.4 (`client`, `krbtgt`, `proof`, `armor`,
-/// `template`); docs/10 §4.
+/// Wire code of [`WireAsServer::LocalTgt`]. Project choice (closed table).
+const AS_SERVER_LOCAL_TGT: u8 = 0x01;
+/// Wire code of [`WireAsServer::ChangePasswordService`]. Project choice.
+const AS_SERVER_CHANGE_PASSWORD_SERVICE: u8 = 0x02;
+
+/// The server key set of `issue_as_rep` (`keyd_types::AsServerKeySet`,
+/// task PN11b): this realm's krbtgt by its handle (a TGT — the krbtgt has no
+/// resolution, docs/59 §7.2), or the change-password service by dird's
+/// attested resolution alone (docs/59 §7.5, task PN11). One `u8` from a
+/// closed table, then that variant's one field — so a server named both by
+/// a handle and by a resolution, or by neither, has no encoding.
+/// Spec: docs/50 §3.3 (enum = `u8` from a closed table); docs/53 §5.2;
+/// docs/59 §7.2, §7.5; docs/questions/Q-1067.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WireAsServer {
+    /// A TGT: the krbtgt's handle.
+    LocalTgt(KeyHandle),
+    /// The change-password service: its resolution. Boxed: the request enum
+    /// stays small (a resolution's fields are its largest part).
+    ChangePasswordService(Box<WireNameResolution>),
+}
+
+impl Payload for WireAsServer {
+    /// Spec: docs/50 §3.3; docs/59 §7.5.
+    fn write_fields(&self, writer: &mut Writer) -> Result<()> {
+        match self {
+            WireAsServer::LocalTgt(krbtgt) => {
+                writer.write_enum(AS_SERVER_LOCAL_TGT)?;
+                write_handle(writer, krbtgt)
+            }
+            WireAsServer::ChangePasswordService(resolution) => {
+                writer.write_enum(AS_SERVER_CHANGE_PASSWORD_SERVICE)?;
+                resolution.write_fields(writer)
+            }
+        }
+    }
+
+    /// Spec: docs/50 §3.3; docs/59 §7.5.
+    fn read_fields(reader: &mut Reader<'_>) -> Result<WireAsServer> {
+        #[derive(Clone, Copy)]
+        enum Which {
+            LocalTgt,
+            ChangePasswordService,
+        }
+        let which = reader.read_enum(|code| match code {
+            AS_SERVER_LOCAL_TGT => Some(Which::LocalTgt),
+            AS_SERVER_CHANGE_PASSWORD_SERVICE => Some(Which::ChangePasswordService),
+            _ => None,
+        })?;
+        Ok(match which {
+            Which::LocalTgt => WireAsServer::LocalTgt(read_handle(reader)?),
+            Which::ChangePasswordService => WireAsServer::ChangePasswordService(Box::new(
+                WireNameResolution::read_fields(reader)?,
+            )),
+        })
+    }
+}
+
+/// `issue_as_rep`: `proof ‖ armor? ‖ template ‖ client_resolution ‖ server`.
+/// The client's key set is named only by its resolution and the server by
+/// one closed choice (task PN11b) — no handle beside a resolution.
+/// Spec: docs/50 §3.4 (`proof`, `armor`, `template`; docs/50's `client`
+/// and the server handle beside a resolution removed by task PN11b);
+/// docs/10 §4; docs/59 §7.5 (`IssueAsRep` + `client_resolution`; task PN11
+/// — and the change-password service's resolution); docs/questions/Q-1067.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssueAsRepRequest {
-    /// PrincipalLongterm handle of the client.
-    pub client: KeyHandle,
-    /// Krbtgt handle.
-    pub krbtgt: KeyHandle,
     /// The proof `verify_preauth` returned.
     pub proof: WireAuthnProof,
     /// The FAST armor of an armored request.
     pub armor: Option<ArmorId>,
     /// The ticket template.
     pub template: WireAsTemplate,
+    /// dird's resolution of the client's name (task PN11) — the only name
+    /// of the client's key set in the request. Boxed: the request enum
+    /// stays small (a resolution's fields are its largest part).
+    pub client_resolution: Box<WireNameResolution>,
+    /// The server key set: the krbtgt's handle, or the change-password
+    /// service's resolution.
+    pub server: WireAsServer,
 }
 
 impl Payload for IssueAsRepRequest {
-    /// Spec: docs/50 §3.4.
+    /// Spec: docs/50 §3.4; docs/59 §7.5.
     fn write_fields(&self, writer: &mut Writer) -> Result<()> {
-        write_handle(writer, &self.client)?;
-        write_handle(writer, &self.krbtgt)?;
         self.proof.write_fields(writer)?;
         writer.write_option(self.armor.as_ref(), |w, a| w.write_array(a.as_bytes()))?;
-        self.template.write_fields(writer)
+        self.template.write_fields(writer)?;
+        self.client_resolution.write_fields(writer)?;
+        self.server.write_fields(writer)
     }
 
-    /// Spec: docs/50 §3.4.
+    /// Spec: docs/50 §3.4; docs/59 §7.5.
     fn read_fields(reader: &mut Reader<'_>) -> Result<IssueAsRepRequest> {
-        let client = read_handle(reader)?;
-        let krbtgt = read_handle(reader)?;
         let proof = WireAuthnProof::read_fields(reader)?;
         let armor = reader.read_option(|r| read_token(r).map(ArmorId::from_bytes))?;
         let template = WireAsTemplate::read_fields(reader)?;
+        let client_resolution = Box::new(WireNameResolution::read_fields(reader)?);
+        let server = WireAsServer::read_fields(reader)?;
         Ok(IssueAsRepRequest {
-            client,
-            krbtgt,
             proof,
             armor,
             template,
+            client_resolution,
+            server,
         })
     }
 }
@@ -645,35 +825,40 @@ impl Payload for WireTgsTemplate {
     }
 }
 
-/// `issue_tgs_rep`. Spec: docs/50 §3.4 (`service`, `ctx: CtxId`,
-/// `template`); docs/10 §5.
+/// `issue_tgs_rep`: `ctx ‖ template ‖ service_resolution` — the service's
+/// key set named only by its resolution (task PN11b).
+/// Spec: docs/50 §3.4 (`ctx: CtxId`, `template`; docs/50's `service` handle
+/// removed by task PN11b); docs/10 §5; docs/59 §7.5 (`IssueTgsRep` +
+/// `service_resolution`, task PN11); docs/questions/Q-1067.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssueTgsRepRequest {
-    /// Service (or krbtgt) handle.
-    pub service: KeyHandle,
     /// The context `open_and_verify_tgt` returned.
     pub ctx: CtxId,
     /// The ticket template.
     pub template: WireTgsTemplate,
+    /// dird's resolution of the service's name (task PN11) — the only name
+    /// of the service's key set in the request. Boxed, as
+    /// [`IssueAsRepRequest`]'s.
+    pub service_resolution: Box<WireNameResolution>,
 }
 
 impl Payload for IssueTgsRepRequest {
-    /// Spec: docs/50 §3.4.
+    /// Spec: docs/50 §3.4; docs/59 §7.5.
     fn write_fields(&self, writer: &mut Writer) -> Result<()> {
-        write_handle(writer, &self.service)?;
         writer.write_array(self.ctx.as_bytes())?;
-        self.template.write_fields(writer)
+        self.template.write_fields(writer)?;
+        self.service_resolution.write_fields(writer)
     }
 
-    /// Spec: docs/50 §3.4.
+    /// Spec: docs/50 §3.4; docs/59 §7.5.
     fn read_fields(reader: &mut Reader<'_>) -> Result<IssueTgsRepRequest> {
-        let service = read_handle(reader)?;
         let ctx = CtxId::from_bytes(read_token(reader)?);
         let template = WireTgsTemplate::read_fields(reader)?;
+        let service_resolution = Box::new(WireNameResolution::read_fields(reader)?);
         Ok(IssueTgsRepRequest {
-            service,
             ctx,
             template,
+            service_resolution,
         })
     }
 }
@@ -1013,6 +1198,54 @@ impl Payload for VerifySecretRequest {
         let handle = read_handle(reader)?;
         let candidate = reader.read_secret(MAX_SECRET)?;
         Ok(VerifySecretRequest { handle, candidate })
+    }
+}
+
+/// `install_attestation_key` (task PN9): the attestation key and nothing
+/// else — `secret bytes<32>` whose length is exactly
+/// [`ATTESTATION_KEY_OCTETS`]. The octets go from the frame (which its owner
+/// wipes) straight into a zeroizing [`Secret`] — no stack copy — whose
+/// `Debug` prints nothing, not even the length. No `Clone`, no `PartialEq`.
+///
+/// One encoding per value (docs/50 §3.3): the length field is always 32. A
+/// shorter length is an incomplete key field (`Truncated`), a longer one
+/// over the field's bound (`LengthOverBound`) — both answered `Malformed`
+/// before the request reaches keyd; nothing is allocated from a length the
+/// bound did not admit. The all-zero key is refused by the typed layer
+/// (`crate::typed::AttestationKeyOctets`).
+///
+/// Spec: docs/59 §7.4, §7.5; docs/questions/Q-1011 items 2, 8 (A-173),
+/// Q-1033 (A-177); docs/50 §3.3 (bound before allocation; secret-bearing
+/// buffers zeroized; no trailing byte), §8.2 (no secret in a log); docs/CLEAN-ROOM.md
+///
+#[derive(Debug)]
+pub struct InstallAttestationKeyRequest {
+    /// The attestation key's octets (exactly [`ATTESTATION_KEY_OCTETS`]).
+    pub key: Secret,
+}
+
+impl Payload for InstallAttestationKeyRequest {
+    /// Spec: docs/50 §3.3; docs/59 §7.5.
+    fn write_fields(&self, writer: &mut Writer) -> Result<()> {
+        // The encoder's matching representability rule: a key of another
+        // length is not one this field holds.
+        if self.key.len() != ATTESTATION_KEY_OCTETS {
+            return Err(Error::LengthOverBound);
+        }
+        writer.write_secret(&self.key, ATTESTATION_KEY_FIELD)
+    }
+
+    /// Spec: docs/50 §3.3; docs/59 §7.5.
+    fn read_fields(reader: &mut Reader<'_>) -> Result<InstallAttestationKeyRequest> {
+        // Borrowed from the frame (bounded by the field first), copied once
+        // into the zeroizing buffer.
+        let octets = reader.read_bytes(ATTESTATION_KEY_FIELD)?;
+        if octets.len() != ATTESTATION_KEY_OCTETS {
+            return Err(Error::Truncated);
+        }
+        Ok(InstallAttestationKeyRequest {
+            key: Secret::from_slice(octets),
+        })
     }
 }
 
@@ -1368,6 +1601,9 @@ pub enum KeydRequest {
     /// `revoke_decision(id)`: the decision id (`u64`), nothing else (task
     /// F3). Spec: docs/52 §4.2, §4.6; docs/questions/Q-976.
     RevokeDecision(DecisionId),
+    /// `install_attestation_key(key)`: the key only (task PN9).
+    /// Spec: docs/59 §7.5; docs/questions/Q-1033.
+    InstallAttestationKey(InstallAttestationKeyRequest),
 }
 
 impl MessageSet for KeydRequest {
@@ -1403,6 +1639,7 @@ impl MessageSet for KeydRequest {
             KeydRequest::CompleteChangePassword(_) => request_kind::COMPLETE_CHANGE_PASSWORD,
             KeydRequest::SealChangePasswordError(_) => request_kind::SEAL_CHANGE_PASSWORD_ERROR,
             KeydRequest::RevokeDecision(_) => request_kind::REVOKE_DECISION,
+            KeydRequest::InstallAttestationKey(_) => request_kind::INSTALL_ATTESTATION_KEY,
         }
     }
 
@@ -1434,6 +1671,7 @@ impl MessageSet for KeydRequest {
             KeydRequest::OpenChangePasswordRequest(m) => m.write_fields(writer),
             KeydRequest::CompleteChangePassword(m) => m.write_fields(writer),
             KeydRequest::SealChangePasswordError(m) => m.write_fields(writer),
+            KeydRequest::InstallAttestationKey(m) => m.write_fields(writer),
         }
     }
 
@@ -1501,6 +1739,9 @@ impl MessageSet for KeydRequest {
                 SealChangePasswordErrorRequest::read_fields(reader)?,
             ),
             request_kind::REVOKE_DECISION => KeydRequest::RevokeDecision(read_decision(reader)?),
+            request_kind::INSTALL_ATTESTATION_KEY => KeydRequest::InstallAttestationKey(
+                InstallAttestationKeyRequest::read_fields(reader)?,
+            ),
             _ => return Err(Error::UnknownKind),
         })
     }
@@ -2116,6 +2357,8 @@ pub enum KeydReply {
     /// The decision is revoked (task F3). Spec: docs/52 §4.2;
     /// docs/questions/Q-976.
     RevokeDecision,
+    /// The attestation key is installed (task PN9). Spec: docs/59 §7.5.
+    InstallAttestationKey,
     /// Spec: docs/10 §9; A-26; A-56.
     AuthnFailure(AuthnError),
     /// Spec: docs/10 §9; A-56.
@@ -2155,6 +2398,7 @@ impl MessageSet for KeydReply {
             KeydReply::CompleteChangePassword(_) => reply_kind::COMPLETE_CHANGE_PASSWORD,
             KeydReply::SealChangePasswordError(_) => reply_kind::SEAL_CHANGE_PASSWORD_ERROR,
             KeydReply::RevokeDecision => reply_kind::REVOKE_DECISION,
+            KeydReply::InstallAttestationKey => reply_kind::INSTALL_ATTESTATION_KEY,
             KeydReply::AuthnFailure(_) => reply_kind::AUTHN_FAILURE,
             KeydReply::IssueFailure(_) => reply_kind::ISSUE_FAILURE,
             KeydReply::Failure(_) => reply_kind::FAILURE,
@@ -2180,7 +2424,8 @@ impl MessageSet for KeydReply {
             | KeydReply::GrantSetSecret
             | KeydReply::RegisterDecision
             | KeydReply::SealCeremony
-            | KeydReply::RevokeDecision => Ok(()),
+            | KeydReply::RevokeDecision
+            | KeydReply::InstallAttestationKey => Ok(()),
             KeydReply::ListDestroyDecisions(m) => m.write_fields(writer),
             KeydReply::VerifyOperationTicket(m) => m.write_fields(writer),
             KeydReply::OpenChangePasswordRequest(m) => m.write_fields(writer),
@@ -2248,6 +2493,7 @@ impl MessageSet for KeydReply {
                 KeydReply::SealChangePasswordError(WireSealedReply::read_fields(reader)?)
             }
             reply_kind::REVOKE_DECISION => KeydReply::RevokeDecision,
+            reply_kind::INSTALL_ATTESTATION_KEY => KeydReply::InstallAttestationKey,
             reply_kind::AUTHN_FAILURE => {
                 KeydReply::AuthnFailure(reader.read_enum(authn_error_from_code)?)
             }

@@ -18,6 +18,14 @@
 //! the kdc's files. dnsd also serves only sources inside the table (the
 //! daemon drops every other one; crates/dns-daemon).
 //!
+//! **Port 53 only** (task DN10d; A-178 on docs/questions/Q-1025 item 1): the
+//! zone's NS record and the SOA's MNAME name the DC as the zone's name server
+//! (docs/54 §3.1), and a name server is reached on port 53 — no record
+//! carries another (RFC 1035 §3.3.11, §4.2). So every `listen` address must
+//! be on [`crate::StandardPort::Dns`] (`NonStandardPort`) — the rule and the
+//! one port table of the kdc's, ldap-front's and kpasswd-front's advertised
+//! listeners. Addresses stay configurable.
+//!
 //! **Not here:** `dns_registrable_networks` (docs/questions/Q-619 item 4)
 //! constrains which addresses a host may register — a rule of dird's zone
 //! projection and write checker (docs/54 §4.4, §5.5), not of dnsd, which
@@ -27,9 +35,9 @@
 //! and the forwarding queue, which are the daemon's constants (A-60 / Q-230
 //! item 4 precedent). docs/questions/Q-951.
 //!
-//! Spec: docs/54 §4.3, §4.4, §4.6, §4.7, §6.7; docs/questions/Q-616 items 6,
-//! 10, Q-619 item 4; docs/50 R50-15, §2.4, §3.6, §4.1, §7.1; RFC 1035 §4.2,
-//! §4.2.1, §4.2.2.
+//! Spec: docs/54 §3.1, §3.3, §4.3, §4.4, §4.6, §4.7, §6.7; docs/questions/
+//! Q-616 items 6, 10, Q-619 item 4, Q-1025 item 1 (A-178); docs/50 R50-15,
+//! §2.4, §3.6, §4.1, §7.1; RFC 1035 §3.3.11, §4.2, §4.2.1, §4.2.2.
 
 use core::net::SocketAddr;
 use core::time::Duration;
@@ -38,18 +46,17 @@ use crate::error::{Error, ErrorKind};
 use crate::format::{Document, Located};
 use crate::limits::Bound;
 use crate::schema::{
-    self, Account, Distinct, Endpoint, AUDITD_UID, AUDIT_SOCKET, DIRD_UID, INTERNAL_NETWORKS,
-    RUN_AS_GID, RUN_AS_UID,
+    self, Account, Distinct, Endpoint, AUDITD_UID, AUDIT_SOCKET, DIRD_DNS_SOCKET, DIRD_UID,
+    INTERNAL_NETWORKS, RUN_AS_GID, RUN_AS_UID,
 };
+use crate::standard_port::StandardPort;
 use crate::value::{self, Network};
 
-/// Key: the interface addresses, each served on UDP and on TCP.
+/// Key: the interface addresses, each served on UDP and on TCP, every one on
+/// port 53 ([`crate::StandardPort::Dns`], the only port accepted).
 /// Spec: RFC 1035 §4.2 ("TCP … on server port 53 … as well as datagram access
-/// using UDP"); docs/54 §4.3, §4.7.
+/// using UDP"); docs/54 §4.3, §4.7; docs/questions/Q-1025 item 1.
 const LISTEN: &str = "listen";
-/// Key: path of `dird-dns.sock`. Spec: docs/54 §4.6; docs/questions/Q-619
-/// item 4.
-const DIRD_DNS_SOCKET: &str = "dird_dns_socket";
 /// Key: the bounded staleness of the zone image. Spec: docs/54 §4.4
 /// (`zone_image_max_age`); docs/questions/Q-616 item 6.
 const ZONE_IMAGE_MAX_AGE: &str = "zone_image_max_age";
@@ -219,7 +226,8 @@ impl DnsdSettings {
     ];
 
     /// Parses and validates dnsd's file. Required: `run_as_uid`,
-    /// `run_as_gid`, `listen` (each address served on UDP and TCP),
+    /// `run_as_gid`, `listen` (each address served on UDP and TCP, every one
+    /// on port 53 — `NonStandardPort`, task DN10d),
     /// `internal_networks` (every `listen` address inside one of them —
     /// `ListenerNotInternal`), `dird_dns_socket` + `dird_uid`,
     /// `audit_socket`, `auditd_uid`. Optional: `zone_image_max_age` (30s ..=
@@ -229,13 +237,18 @@ impl DnsdSettings {
     /// # Errors
     /// Any rule of the format or of this schema (see [`crate::ErrorKind`]).
     ///
-    /// Spec: docs/54 §4.3, §4.4, §4.6, §4.7, §6.7; docs/50 R50-15, §7.1;
-    /// docs/questions/Q-619 item 4.
+    /// Spec: docs/54 §3.1, §4.3, §4.4, §4.6, §4.7, §6.7; docs/50 R50-15,
+    /// §7.1; RFC 1035 §4.2; docs/questions/Q-619 item 4, Q-1025 item 1.
     pub fn parse(input: &[u8]) -> Result<Self, Error> {
         let doc = Document::parse(input, Self::KEYS)?;
         let mut all = Distinct::default();
         let run_as = schema::account(&doc, &mut all)?;
         let listen = doc.required(LISTEN, |text| value::list(text, value::listener_address))?;
+        // Task DN10d (A-178 on Q-1025 item 1): the NS record names the DC as
+        // the zone's name server, reached on port 53 (RFC 1035 §4.2) — every
+        // listener is on it, by the one port table and rule (checked right
+        // after the list, before the zone-table rule, as for the kdc).
+        schema::check_standard_port(Some(&listen), LISTEN, StandardPort::Dns)?;
         // docs/54 §4.7 (A-114): `internal_networks` is mandatory and every
         // listener lies inside it — the rule and the one match of the kdc's
         // and ldap-front's files.
@@ -297,8 +310,9 @@ impl DnsdSettings {
     }
 
     /// The interface addresses, each served on UDP and on TCP (at least one;
-    /// none repeated; each inside an internal network).
-    /// Spec: RFC 1035 §4.2; docs/54 §4.3, §4.7.
+    /// none repeated; each inside an internal network; every one on port 53,
+    /// [`crate::StandardPort::Dns`]).
+    /// Spec: RFC 1035 §4.2; docs/54 §4.3, §4.7; docs/questions/Q-1025 item 1.
     #[must_use]
     pub fn listen(&self) -> &[SocketAddr] {
         &self.listen

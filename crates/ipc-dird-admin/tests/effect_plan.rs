@@ -8,11 +8,15 @@
 //! `OperationDigest = H(op ‖ fields ‖ plan.digest)`); docs/questions/Q-874
 //! items 1-3; docs/50 §3.3 (one encoding per value, closed tables, no
 //! trailing octet); FIPS 180-4 (SHA-256 through the approved `sha2`); this
-//! crate's own layout (crate::plan module documentation). The plans are this
-//! test's own data.
+//! crate's own layout (crate::plan module documentation); docs/59 §4.2 (a
+//! key's form: printable ASCII, folded), §4.4 N1 (one holder per key), §4.6,
+//! §10 (PN7); docs/questions/Q-1008 item 2, Q-1037 (`NamesReleased`). The
+//! plans are this test's own data.
 
 use dtyp::{Guid, Sid, SECURITY_NT_AUTHORITY};
-use ipc_dird_admin::channel::{request_kind, MAX_PLAN};
+use ipc_dird_admin::channel::{
+    request_kind, MAX_PLAN, MAX_PLAN_RELEASED_NAME, MAX_PLAN_RELEASED_NAMES,
+};
 use ipc_dird_admin::{
     operation_digest, plan_digest, Auth, ConversionError, Effect, EffectPlan, KeyOperation,
     Operation, PlanError, PlanPrincipal, PlanPrincipalKind, PlanTier, PolicyReferenceKind, Reply,
@@ -53,12 +57,17 @@ fn set(rids: &[u32]) -> BTreeSet<Sid> {
     rids.iter().map(|r| sid(*r)).collect()
 }
 
+fn names(keys: &[&str]) -> BTreeSet<String> {
+    keys.iter().map(|k| (*k).to_owned()).collect()
+}
+
 /// A plan of every effect kind.
 fn every_effect() -> EffectPlan {
     EffectPlan::new(
         [
             user(1101, "carol"),
             user(1102, "dave"),
+            user(1103, "Erin"),
             group(1201, "tier0"),
             group(1202, "project"),
         ],
@@ -87,6 +96,10 @@ fn every_effect() -> EffectPlan {
             Effect::KeyDestruction {
                 kvno: Some(3),
                 principals: set(&[1102]),
+            },
+            Effect::NamesReleased {
+                names: names(&["erin"]),
+                principals: set(&[1103]),
             },
         ],
     )
@@ -226,7 +239,8 @@ fn the_decoder_is_strict() {
     .unwrap();
     let tag_at = one.len() - (4 + 4 + packet.len()) - 1;
     assert_eq!(one[tag_at], 5);
-    for tag in [0u8, 7, 0xFF] {
+    // 7 is `NamesReleased` (task PN7); 8 is the first unknown tag.
+    for tag in [0u8, 8, 0xFF] {
         let mut bad = one.clone();
         bad[tag_at] = tag;
         assert!(EffectPlan::decode(&bad).is_err(), "tag {tag}");
@@ -248,6 +262,113 @@ fn a_plan_beyond_its_bounds_is_too_large() {
         EffectPlan::new(principals, [Effect::ProtectedDataLoss { principals: all }]),
         Err(PlanError::TooLarge)
     );
+}
+
+/// Task PN7 (docs/59 §10; Q-1037): a `NamesReleased` has one form — the
+/// names of exactly one principal, non-empty, each in a namespace key's form
+/// (printable ASCII without `A`-`Z`, docs/59 §4.2); no principal and no name
+/// in two of them (one holder per key, docs/59 §4.4 N1); within its bounds
+/// (36 names of at most 2048 octets — Q-1008 item 2); and the digest covers
+/// every name.
+#[test]
+fn released_names_have_one_form_and_their_bounds() {
+    let plan =
+        |effects: Vec<Effect>| EffectPlan::new([user(1103, "erin"), user(1104, "frank")], effects);
+    let released = |keys: &[&str], rids: &[u32]| Effect::NamesReleased {
+        names: names(keys),
+        principals: set(rids),
+    };
+    // A computer's keys — sAMAccountName, base name, SPN, host name.
+    let computer = [
+        "erin$",
+        "erin",
+        "host/erin.example.test",
+        "erin.example.test",
+    ];
+    let ok = plan(vec![released(&computer, &[1103])]).unwrap();
+    let bytes = ok.encode().unwrap();
+    assert_eq!(EffectPlan::decode(&bytes).unwrap(), ok);
+    // The digest covers the names: two names fewer, another digest.
+    let fewer = plan(vec![released(&computer[..2], &[1103])]).unwrap();
+    assert_ne!(fewer.digest().unwrap(), ok.digest().unwrap());
+    // Two holders, each with its own names.
+    assert!(plan(vec![
+        released(&["erin"], &[1103]),
+        released(&["frank"], &[1104])
+    ])
+    .is_ok());
+    for effects in [
+        vec![released(&[], &[1103])],
+        vec![released(&[""], &[1103])],
+        vec![released(&["erin"], &[1103, 1104])],
+        vec![released(&["Erin"], &[1103])],
+        vec![released(&["erin\n"], &[1103])],
+        vec![released(&["er\u{7f}in"], &[1103])],
+        vec![released(&["érin"], &[1103])],
+        // One holder in two effects.
+        vec![released(&["erin"], &[1103]), released(&["erin$"], &[1103])],
+        // One name, two holders.
+        vec![
+            released(&["erin"], &[1103]),
+            released(&["erin", "frank"], &[1104]),
+        ],
+    ] {
+        assert_eq!(
+            plan(effects.clone()),
+            Err(PlanError::Malformed),
+            "{effects:?}"
+        );
+    }
+    // The bounds: a name of 2048 octets, 36 names.
+    let longest = "a".repeat(MAX_PLAN_RELEASED_NAME as usize);
+    assert!(plan(vec![released(&[&longest], &[1103])]).is_ok());
+    let longer = "a".repeat(MAX_PLAN_RELEASED_NAME as usize + 1);
+    assert_eq!(
+        plan(vec![released(&[&longer], &[1103])]),
+        Err(PlanError::TooLarge)
+    );
+    let many: Vec<String> = (0..=MAX_PLAN_RELEASED_NAMES)
+        .map(|i| format!("n{i}"))
+        .collect();
+    let many: Vec<&str> = many.iter().map(String::as_str).collect();
+    assert!(plan(vec![released(&many[1..], &[1103])]).is_ok());
+    assert_eq!(
+        plan(vec![released(&many, &[1103])]),
+        Err(PlanError::TooLarge)
+    );
+}
+
+/// The decoder holds released names to their form octet by octet: out of
+/// order, repeated, or with an upper-case letter — refused; nothing is a
+/// second spelling (docs/50 §3.3).
+#[test]
+fn the_decoder_holds_released_names_to_their_form() {
+    let plan = EffectPlan::new(
+        [user(1103, "erin")],
+        [Effect::NamesReleased {
+            names: names(&["a", "b"]),
+            principals: set(&[1103]),
+        }],
+    )
+    .unwrap();
+    let bytes = plan.encode().unwrap();
+    assert_eq!(EffectPlan::decode(&bytes).unwrap(), plan);
+    // The head: tag 7, two names of one octet each (u32 counts and lengths).
+    let head = [7u8, 0, 0, 0, 2, 0, 0, 0, 1, b'a', 0, 0, 0, 1, b'b'];
+    let at = bytes
+        .windows(head.len())
+        .position(|w| w == head)
+        .expect("the head");
+    for (first, second) in [(b'b', b'a'), (b'a', b'a'), (b'a', b'B')] {
+        let mut bad = bytes.clone();
+        bad[at + 9] = first;
+        bad[at + 14] = second;
+        assert_eq!(
+            EffectPlan::decode(&bad),
+            Err(PlanError::Malformed),
+            "{first} {second}"
+        );
+    }
 }
 
 /// No second path (r5-a §3.3): the planned kinds are not requests of their

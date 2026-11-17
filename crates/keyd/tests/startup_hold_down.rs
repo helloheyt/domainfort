@@ -103,7 +103,7 @@ fn every_held_operation_refused_at(f: &mut Fixture, tgt: &Tgt, when: KerberosTim
     };
     let r = f
         .keyd
-        .issue_as_rep(&KDC, &ALICE, &KRBTGT, &proof, None, &as_template(), &when);
+        .issue_as(&KDC, &ALICE, &KRBTGT, &proof, None, &as_template(), &when);
     assert_eq!(r.unwrap_err(), IssueError::Unavailable);
     assert_held(f, Operation::IssueAsRep);
 
@@ -114,7 +114,7 @@ fn every_held_operation_refused_at(f: &mut Fixture, tgt: &Tgt, when: KerberosTim
     assert_eq!(r.unwrap_err(), AuthnError::Unavailable);
     assert_held(f, Operation::OpenAndVerifyTgt);
 
-    let r = f.keyd.issue_tgs_rep(
+    let r = f.keyd.issue_tgs(
         &KDC,
         &SERVICE,
         &CtxId::from_bytes([4; 16]),
@@ -257,7 +257,7 @@ fn the_boundary_is_exact() {
     };
     assert!(f
         .keyd
-        .issue_tgs_rep(&KDC, &SERVICE, &ctx.ctx_id, &template, &served)
+        .issue_tgs(&KDC, &SERVICE, &ctx.ctx_id, &template, &served)
         .is_ok());
 }
 

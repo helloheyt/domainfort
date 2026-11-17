@@ -16,7 +16,7 @@
 //! — and keyadm names a decision only by its id: keyd runs the parameters it
 //! holds.
 //!
-//! # `keyadm <configuration file> ceremony <manifest file>`
+//! # `keyadm <configuration file> ceremony <manifest file> <attestation key file>`
 //!
 //! Provisioning step 11 (docs/51 §4.3): after auditd and keyd start, create
 //! the key sets the manifest of `provision domain` names — the krbtgt key
@@ -30,8 +30,12 @@
 //! command line → refuse root ([`identity`]) → read the configuration
 //! ([`settings`]: root-owned, not group/other-writable) → read the manifest
 //! (`provision_manifest::read_manifest`: the same rule; every first
-//! administrator must have its salt, A-102 / N4) → connect to keyd, verify
-//! its peer uid before anything is sent → `ping` → four `create_key` (task K9: the fourth for `kadmin/changepw`) → one
+//! administrator must have its salt, A-102 / N4) → read the attestation key
+//! file ([`attestation_key`]: the running account's, 0400/0600, exactly 32
+//! octets, not all zero — task PN9; the copy `provision domain` writes,
+//! required since task PN12 — A-183) → connect to keyd, verify
+//! its peer uid before anything is sent → `ping` → four `create_key` (task K9: the fourth for `kadmin/changepw`) →
+//! `install_attestation_key` (task PN9; docs/59 §7.4, §7.5) → one
 //! `grant_set_secret` per first administrator, binding the manifest's salt
 //! (task A15a: the initial-secret grants without which keyd refuses
 //! `provision first-admin-secret`'s `set_secret`, live 15 minutes — docs/51
@@ -81,6 +85,7 @@
 //! Spec: docs/51 §4.3 step 11, §4.5, §6, §12 (A5); docs/50 §2.4, R50-3;
 //! A-57; A-72; A-73; A-77; docs/52 §4 (A-102).
 
+pub mod attestation_key;
 pub mod ceremony;
 pub mod cli;
 pub mod execute;

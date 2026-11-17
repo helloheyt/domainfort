@@ -199,6 +199,65 @@
 //! interpretations in docs/questions/Q-963. No other implementation was
 //! consulted or recalled (docs/CLEAN-ROOM.md).
 
+//! # `DnsSelfUpdate` (task DN6; docs/54 §4.5, §5; decision A-119)
+//!
+//! A member host's change of its own DNS host record (module `dns_update`):
+//! [`DirectoryAdmin::dns_update_host`] decides the signer's own host from
+//! the identity keyd verified (Subject, own computer, host name, PDP
+//! `DnsUpdate` with the owner's tier), [`DirectoryAdmin::prepare_dns_self_update`]
+//! judges the new address set, and [`DirectoryAdmin::apply_dns_self_update`]
+//! writes it — after auditd acknowledged the decision — as a `CheckedWrite`
+//! of the one checker. The record is an attribute of the owner (ad-schema
+//! `HOST_ADDRESS`); its holder rule (a computer named `<computerName>.<zone>`,
+//! one LDH label; at most eight registrable addresses) is a state rule of the
+//! checker; and the commit takes the `dns-zone-serial` counter in the same
+//! transaction for **every** write that changes the zone's content — a host
+//! record's, and an admin write to an object holding one (RFC 2136 §3.6).
+//! The provisioning session creates that counter with the other two (A-83).
+//! Written only from the sources listed in module `dns_update`;
+//! interpretations in docs/questions/Q-991..Q-994. No other implementation
+//! was consulted or recalled (docs/CLEAN-ROOM.md).
+//!
+//! # The serial-only zone write (task DN10b; docs/questions/Q-1002, A-172)
+//!
+//! [`ZoneSerialWriter`] advances the zone's SOA SERIAL without a content
+//! write, for the changes no commit sees (the clock; a dird restart with
+//! other zone values): `prepare` in dird's `WriteTxn` (the `ZoneSerial`
+//! decision event), auditd's acknowledgement, then `apply` — the one
+//! checker's `Op::ZoneSerial` and the one commit, which takes the counter
+//! exactly as for a content write; still one writer of SERIAL. The
+//! provisioning session, given the zone
+//! ([`Provisioning::with_dns_registration`]), writes the DC's own host
+//! record through the same host-record rule. Written only from the sources
+//! listed in module `zone_serial`; interpretations in docs/questions/Q-1013,
+//! Q-1014. No other implementation was consulted or recalled (docs/CLEAN-ROOM.md
+//! -3).
+//!
+//! # The one principal namespace (task PN5; docs/59, decision A-173)
+//!
+//! Every security principal any write path creates gets its keys in the one
+//! principal namespace from the one checker — `principal_names::
+//! keys_of_names` of its own names and provisioning claim, written into the
+//! ad-schema `PRINCIPAL_NAME_KEY` attribute by crate::invariants itself and
+//! by nothing else (docs/59 N7: no caller can supply or change a key) — so
+//! the store's unique index on that one attribute makes every name, in every
+//! form and case, one object's only (class M2). Reserved names (`krbtgt`,
+//! `admind/<host>`, `kadmin/changepw`) are judged on those folded keys, not
+//! on octets (class C49; Q-1009 items 1-2). `prepare` runs the same rules on
+//! a new object and probes its keys (`Conflict`); `Lookup {sam | spn}` probes
+//! the namespace once and keeps the exact acceptance of R47-1. The
+//! provisioning session derives the keys in its naming context and marks the
+//! store (`principal-namespace`). Written only from, opened in this session:
+//! docs/59 (whole), docs/questions/Q-1007..Q-1010, Q-1018, Q-1020 with their
+//! Decision lines, PENDING-OWNER A-163, A-167, A-170, A-173..A-176; the
+//! pinned [MS-SAMR] v20260427 3.1.1.6 items 8-14, 3.1.1.8.4, [MS-ADTS]
+//! v20261026 3.1.1.5.1.3, 3.1.1.5.3.1.1.1-.4, RFC 4120 §6.2, §6.2.1, §7.3
+//! (SHA-256 verified against tools/spec-pin/manifest.json); and this
+//! repository's crates principal-names, directory-pip (`principal.rs`) and
+//! ad-schema (`internal.rs`). Interpretations in docs/questions/
+//! Q-1029..Q-1031. No other implementation was consulted or recalled
+//! (docs/CLEAN-ROOM.md).
+
 mod admin;
 mod apply;
 mod audit;
@@ -206,6 +265,7 @@ mod change_password;
 mod checks;
 mod config;
 mod descriptor;
+mod dns_update;
 mod effects;
 mod ids;
 mod invariants;
@@ -219,6 +279,7 @@ mod reply;
 mod requests;
 mod subject;
 mod time;
+mod zone_serial;
 
 pub use admin::{
     DirectoryAdmin, Prepared, Request, VerificationFailure, ACCOUNT_EXPIRES_NEVER,
@@ -233,10 +294,19 @@ pub use change_password::{
     USER_CHANGE_PASSWORD,
 };
 pub use config::{
-    AdminConfig, ConfigError, ProtectedObjects, CHANGE_SEQ_COUNTER, CHANGE_SEQ_END_EXCLUSIVE,
-    CHANGE_SEQ_FIRST, MAX_QUORUM, MIN_QUORUM, RID_COUNTER, RID_END_EXCLUSIVE, RID_FIRST,
+    AdminConfig, ConfigError, DnsRegistration, ProtectedObjects, CHANGE_SEQ_COUNTER,
+    CHANGE_SEQ_END_EXCLUSIVE, CHANGE_SEQ_FIRST, DNS_ZONE_SERIAL_COUNTER,
+    DNS_ZONE_SERIAL_END_EXCLUSIVE, DNS_ZONE_SERIAL_FIRST, MAX_QUORUM, MIN_QUORUM,
+    PRINCIPAL_NAMESPACE_COUNTER, PRINCIPAL_NAMESPACE_END_EXCLUSIVE, PRINCIPAL_NAMESPACE_FIRST,
+    RID_COUNTER, RID_END_EXCLUSIVE, RID_FIRST,
 };
 pub use descriptor::{new_object_descriptor, DescriptorError};
+// A host's change of its own DNS host record (task DN6; docs/54 §4.5): the
+// one write path of the dynamic records, for dird's DNS PEP (task DN8).
+pub use dns_update::{
+    AppliedDnsUpdate, DnsHost, DnsHostUpdate, DnsUpdateFailure, DnsUpdateRefusal, DnsUpdateTicket,
+    PreparedDnsUpdate, RecordedDnsUpdate,
+};
 // The write invariants' provisioning session (docs/52 R13): the only way
 // `provision domain` writes the new domain, and the only place the named
 // provisioning exceptions exist.
@@ -280,3 +350,9 @@ pub use random::{OsRandom, RandomError, RandomSource};
 pub use reply::{KeyTarget, LookupResult, PasswordChangeTarget, PasswordSetReply, Reply};
 pub use subject::{AdminSubject, SubjectError, VerifiedTicket};
 pub use time::{filetime, wall_clock};
+// The serial-only zone write (task DN10b; docs/questions/Q-1002, A-172):
+// the zone's SERIAL advanced through the one commit, after auditd
+// acknowledged the decision — for dird's DNS service.
+pub use zone_serial::{
+    AppliedSerialAdvance, PreparedSerialAdvance, SerialAdvanceFailed, ZoneSerialWriter,
+};

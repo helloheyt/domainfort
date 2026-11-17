@@ -15,7 +15,11 @@
 use std::process::Command;
 
 /// What the kdc daemon must never link.
-const FORBIDDEN: [&str; 8] = [
+/// `name-attestation`, `hmac` and `sha2` (A-173, A-175; docs/59 §7): the KDC
+/// forwards a dird-attested name resolution to keyd but never holds the
+/// attestation key nor links MAC code (C3 — a compromised KDC cannot forge
+/// a resolution).
+const FORBIDDEN: [&str; 11] = [
     "dirstore",
     "redb",
     "directory-pip",
@@ -24,6 +28,9 @@ const FORBIDDEN: [&str; 8] = [
     "keyd",
     "krb-crypto",
     "directory-daemon",
+    "name-attestation",
+    "hmac",
+    "sha2",
 ];
 
 fn normal_dependency_graph(package: &str) -> Vec<String> {

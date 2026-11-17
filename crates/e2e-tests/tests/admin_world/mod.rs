@@ -9,8 +9,12 @@
 //!    with the installer's recording `Ownership` and `Progress` of A4's
 //!    tests (crates/provision/tests/common, reused through `#[path]`),
 //!    never root, into the run's 0700 temporary directory. Its database,
-//!    integrity key, policy, manifest and seven configuration files are the
-//!    daemons' inputs ([`World::provisioned`]).
+//!    integrity key, policy, manifest and configuration files are the
+//!    daemons' inputs ([`World::provisioned`]) — and (task PN12) its
+//!    attestation key's two files: dird's key file, which dird reads with
+//!    its own reader ([`World::start_dird`]), and keyadm's copy, which the
+//!    ceremony installs in keyd ([`World::ceremony`]) — one draw, so dird
+//!    tags with the key keyd holds.
 //! 2. **The test-only workstation fixture** ([`Workstation`]; P-23 is open,
 //!    docs/questions/Q-431): before dird starts, directly on the produced
 //!    store, through the write PEP itself (crate directory-admin `prepare` /
@@ -761,6 +765,12 @@ fn workstation_fixture(plan: &Plan, input: &DomainInput, uid: u32) -> Workstatio
     let tiers = directory_daemon::policy::tier_map(&policy).unwrap();
     let snapshot = policy.snapshot().unwrap();
     let nc = NamingContext::new(&input.naming_context).unwrap();
+    // No signer (task PN10c; A-189): the write PEP's subject check reads
+    // the ticket's subject through `TicketSubjects` — the one lookup path,
+    // no KDC record, no attested resolution — and its service-object
+    // checks through `canonical_principal`; only dird's KDC channel attests
+    // (docs/questions/Q-1050 item 1, Q-1051 item 1). Nothing this fixture
+    // runs reads a KDC record.
     let ctx = DirectoryContext::new(
         ad_schema::phase1().unwrap(),
         &KeydConfig::new(realm()),
@@ -846,7 +856,6 @@ fn workstation_fixture(plan: &Plan, input: &DomainInput, uid: u32) -> Workstatio
     let guid = match run(PepOperation::CreateComputer(CreateComputer {
         parent: workstations,
         name: WORKSTATION.into(),
-        dns_host_name: format!("{WORKSTATION}.example.org"),
         spn: None,
     })) {
         PepReply::Created { guid, .. } => guid,
@@ -870,6 +879,18 @@ fn workstation_fixture(plan: &Plan, input: &DomainInput, uid: u32) -> Workstatio
 // ---------------------------------------------------------------------------
 // The world.
 // ---------------------------------------------------------------------------
+
+/// Which of dird's two account queries on `dird-kdc.sock` a resolution is
+/// read through ([`World::dird_resolution`]): the KDC's client lookup (AS)
+/// or its service lookup (TGS). Spec: docs/50 §3.4 (the dird-kdc table:
+/// `Client`, `Service`); docs/59 §6.2 (`AsClient`, `TgsServer`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirdQuery {
+    /// `Client {realm, name}` — `AccountSource::client`.
+    Client,
+    /// `Service {realm, name}` — `AccountSource::service`.
+    Service,
+}
 
 /// A client of the run who holds an admin-service ticket.
 pub struct Persona {
@@ -1032,6 +1053,9 @@ impl World {
             "kdc" => "ak.sock",
             "ldap-front" => "af.sock",
             "admind" => "am.sock",
+            // Task DN10a: dnsd's listener (support::AUDIT_LABELS); this
+            // world runs no dnsd, so nothing connects to it.
+            "dnsd" => "an.sock",
             other => panic!("not a sender: {other}"),
         };
         produced.with_file_name(name)
@@ -1169,9 +1193,13 @@ impl World {
     /// `keyadm ceremony` (library, over keyd's socket, Role::Admin):
     /// `create_key` for krbtgt and the three service objects of the manifest
     /// (docs/51 §4.3 step 11; the change-password service's since task K9 —
-    /// docs/53 §5.2), then the first administrators' initial-secret
-    /// grants (task A15a; their salts from the manifest — A-102, N4), then
-    /// the seal (A-102, docs/52 R3). keyadm's file names keyd's socket.
+    /// docs/53 §5.2), then (task PN12) the attestation key — keyadm's copy
+    /// that `provision domain` wrote, read through keyadm's own reader (the
+    /// test uid stands in for keyadm's account: the installer's owner change
+    /// is recorded, not made) and installed in keyd (task PN9) — then the
+    /// first administrators' initial-secret grants (task A15a; their salts
+    /// from the manifest — A-102, N4), then the seal (A-102, docs/52 R3).
+    /// keyadm's file names keyd's socket.
     pub fn ceremony(&mut self) -> keyadm::ceremony::CeremonyReport {
         self.keyd_phase(KeydPhase::Provisioning);
         let settings = KeyadmSettings::parse(&self.read(&self.input.paths.keyadm_config)).unwrap();
@@ -1181,10 +1209,53 @@ impl World {
         );
         let mut client =
             key_state_client(settings.keyd().socket().as_path(), self.uid, Role::Admin);
-        let report = keyadm::ceremony::run(&mut client, &self.manifest);
+        let key = provision_common::keyadm_attestation_key(&self.input.paths, self.uid);
+        let report = keyadm::ceremony::run_with_attestation_key(&mut client, &self.manifest, key);
         self.captured
             .extend(keyadm::report::render(&report, &self.manifest));
         report
+    }
+
+    /// Task PN12 (docs/59 §7.1, §7.5): the attested name resolution of
+    /// `sam`'s client record as the **running** dird answers it on
+    /// `dird-kdc.sock` — the record the KDC hands keyd once PN11 lands —
+    /// read through the channel's own client (`ipc_directory`, the server
+    /// uid checked; the test uid is dird's and its kdc peer here), in one
+    /// pinned view.
+    pub fn dird_client_resolution(&self, sam: &str) -> keyd_types::AttestedNameResolution {
+        self.dird_resolution(&principal(sam), DirdQuery::Client)
+            .expect("the account exists")
+    }
+
+    /// Task PN13 (docs/59 §7.1, §7.5): the attested name resolution the
+    /// **running** dird answers on `dird-kdc.sock` for `name` — the record
+    /// of a `Client` query (the KDC's AS lookup) or of a `Service` query
+    /// (its TGS lookup) — read through the channel's own client in one
+    /// pinned view, exactly what dird hands the KDC; `None` when dird
+    /// answers that no such principal exists.
+    pub fn dird_resolution(
+        &self,
+        name: &PrincipalName,
+        query: DirdQuery,
+    ) -> Option<keyd_types::AttestedNameResolution> {
+        let mut client = ipc_directory::DirectoryClient::connect(
+            connector::dird(self.input.paths.dird_kdc_socket.as_path()),
+            self.uid,
+            ipc_directory::DEFAULT_DEADLINE,
+            self.plan.policy.version,
+        )
+        .expect("dird describes its domain");
+        let view = client.begin_view().expect("dird pins a view");
+        let resolution = match query {
+            DirdQuery::Client => kdc::AccountSource::client(&view, &realm(), name)
+                .expect("dird answers the client query")
+                .map(|account| account.resolution),
+            DirdQuery::Service => kdc::AccountSource::service(&view, &realm(), name)
+                .expect("dird answers the service query")
+                .map(|account| account.resolution),
+        };
+        view.end().expect("the view ends");
+        resolution
     }
 
     /// The first administrators' password files (docs/51 §4.4 source (b):
@@ -1296,10 +1367,29 @@ impl World {
     /// clock, and keyd's verifier through the host's connector (Role::Ldap,
     /// the produced `keyd_socket`).
     pub fn start_dird(&mut self) {
+        let produced = self.input.paths.attestation_key.as_path().to_path_buf();
+        self.start_dird_attesting_with(&produced);
+    }
+
+    /// [`World::start_dird`] with dird's attestation key read — through
+    /// dird's own reader — from `key_file` instead of the produced file its
+    /// configuration names (task PN13: a dird whose key is not the one the
+    /// ceremony installed in keyd; docs/59 §7.2 step 1, §7.4). Everything
+    /// else is the produced configuration's.
+    pub fn start_dird_attesting_with(&mut self, key_file: &Path) {
         let paths = &self.input.paths;
         let settings = DirdSettings::parse(&self.read(&paths.dird_config)).unwrap();
+        // Task PN12 (docs/59 §7.4): dird's attestation key — the produced
+        // file its produced configuration names, read with dird's own
+        // reader (root:0400, 32 octets; the test uid stands in for root).
+        assert_eq!(
+            settings.attestation_key_path().as_path(),
+            paths.attestation_key.as_path()
+        );
+        let attestation_key =
+            directory_daemon::startup::read_attestation_key(key_file, self.uid).unwrap();
         let mut params = directory_daemon::test_seams::DaemonParams::from(
-            directory_daemon::startup::params(&settings).unwrap(),
+            directory_daemon::startup::params(&settings, attestation_key).unwrap(),
         );
         params.kdc_uid = self.uid;
         params.ldap_front_uid = self.uid;
@@ -1367,6 +1457,12 @@ impl World {
             owner_uid: uid,
         };
         self.dird = Some(DirdRun::start(params, admin, source, policy).expect("dird starts"));
+    }
+
+    /// Stop dird (its audit window delivered, bounded).
+    pub fn stop_dird(&mut self) {
+        let unacknowledged = self.dird.take().expect("dird runs").stop().unwrap();
+        assert_eq!(unacknowledged, 0, "dird delivered every audit event");
     }
 
     /// The kdc: its produced file read through the kdc's own reader (owner =
@@ -1966,6 +2062,10 @@ fn domain_input(dir: &ScratchDir, uid: u32) -> DomainInput {
             staging: path("etc/staging"),
             database: path("var/directory.redb"),
             integrity_key: path("etc/integrity.key"),
+            // Task PN12 (docs/59 §7.4): dird's attestation key and keyadm's
+            // copy.
+            attestation_key: path("etc/attestation.key"),
+            keyadm_attestation_key: path("etc/keyadm-attestation.key"),
             policy: path("etc/policy.store"),
             manifest: path("etc/provision.manifest"),
             audit_log: path("var/audit.log"),
@@ -1992,11 +2092,18 @@ fn domain_input(dir: &ScratchDir, uid: u32) -> DomainInput {
         },
         network: Network {
             kdc_listen: vec!["127.0.0.1:88".to_owned()],
-            ldap_listen: Vec::new(),
+            // Task DN10c: the StartTLS listener the zone's `_ldap._tcp`
+            // needs (docs/questions/Q-1016 item 3, A-176); LDAPS beside it.
+            // The world binds its own loopback port-0 listeners, never these.
+            ldap_listen: vec!["127.0.0.1:389".to_owned()],
             ldaps_listen: vec!["127.0.0.1:636".to_owned()],
-            internal_networks: vec!["127.0.0.0/8".to_owned()],
+            // Task DN10b: the DC's address must be registrable — inside an
+            // IPv4 internal network and not loopback (docs/54 §5.5) — so a
+            // test network beside loopback holds it.
+            internal_networks: vec!["127.0.0.0/8".to_owned(), "192.0.2.0/24".to_owned()],
             kpasswd_listen: vec!["127.0.0.1:464".to_owned()],
             dnsd_listen: vec!["127.0.0.1:53".to_owned()],
+            dc_addresses: vec!["192.0.2.10".to_owned()],
         },
         names: Names {
             tier0_ou: "Tier0".to_owned(),

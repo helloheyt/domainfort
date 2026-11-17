@@ -159,6 +159,65 @@ pub fn is_admin_service_name(name: &PrincipalName) -> bool {
 pub use krb_proto::{is_change_password_service_name, CHANGE_PASSWORD_SERVICE_NAME};
 
 impl KeyPurpose {
+    /// Every purpose, in code order: `ALL[i].code() == i` (checked at
+    /// compile time below), so [`KeyPurpose::from_code`] — which searches
+    /// this list — is the exact inverse of [`KeyPurpose::code`] and never a
+    /// second table.
+    /// Spec: docs/10 §1 (KeyPurpose); docs/questions/Q-1023 item 4.
+    pub const ALL: [KeyPurpose; 5] = [
+        KeyPurpose::PrincipalLongterm,
+        KeyPurpose::Krbtgt,
+        KeyPurpose::Service,
+        KeyPurpose::AdminService,
+        KeyPurpose::ChangePasswordService,
+    ];
+
+    /// The purpose's code — **the one table** of it: the sealed key store
+    /// persists it (`sealed_store`: a record's handle, the root-digest
+    /// list) and the name-resolution MAC input carries it
+    /// (`NameResolution::mac_input`). Explicit, so that neither encoding
+    /// depends on the enum's in-memory representation; a new purpose does
+    /// not compile here until it is given a code (and it must then be
+    /// appended to [`KeyPurpose::ALL`], which the compile-time check below
+    /// keeps dense and in order). The numbers are persisted: they never
+    /// change (pinned by the tests of this module and of `sealed_store`).
+    ///
+    /// Class closed (C14, docs/CLEAN-ROOM.md): one fact — the code of a purpose
+    /// — was written as two tables (the sealed store's private
+    /// `purpose_code` and the MAC input's `mac_purpose_code`), held equal
+    /// only by a test. Now both encoders call this function.
+    /// Spec: docs/10 §1; docs/research/r4-c §3.3 (the handle in the
+    /// associated data); docs/59 §7.1 (`key_purpose` in the MAC input);
+    /// docs/questions/Q-1023 item 4 (A-175: "folds into one
+    /// `KeyPurpose::code()` in PN8").
+    #[must_use]
+    pub const fn code(self) -> u8 {
+        match self {
+            KeyPurpose::PrincipalLongterm => 0,
+            KeyPurpose::Krbtgt => 1,
+            KeyPurpose::Service => 2,
+            KeyPurpose::AdminService => 3,
+            KeyPurpose::ChangePasswordService => 4,
+        }
+    }
+
+    /// The purpose whose [`KeyPurpose::code`] is `code`; `None` for every
+    /// other code (a decoder refuses it). Derived from `code` through
+    /// [`KeyPurpose::ALL`] — not a second table.
+    /// Spec: docs/10 §1; docs/research/r4-c §3.3, §8.3 (unknown ids
+    /// refused); docs/questions/Q-1023 item 4.
+    #[must_use]
+    pub const fn from_code(code: u8) -> Option<KeyPurpose> {
+        let mut i = 0;
+        while i < KeyPurpose::ALL.len() {
+            if KeyPurpose::ALL[i].code() == code {
+                return Some(KeyPurpose::ALL[i]);
+            }
+            i += 1;
+        }
+        None
+    }
+
     /// The purpose of the key set a service ticket for `name` is sealed
     /// under: [`KeyPurpose::AdminService`] for the admin service's name
     /// ([`is_admin_service_name`]), [`KeyPurpose::ChangePasswordService`]
@@ -183,6 +242,16 @@ impl KeyPurpose {
         }
     }
 }
+
+// `KeyPurpose::ALL` is dense and in code order: `ALL[i].code() == i`, so
+// `from_code` inverts `code` exactly. Spec: docs/questions/Q-1023 item 4.
+const _: () = {
+    let mut i = 0;
+    while i < KeyPurpose::ALL.len() {
+        assert!(KeyPurpose::ALL[i].code() as usize == i);
+        i += 1;
+    }
+};
 
 /// A reference to a stored key set — never the key material.
 ///
@@ -338,6 +407,35 @@ mod tests {
 
     fn realm(r: &str) -> Realm {
         Realm::new(r).unwrap()
+    }
+
+    /// Q-1023 item 4 (A-175): the one purpose-code table. The numbers are
+    /// persisted by the sealed store (r4-c §3.3) and carried in the
+    /// name-resolution MAC input (docs/59 §7.1), so they are pinned here
+    /// literally; `from_code` inverts `code` on every listed purpose and
+    /// maps no other octet; `ALL` holds each purpose once.
+    #[test]
+    fn the_purpose_codes_are_the_one_pinned_table() {
+        let pinned = [
+            (KeyPurpose::PrincipalLongterm, 0u8),
+            (KeyPurpose::Krbtgt, 1),
+            (KeyPurpose::Service, 2),
+            (KeyPurpose::AdminService, 3),
+            (KeyPurpose::ChangePasswordService, 4),
+        ];
+        assert_eq!(KeyPurpose::ALL.len(), pinned.len());
+        for (purpose, code) in pinned {
+            assert_eq!(purpose.code(), code, "{purpose:?}");
+            assert_eq!(KeyPurpose::from_code(code), Some(purpose), "{code}");
+            assert_eq!(
+                KeyPurpose::ALL.iter().filter(|p| **p == purpose).count(),
+                1,
+                "{purpose:?}"
+            );
+        }
+        for code in 5..=u8::MAX {
+            assert_eq!(KeyPurpose::from_code(code), None, "{code}");
+        }
     }
 
     /// RFC 4120 6.2: name-type is not significant for equivalence; realm

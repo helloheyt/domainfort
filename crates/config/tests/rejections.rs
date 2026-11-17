@@ -11,7 +11,7 @@ use common::{append, remove, replace, set, Daemon, ADMIND, AUDITD, DIRD, KDC, KE
 use config::limits::{MAX_FILE_OCTETS, MAX_KEY_OCTETS, MAX_LINES, MAX_LINE_OCTETS};
 use config::{
     AdmindSettings, AuditdSettings, DirdSettings, Error, ErrorKind, KdcSettings, KeydSettings,
-    LdapFrontSettings,
+    LdapFrontSettings, StandardPort,
 };
 
 /// The 1-based line of `key` in `text`.
@@ -943,12 +943,80 @@ fn listener_addresses() {
     ] {
         rejects_value(Daemon::Kdc, KDC, key, value, ErrorKind::InvalidList);
     }
-    // Every listener inside the zone table (docs/50 R50-9; task R15b).
+    // Every listener inside the zone table (docs/50 R50-9; task R15b), and
+    // every one on port 88 (task DN10c).
     accepts_value(
         Daemon::Kdc,
         &set(KDC, "internal_networks", "10.0.0.0/8, 127.0.0.0/8, ::1/128"),
         key,
-        "[::1]:8888, 127.0.0.1:88, 10.0.0.5:89",
+        "[::1]:88, 127.0.0.1:88, 10.0.0.6:88",
+    );
+}
+
+/// Task DN10c (A-176 on docs/questions/Q-1016 item 4; Q-1024): the listeners
+/// the zone advertises take only their service's standard port — the kdc's
+/// `listen` 88 (RFC 4120 §7.2.3.2), ldap-front's StartTLS `ldap_listen` 389
+/// ([MS-ADTS] §6.3.2.3), kpasswd-front's `listen` 464 ([MS-ADTS] §6.3.2.3) —
+/// refused `NonStandardPort` at the list's line and key, also when only one
+/// address of the list is off; the address stays the operator's. LDAPS is
+/// advertised by no SRV record and keeps any port.
+#[test]
+fn advertised_listeners_take_only_the_standard_port() {
+    assert_eq!(
+        StandardPort::ALL.map(StandardPort::number),
+        [88, 389, 464, 53],
+        "RFC 4120 §7.2.3.2; [MS-ADTS] §6.3.2.3; RFC 1035 §4.2"
+    );
+    let kdc = set(KDC, "internal_networks", "10.0.0.0/8, fd00:1234::/32");
+    for value in [
+        "10.0.0.5:89",
+        "10.0.0.5:87",
+        "10.0.0.5:389",
+        "10.0.0.5:464",
+        "10.0.0.5:8888",
+        "10.0.0.5:88, [fd00:1234::5]:8888",
+        "[fd00:1234::5]:1088",
+    ] {
+        rejects_value(
+            Daemon::Kdc,
+            &kdc,
+            "listen",
+            value,
+            ErrorKind::NonStandardPort,
+        );
+    }
+    accepts_value(
+        Daemon::Kdc,
+        &kdc,
+        "listen",
+        "10.0.0.7:88, [fd00:1234::7]:88",
+    );
+    for value in [
+        "10.0.0.5:3389",
+        "10.0.0.5:88",
+        "10.0.0.5:636",
+        "10.0.0.5:389, 192.168.10.5:390",
+    ] {
+        rejects_value(
+            Daemon::LdapFront,
+            LDAP_FRONT,
+            "ldap_listen",
+            value,
+            ErrorKind::NonStandardPort,
+        );
+    }
+    accepts_value(
+        Daemon::LdapFront,
+        LDAP_FRONT,
+        "ldap_listen",
+        "10.0.0.7:389, 192.168.10.5:389",
+    );
+    // LDAPS: no SRV record, any port (docs/questions/Q-1016 item 3 (c)).
+    accepts_value(
+        Daemon::LdapFront,
+        LDAP_FRONT,
+        "ldaps_listen",
+        "10.0.0.5:6360, [fd00:1234::5]:636",
     );
 }
 
@@ -1103,6 +1171,14 @@ fn the_same_path_under_two_settings_is_rejected() {
             DIRD,
             "dird_admin_socket",
             "/run/auditd/audit.sock",
+        ),
+        // Task PN10 (docs/59 §7.4: the attestation key is never the dirstore
+        // integrity key — A-129): two keys, two files.
+        (
+            Daemon::Dird,
+            DIRD,
+            "attestation_key_path",
+            "/etc/dird/integrity.key",
         ),
         (
             Daemon::LdapFront,
@@ -1393,13 +1469,23 @@ fn kdc_limits_stop_at_the_documented_value() {
     );
 }
 
-/// ldap-front needs at least one listener; no address serves both 389 and
-/// 636. Spec: docs/50 §4.2, §4.3; Q-230 item 7.
+/// ldap-front needs its StartTLS listener — `ldap_listen` is required
+/// (task DN10d: the zone advertises `_ldap._tcp` on 389, so an LDAPS-only
+/// file is refused by the daemon's own schema, `MissingKey` at
+/// `ldap_listen`, with or without LDAPS listeners); no address serves both
+/// 389 and 636. Spec: docs/50 §4.2 (A-178), §4.3; [MS-ADTS] v20261026
+/// §6.3.2.3; Q-230 item 7; docs/questions/Q-1025 item 3.
 #[test]
 fn ldap_front_listeners() {
-    let none = remove(&remove(LDAP_FRONT, "ldap_listen"), "ldaps_listen");
+    let ldaps_only = remove(LDAP_FRONT, "ldap_listen");
+    let err = error(Daemon::LdapFront, &ldaps_only);
+    assert_eq!(err.kind(), ErrorKind::MissingKey);
+    assert_eq!(err.key(), Some("ldap_listen"));
+    assert_eq!(err.line(), None);
+    let none = remove(&ldaps_only, "ldaps_listen");
     let err = error(Daemon::LdapFront, &none);
-    assert_eq!(err.kind(), ErrorKind::NoListener);
+    assert_eq!(err.kind(), ErrorKind::MissingKey);
+    assert_eq!(err.key(), Some("ldap_listen"));
     let text = set(LDAP_FRONT, "ldaps_listen", "10.0.0.5:389");
     let err = error(Daemon::LdapFront, &text);
     assert_eq!(err.kind(), ErrorKind::DuplicateEntry);
@@ -1458,7 +1544,7 @@ fn ldap_front_listeners_must_be_internal() {
             "10.0.0.5/32, fd00:1234::5/128",
         ),
         "ldap_listen",
-        "10.0.0.5:3389",
+        "10.0.0.5:389",
     );
     let s = LdapFrontSettings::parse(text.as_bytes()).expect("every listener inside");
     assert_eq!(s.internal_networks().len(), 2);

@@ -97,8 +97,58 @@ fn decided_for(handle: &KeyHandle) -> DecidedOperation {
     }
 }
 
+/// The token an issuance by the Kdc role redeems — a live one, so that the
+/// purpose of the key set a resolution names is reached (task PN11b: the
+/// request names the AS client and the TGS service only through their
+/// resolutions, whose purpose keyd checks once it verified them, after the
+/// token step — docs/59 §7.2; docs/questions/Q-1067). Any other role is
+/// refused before the token is looked at, so a made-up one serves.
+fn live_proof(f: &mut Fixture, caller: &CallerId) -> AuthnProof {
+    let n = now();
+    if caller.role == Role::Kdc {
+        if let Ok(proof) = f.keyd.verify_preauth(
+            caller,
+            &ALICE,
+            &pa_enc_timestamp(&alice_key(), Some(1), n),
+            None,
+            &n,
+        ) {
+            return proof;
+        }
+    }
+    AuthnProof {
+        exchange_id: ExchangeId::from_bytes([3; 16]),
+        client: ALICE_ID,
+        authtime: n,
+    }
+}
+
+/// A TGS context of alice's TGT for the service at `nonce` (live for the Kdc
+/// role, made up otherwise — see [`live_proof`]).
+fn live_context(f: &mut Fixture, caller: &CallerId, nonce: u32) -> CtxId {
+    if caller.role != Role::Kdc {
+        return CtxId::from_bytes([4; 16]);
+    }
+    let tgt = obtain_tgt(f, now(), &as_template());
+    let (_, body) = tgs_req_body(nonce, service_name());
+    let auth = authenticator(&tgt.session, &AuthenticatorSpec::new(now(), nonce, &body));
+    f.keyd
+        .open_and_verify_tgt(
+            caller,
+            &KRBTGT,
+            &ap_req(&tgt.parts.ticket, auth),
+            &body,
+            None,
+            &now(),
+        )
+        .map(|ctx| ctx.ctx_id)
+        .unwrap_or(CtxId::from_bytes([4; 16]))
+}
+
 /// Invoke `op` with `caller` on `handle` (other arguments are plausible but
-/// irrelevant: authorization is the first step). Returns whether it
+/// irrelevant: authorization is the first step — for the AS client and the
+/// TGS service, the purpose check of the key set their resolution names
+/// follows the token, which is then a live one). Returns whether it
 /// succeeded.
 fn invoke(f: &mut Fixture, op: Operation, caller: &CallerId, handle: &KeyHandle) -> bool {
     let n = now();
@@ -114,29 +164,22 @@ fn invoke(f: &mut Fixture, op: Operation, caller: &CallerId, handle: &KeyHandle)
             )
             .is_ok(),
         Operation::IssueAsRep => {
-            let proof = AuthnProof {
-                exchange_id: ExchangeId::from_bytes([3; 16]),
-                client: handle.principal,
-                authtime: n,
-            };
+            let proof = live_proof(f, caller);
             f.keyd
-                .issue_as_rep(caller, handle, &KRBTGT, &proof, None, &as_template(), &n)
+                .issue_as(caller, handle, &KRBTGT, &proof, None, &as_template(), &n)
                 .is_ok()
         }
         Operation::OpenAndVerifyTgt => f
             .keyd
             .open_and_verify_tgt(caller, handle, &dummy_ap_req(), &[0x30, 0x00], None, &n)
             .is_ok(),
-        Operation::IssueTgsRep => f
-            .keyd
-            .issue_tgs_rep(
-                caller,
-                handle,
-                &CtxId::from_bytes([4; 16]),
-                &tgs_template(1),
-                &n,
-            )
-            .is_ok(),
+        Operation::IssueTgsRep => {
+            let nonce = u32::try_from(f.records().len()).unwrap();
+            let ctx = live_context(f, caller, nonce);
+            f.keyd
+                .issue_tgs(caller, handle, &ctx, &tgs_template(nonce), &n)
+                .is_ok()
+        }
         Operation::SetSecret => f
             .keyd
             .set_secret(
@@ -271,6 +314,15 @@ fn invoke(f: &mut Fixture, op: Operation, caller: &CallerId, handle: &KeyHandle)
             .keyd
             .revoke_decision(caller, next_decision_id(), &n)
             .is_ok(),
+        // Task PN9: the key only, no handle (`handle` unused); a made-up key.
+        Operation::InstallAttestationKey => f
+            .keyd
+            .install_attestation_key(
+                caller,
+                keyd::AttestationKey::from_bytes(&[0x6E; keyd::ATTESTATION_KEY_LEN]).unwrap(),
+                &n,
+            )
+            .is_ok(),
     }
 }
 
@@ -293,7 +345,8 @@ fn valid_handle(op: Operation) -> KeyHandle {
         | Operation::SealCeremony
         | Operation::ListDestroyDecisions
         | Operation::SealChangePasswordError
-        | Operation::RevokeDecision => ALICE,
+        | Operation::RevokeDecision
+        | Operation::InstallAttestationKey => ALICE,
         Operation::CreateKey => {
             KeyHandle::new(PrincipalId::from_bytes([0x99; 16]), KeyPurpose::Service)
         }
@@ -366,7 +419,8 @@ fn wrong_purpose_is_denied_for_every_operation() {
         // `verify_operation_ticket`.
         // Task K3: `open_change_password_request` names a principal (its
         // purpose is `AppBinding::ChangePassword`'s) and
-        // `seal_change_password_error` no handle.
+        // `seal_change_password_error` no handle. Task PN9: nor does
+        // `install_attestation_key` (it carries the key, no key set).
         if matches!(
             op,
             Operation::OpenAndVerifyServiceTicket
@@ -385,6 +439,7 @@ fn wrong_purpose_is_denied_for_every_operation() {
                 | Operation::ListDestroyDecisions
                 | Operation::VerifySecret
                 | Operation::RevokeDecision
+                | Operation::InstallAttestationKey
         ) {
             continue;
         }
@@ -431,7 +486,7 @@ fn issue_as_rep_krbtgt_slot_purpose() {
     for wrong in [SERVICE, BOB, ADMIN_SERVICE, CHANGE_PASSWORD_SERVICE] {
         assert!(f
             .keyd
-            .issue_as_rep(&KDC, &ALICE, &wrong, &proof, None, &as_template(), &now())
+            .issue_as(&KDC, &ALICE, &wrong, &proof, None, &as_template(), &now())
             .is_err());
         assert_eq!(
             f.records().last().unwrap().reason,
@@ -441,7 +496,7 @@ fn issue_as_rep_krbtgt_slot_purpose() {
     // The purpose refusal precedes the token: the proof is still usable.
     assert!(f
         .keyd
-        .issue_as_rep(&KDC, &ALICE, &KRBTGT, &proof, None, &as_template(), &now())
+        .issue_as(&KDC, &ALICE, &KRBTGT, &proof, None, &as_template(), &now())
         .is_ok());
 }
 
@@ -464,7 +519,8 @@ fn issue_as_rep_krbtgt_slot_purpose() {
 /// docs/questions/Q-503): `ListDestroyDecisions` Admin and Ldap; task K3
 /// (docs/53 R53-7, A-117): the three change-password operations, Ldap; task
 /// F3 (docs/questions/Q-937 item 6, Q-976): `RevokeDecision`, Ldap — the
-/// role that registers decisions.
+/// role that registers decisions; task PN9 (docs/59 §7.5; docs/questions/
+/// Q-1011 item 8, Q-1033 item 2): `InstallAttestationKey`, Admin.
 #[test]
 fn capability_table_matches_design() {
     use Operation::*;
@@ -495,6 +551,7 @@ fn capability_table_matches_design() {
                 SealCeremony,
                 ListDestroyDecisions,
                 Ping,
+                InstallAttestationKey,
             ],
         ),
         (

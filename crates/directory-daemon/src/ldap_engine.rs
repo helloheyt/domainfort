@@ -22,13 +22,15 @@
 //!   `try_send`); never an unbounded queue (R50-7).
 //! * Per request, the engine thread's host ([`LdapHost`]) reserves the audit
 //!   slot (crate::ldap_audit, A-57), takes **one fresh snapshot** of the
-//!   store as the PIP, the account source and the directory (docs/49 §4.4,
+//!   store as the PIP, the ticket-subject lookup and the directory (docs/49 §4.4,
 //!   R49-15: authorization derived again for every operation from a fresh
 //!   view; docs/47 §8.1: one view serves as both), reads `now` from dird's
 //!   clock, runs the engine, and commits the event — with the client address
 //!   the front reported, as an unverified observation — before the reply
 //!   leaves (Q-252 item 9). The bound-identity re-check uses this view's own
-//!   `AccountSource` — in process, since dird owns the store.
+//!   ticket-subject lookup (directory-pip `TicketSubjects`; task PN10b — no
+//!   name resolution, so the LDAP context carries no signer) — in process,
+//!   since dird owns the store.
 //! * **No zone table** (docs/52 R14): the request's zone arrives fixed in
 //!   its `TransportReport` — the zone of the front the connection came
 //!   from, derived from the peer uid by the listener. Nothing here can turn
@@ -179,7 +181,7 @@ impl RequestHost for LdapHost<'_> {
         let outcome = run(RequestInputs {
             snapshot: self.policy,
             pip: &view,
-            accounts: &view,
+            subjects: &view,
             rate: &mut *self.rate,
             now,
             transport,

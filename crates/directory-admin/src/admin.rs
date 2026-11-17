@@ -70,15 +70,17 @@ use directory_pip::{
     account_salt, AccountKind, DirectoryView, GateFault, UnseenCause, Visibility, MAX_DN_DEPTH,
 };
 
+use crate::apply::invariant_stop;
 use crate::audit::{pdp_reason, sid_value, EventBase, Refusal, Stop};
 use crate::checks::{
-    domain_sid, local_ipc_security, malformed, store_failure, Cx, LockoutChange, Resolved,
+    domain_sid, local_ipc_security, malformed, store_failure, Cx, LockoutChange, NameLookup,
+    Resolved,
 };
 use crate::config::{AdminConfig, ConfigError, CHANGE_SEQ_COUNTER, RID_COUNTER};
 use crate::descriptor::new_object_sd;
 use crate::effects::BuiltPlan;
 use crate::ids::{ClassIds, Ids};
-use crate::invariants::{End, Invariants, LinkProof};
+use crate::invariants::{End, HostZone, Invariants, LinkProof};
 use crate::names;
 use crate::operation::{
     CompletePasswordSet, CreateComputer, CreateContainerLike, CreateGroup, CreateUser, LookupKey,
@@ -385,7 +387,20 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         schema: &Phase1Schema,
         rng: R,
     ) -> Result<DirectoryAdmin<R>, ConfigError> {
-        let invariants = Invariants::new(schema, config.protected().service_objects.clone())?;
+        // Host records (task DN6): only when DNS self-updates are enabled,
+        // in the naming context's zone (A-53; docs/54 §5.3, §5.5).
+        let hosts = config.dns_registration().map(|dns| HostZone {
+            zone: config.naming_context().dns_name(),
+            networks: dns.networks().to_vec(),
+        });
+        // The principal namespace (task PN5; docs/59 §5.1): the realm
+        // context `AdminConfig` derived from the same naming context.
+        let invariants = Invariants::new(
+            schema,
+            config.protected().service_objects.clone(),
+            hosts,
+            Some(config.name_context().clone()),
+        )?;
         Ok(DirectoryAdmin {
             config,
             ids: Ids::resolve(schema)?,
@@ -617,7 +632,7 @@ pub(crate) fn subject_of_facts(
     cname: &PrincipalName,
     authtime: &KerberosTime,
 ) -> Result<AdminSubject, SubjectError> {
-    AdminSubject::from_verified_ticket(cx.pep.accounts(), crealm, cname, authtime, &cx.now)
+    AdminSubject::from_verified_ticket(cx.pep.subjects(), crealm, cname, authtime, &cx.now)
 }
 
 /// The per-request part every operation handler reads.
@@ -636,16 +651,18 @@ enum NewObject<'r> {
     Container(&'r CreateContainerLike),
 }
 
-/// The values a create determines from the request alone.
+/// The values a create determines from the request alone (and, for a
+/// computer's dNSHostName, the checker's realm context — task PN6b).
 struct NewValues {
     class: ClassIds,
     /// The RDN value (cn / ou), for the name check under the parent.
     rdn: String,
     attributes: Vec<(AttrId, Vec<Vec<u8>>)>,
-    /// (attribute, value) pairs the unique index must not already hold.
-    uniques: Vec<(AttrId, String)>,
     /// A security principal: gets a RID and an objectSid.
     principal: bool,
+    /// A computer's derived dNSHostName (the value in `attributes`), for
+    /// the decision event: the request names no host (task PN6b).
+    derived_host_name: Option<String>,
 }
 
 impl<R: RandomSource> DirectoryAdmin<R> {
@@ -780,13 +797,11 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                         vec![record::encode_int64(ACCOUNT_EXPIRES_NEVER)],
                     ),
                 ];
-                let mut uniques = vec![(ids.sam_account_name, c.sam.clone())];
                 if let Some(upn) = &c.upn {
                     if !names::upn_ok(upn) {
                         return Err(invalid_value);
                     }
                     attributes.push((ids.user_principal_name, text(upn)));
-                    uniques.push((ids.user_principal_name, upn.clone()));
                 }
                 if let Some(description) = &c.description {
                     if !names::description_ok(description) {
@@ -798,8 +813,8 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                     class: ids.user.clone(),
                     rdn: c.sam.clone(),
                     attributes,
-                    uniques,
                     principal: true,
+                    derived_host_name: None,
                 }
             }
             // CreateComputer: sAMAccountName = name ‖ "$", UAC = WT|D (ST is
@@ -810,10 +825,19 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                 if !names::computer_name_ok(&c.name) {
                     return Err(invalid_name);
                 }
-                if !names::dns_host_name_ok(&c.dns_host_name) {
-                    return Err(invalid_value);
-                }
                 let sam = names::computer_sam(&c.name);
+                // dNSHostName = `<name>.<realm DNS name>`, derived — never
+                // taken from the request (task PN6b; Q-1036 item 1, A-182:
+                // the root form of rule N6, [MS-ADTS] 3.1.1.5.3.1.1.2) —
+                // by the checker from the realm context it judges the
+                // create in, so `keys_of_new` below and the commit's
+                // `check_create` accept exactly this value. A computerName
+                // with no host name (not one RFC 1035 label) ⇒
+                // `AccountNameInvalid` (Q-1035 item 5).
+                let dns_host_name = self
+                    .invariants
+                    .own_host_name(&sam)
+                    .map_err(invariant_stop)?;
                 let mut attributes = vec![
                     (ids.cn, text(&c.name)),
                     (ids.sam_account_name, text(&sam)),
@@ -827,22 +851,21 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                         ids.account_expires,
                         vec![record::encode_int64(ACCOUNT_EXPIRES_NEVER)],
                     ),
-                    (ids.dns_host_name, text(&c.dns_host_name)),
+                    (ids.dns_host_name, text(&dns_host_name)),
                 ];
-                let mut uniques = vec![(ids.sam_account_name, sam)];
+                // The SPN's host is the derived dNSHostName (Q-355 item 3).
                 if let Some(spn) = &c.spn {
-                    if !names::spn_ok(spn, &c.dns_host_name) {
+                    if !names::spn_ok(spn, &dns_host_name) {
                         return Err(invalid_value);
                     }
                     attributes.push((ids.service_principal_name, text(spn)));
-                    uniques.push((ids.service_principal_name, spn.clone()));
                 }
                 NewValues {
                     class: ids.computer.clone(),
                     rdn: c.name.clone(),
                     attributes,
-                    uniques,
                     principal: true,
+                    derived_host_name: Some(dns_host_name),
                 }
             }
             // CreateGroup: groupType one of the six phase-1 values, default
@@ -869,8 +892,8 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                         (ids.sam_account_name, text(&c.sam)),
                         (ids.group_type, vec![record::encode_flags(group_type)]),
                     ],
-                    uniques: vec![(ids.sam_account_name, c.sam.clone())],
                     principal: true,
+                    derived_host_name: None,
                 }
             }
             NewObject::Ou(c) => {
@@ -881,8 +904,8 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                     class: ids.organizational_unit.clone(),
                     rdn: c.name.clone(),
                     attributes: vec![(ids.ou, text(&c.name))],
-                    uniques: Vec::new(),
                     principal: false,
+                    derived_host_name: None,
                 }
             }
             NewObject::Container(c) => {
@@ -893,8 +916,8 @@ impl<R: RandomSource> DirectoryAdmin<R> {
                     class: ids.container.clone(),
                     rdn: c.name.clone(),
                     attributes: vec![(ids.cn, text(&c.name))],
-                    uniques: Vec::new(),
                     principal: false,
+                    derived_host_name: None,
                 }
             }
         })
@@ -912,12 +935,33 @@ impl<R: RandomSource> DirectoryAdmin<R> {
     ) -> Result<Handled, Stop> {
         let cx = ctx.cx;
         let values = self.new_values(new)?;
+        // The decision event names the dNSHostName the create will write —
+        // the derived value, which the request no longer carries (task PN6b;
+        // docs/questions/Q-1044 item 5).
+        if let Some(host) = &values.derived_host_name {
+            base.derived_host_name(host);
+        }
         let parent_guid = match new {
             NewObject::User(c) => c.parent,
             NewObject::Computer(c) => c.parent,
             NewObject::Group(c) => c.parent,
             NewObject::Ou(c) | NewObject::Container(c) => c.parent,
         };
+        // The write checker's per-object rules on the new object — the same
+        // `check_create` will apply — and, for a security principal, the keys
+        // it will hold in the one principal namespace (task PN5; docs/59
+        // §5.1): its names in every form, reserved names judged on the folded
+        // key (A-163; Q-1009 items 1-2). Like the value rules above, they
+        // read nothing from the directory, so they reveal nothing about it.
+        let keys = self
+            .invariants
+            .keys_of_new(
+                values.class.id,
+                &values.class.chain,
+                parent_guid,
+                &values.attributes,
+            )
+            .map_err(invariant_stop)?;
         let (parent, _) = self.named(ctx, base, parent_guid)?;
         let action = Action::DirAddChild(ObjClass(values.class.guid));
         let resource = Resource::DirObject {
@@ -937,10 +981,11 @@ impl<R: RandomSource> DirectoryAdmin<R> {
         // A live child of the parent with the same RDN (docs/46 §8.3 item
         // 3; dirstore `NameExists`).
         cx.name_free(parent.guid, &values.rdn)?;
-        // A value the unique index already holds ([MS-SAMR] 3.1.1.8.4 item
-        // 2; docs/46 §8.5).
-        for (attr, value) in &values.uniques {
-            cx.unique_free(*attr, value)?;
+        // A name another object holds in any of its forms — over the union
+        // of every principal name, not per attribute ([MS-SAMR] 3.1.1.8.4
+        // item 2; RFC 4120 §6.2; docs/59 §4.4 N1, task PN5).
+        if let Some(keys) = &keys {
+            cx.names_free(keys)?;
         }
         // The new object's descriptor must have a DACL ([MS-ADTS] 6.1.3
         // item 7; A-84).
@@ -1403,20 +1448,22 @@ impl<R: RandomSource> DirectoryAdmin<R> {
     }
 
     /// The object a `Lookup` key names, if any: a sAMAccountName or SPN
-    /// through the unique index and then compared octet for octet (A-27, as
-    /// the account source does — `Cx::locate_exact`), a DN through the PEP
-    /// view's `lookup_dn`. A key that cannot name anything (not printable
-    /// ASCII, too long) names nothing. Only a GUID: the object reaches the
-    /// reply only through the gate (docs/52 R-a).
-    /// Spec: docs/47 §1.3 steps 3-4 (R47-1); docs/49 §7 (R49-11, DN
-    /// resolution); docs/46 §5.4 (bounds).
+    /// through **one** probe of the principal namespace and then compared
+    /// with the stored value of that kind octet for octet (A-27, as the
+    /// account source does — `Cx::locate_name`, task PN5), a DN through the
+    /// PEP view's `lookup_dn`. A key that cannot name anything (not
+    /// printable ASCII, too long, a form no key has) names nothing. Only a
+    /// GUID: the object reaches the reply only through the gate (docs/52
+    /// R-a).
+    /// Spec: docs/59 §6.4; docs/47 §1.3 steps 3-4 (R47-1); docs/49 §7
+    /// (R49-11, DN resolution); docs/46 §5.4 (bounds).
     fn find(&self, cx: &Cx<'_, '_, '_>, key: &LookupKey) -> Result<Option<Guid>, Stop> {
         match key {
             LookupKey::SamAccountName(sam) => {
-                cx.locate_exact(self.ids.sam_account_name, sam, names::MAX_GROUP_SAM_CHARS)
+                cx.locate_name(NameLookup::SamAccountName, sam, names::MAX_GROUP_SAM_CHARS)
             }
-            LookupKey::ServicePrincipalName(spn) => cx.locate_exact(
-                self.ids.service_principal_name,
+            LookupKey::ServicePrincipalName(spn) => cx.locate_name(
+                NameLookup::ServicePrincipalName,
                 spn,
                 names::MAX_PRINCIPAL_NAME_CHARS,
             ),

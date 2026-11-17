@@ -21,12 +21,33 @@ pub const KEYD_MAGIC: u16 = 0x4B44;
 /// §12; D57.
 pub const KEYD_VERSION: u8 = 1;
 
-/// Request body bound: 80 KiB. Every byte or DER field of a keyd request is
-/// part of one KDC request (at most `kdc::MAX_REQUEST_LEN` = 64 KiB) or a
-/// small structure the KDC builds (a KRB-ERROR, PA-DATA).
+/// Request body bound: 80 KiB for the KDC-request part of a request, plus
+/// room for the two attested name resolutions an `issue_as_rep` can carry
+/// (task PN11) — 149 KiB in all (derived below: [`MAX_KDC_PART_BODY`] +
+/// 2 × [`LARGEST_RESOLUTION`] + one octet, rounded up to whole KiB; checked
+/// at compile time). Every byte or DER field of a keyd request is part of
+/// one KDC request (at most `kdc::MAX_REQUEST_LEN` = 64 KiB) or a small
+/// structure the KDC builds (a KRB-ERROR, PA-DATA) — except a resolution's
+/// canonical names, which come from dird's store, not from the request, so
+/// the 80 KiB of docs/50 §3.3 no longer bound them.
+///
+/// Task PN11b re-derived it from task PN11b's layout (docs/questions/
+/// Q-1081): the largest request is still an armored change-password
+/// `issue_as_rep` — its KDC part, the client's resolution, the server's
+/// variant octet and the service's resolution (the octet replaces PN11's
+/// option marker; the two handles and the template's client principal that
+/// left the request only shrink the KDC part) — so the bound is unchanged;
+/// a TGT's request (one resolution, the octet, a 17-octet handle) and
+/// `issue_tgs_rep` (one resolution, no handle) are smaller.
 /// Spec: docs/50 §3.3 ("keyd request ≤ 80 KiB"; "⚠ to be estimated" — see
-/// docs/questions/Q-245 item 6 for the armored TGS case).
-pub const MAX_REQUEST_BODY: u32 = 80 * 1024;
+/// docs/questions/Q-245 item 6 for the armored TGS case); docs/59 §7.5
+/// ("size bounds"); docs/questions/Q-1062 (the bound as built), Q-1081.
+pub const MAX_REQUEST_BODY: u32 = 149 * 1024;
+
+/// The KDC-request part of a request body: docs/50 §3.3's 80 KiB (every
+/// field a substring of one KDC request or a small structure the KDC
+/// builds). Spec: docs/50 §3.3.
+pub const MAX_KDC_PART_BODY: u32 = 80 * 1024;
 
 /// Reply body bound: 320 KiB (krb-proto bounds every encoding at 256 KiB).
 /// Spec: docs/50 §3.3 ("reply ≤ 320 KiB").
@@ -107,6 +128,34 @@ pub const MAX_DECISION_APPROVERS: u32 = 3;
 /// Spec: docs/52 §4.6 (A-102); docs/50 §3.3 (bounded replies).
 pub const MAX_DESTROY_PAGE: u32 = 64;
 
+/// The exact length of the attestation key on the wire (`install_attestation_key`,
+/// task PN9): 32 octets — crate name-attestation's `ATTESTATION_KEY_LEN`
+/// (the SHA-256 output size L, FIPS 180-4 §1, as name-attestation records).
+/// This crate links no crypto code (D182; A-63, A-173), so the value is
+/// restated here and pinned against name-attestation's at compile time in
+/// crate ipc-keyd-server, which links both (a different value does not
+/// build there). Every other length is refused: fewer octets `Truncated`,
+/// more `LengthOverBound` — both `Malformed`.
+/// Spec: docs/59 §7.4; docs/questions/Q-1011 item 2 (A-173), Q-1033
+/// (A-177); docs/50 §3.3 (bounded fields).
+pub const ATTESTATION_KEY_OCTETS: usize = 32;
+
+/// [`ATTESTATION_KEY_OCTETS`] as the `u32` field bound of the ipc layer.
+/// Spec: docs/50 §3.3 (`bytes<max>` = `u32` length ≤ max + octets).
+pub const ATTESTATION_KEY_FIELD: u32 = ATTESTATION_KEY_OCTETS as u32;
+
+/// The bounds of an attested name resolution on this channel (task PN11):
+/// a realm (`MAX_RESOLUTION_REALM`), a `PrincipalName` DER
+/// (`MAX_RESOLUTION_NAME`) and the whole resolution's body
+/// (`LARGEST_RESOLUTION`) — defined once in crate keyd-types beside the
+/// bounds of `NameResolution` they are derived from, and used by this
+/// channel and the dird-kdc channel (crate ipc-directory, task PN10) alike:
+/// one resolution, one bound on both of its channels (A-190 on
+/// docs/questions/Q-1062 item 1).
+/// Spec: docs/59 §7.1, §7.5 ("size bounds"); crates/keyd-types
+/// `name_resolution.rs`; docs/CLEAN-ROOM.md.
+pub use keyd_types::{LARGEST_RESOLUTION, MAX_RESOLUTION_NAME, MAX_RESOLUTION_REALM};
+
 // The bounds agree with the values they are derived from; checked at compile
 // time, never at run time. Task K3 (docs/questions/Q-620 item 4): the bound
 // of a password on this channel is the bound of RFC 3244's `newpasswd`, so a
@@ -120,6 +169,21 @@ const _: () = assert!(MAX_DECISION_APPROVERS as usize == keyd_types::MAX_DECISIO
 const _: () = assert!(MAX_DESTROY_PAGE as usize == keyd_types::MAX_DESTROY_DECISION_PAGE);
 const _: () = assert!(MAX_REQUEST_FIELD < MAX_REQUEST_BODY);
 const _: () = assert!(MAX_REPLY_FIELD < MAX_REPLY_BODY);
+const _: () = assert!(ATTESTATION_KEY_FIELD as usize == ATTESTATION_KEY_OCTETS);
+const _: () = assert!(ATTESTATION_KEY_FIELD < MAX_REQUEST_FIELD);
+// Task PN11: a resolution's realm bound is keyd-types' (the derivation and
+// its own compile-time checks are keyd-types', A-190); the request body
+// holds the KDC-request part and two resolutions (the AS client's and the
+// change-password service's) with one octet — since task PN11b the server's
+// variant code (Q-1081).
+const _: () = assert!(MAX_RESOLUTION_REALM as usize == keyd_types::sealed_store::MAX_NAME_OCTETS);
+const _: () = assert!(MAX_RESOLUTION_NAME < MAX_REQUEST_FIELD);
+// (`<` here: the KDC part, two resolutions and the server's one variant octet.)
+const _: () =
+    assert!(MAX_KDC_PART_BODY as usize + 2 * LARGEST_RESOLUTION < MAX_REQUEST_BODY as usize);
+const _: () = assert!(
+    (MAX_REQUEST_BODY as usize) < MAX_KDC_PART_BODY as usize + 2 * LARGEST_RESOLUTION + 1 + 1024
+);
 
 // ---- kinds -----------------------------------------------------------------
 
@@ -195,6 +259,11 @@ pub mod request_kind {
     /// registered. Appended by task F3.
     /// Spec: docs/52 §4.2, §4.6; docs/questions/Q-937 item 6, Q-976.
     pub const REVOKE_DECISION: u8 = 0x19;
+    /// `install_attestation_key(key)` (Admin, provisioning only): hand keyd
+    /// the attestation key of dird's name resolutions — a state call.
+    /// Appended by task PN9.
+    /// Spec: docs/59 §7.4, §7.5; docs/questions/Q-1011 items 2, 8, Q-1033.
+    pub const INSTALL_ATTESTATION_KEY: u8 = 0x1A;
 
     /// The closed request table. Spec: docs/50 §3.3, §3.4.
     pub const ALL: &[u8] = &[
@@ -223,6 +292,7 @@ pub mod request_kind {
         COMPLETE_CHANGE_PASSWORD,
         SEAL_CHANGE_PASSWORD_ERROR,
         REVOKE_DECISION,
+        INSTALL_ATTESTATION_KEY,
     ];
 }
 
@@ -294,6 +364,9 @@ pub mod reply_kind {
     /// `()`: the decision is revoked (task F3). Spec: docs/52 §4.2;
     /// docs/questions/Q-976.
     pub const REVOKE_DECISION: u8 = ok(rq::REVOKE_DECISION);
+    /// `()`: the attestation key is installed (task PN9). Spec: docs/59
+    /// §7.4, §7.5.
+    pub const INSTALL_ATTESTATION_KEY: u8 = ok(rq::INSTALL_ATTESTATION_KEY);
     /// A refusal of an authentication step: `keyd_types::AuthnError`.
     /// Spec: docs/10 §9; A-26; A-56.
     pub const AUTHN_FAILURE: u8 = 0xF1;
@@ -332,6 +405,7 @@ pub mod reply_kind {
         COMPLETE_CHANGE_PASSWORD,
         SEAL_CHANGE_PASSWORD_ERROR,
         REVOKE_DECISION,
+        INSTALL_ATTESTATION_KEY,
         AUTHN_FAILURE,
         ISSUE_FAILURE,
         FAILURE,

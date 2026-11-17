@@ -461,3 +461,45 @@ fn a_seventeenth_nesting_level_is_refused() {
         }
     }
 }
+
+// --- The DC's host record (task DN10b) ----------------------------------------
+
+/// docs/54 §3.1, §5.2-§5.5; docs/questions/Q-1003 item 2, Q-1014: the DC's
+/// host record passes the one checker's host-record rule under the DC
+/// account's claim, in the zone the session was given (the positive control
+/// above installs it) — and the same rule refuses, at the store write, what
+/// the plan's own checks would refuse earlier: an address outside dird's
+/// registrable networks, one that is loopback although inside the internal
+/// network 127.0.0.0/8, more than eight, a value that is not four octets
+/// (`Value`); a host record on a service object (`Exception`: only an online
+/// computer or the DC account may hold one) or on a user (`NotModifiable`).
+/// Addresses are hand-made test data.
+#[test]
+fn the_dc_host_record_passes_the_checker_and_the_rule_still_refuses() {
+    fn dc_host(values: Vec<Vec<u8>>) -> impl FnOnce(&mut Plan) {
+        move |plan: &mut Plan| {
+            let dc = object(plan, ObjectRole::DcComputer);
+            dc.attributes
+                .retain(|(id, _)| *id != directory_pip::HOST_ADDRESS);
+            dc.attributes.push((directory_pip::HOST_ADDRESS, values));
+        }
+    }
+    violates(V::Value, dc_host(vec![vec![192, 0, 2, 10]]));
+    violates(V::Value, dc_host(vec![vec![127, 0, 0, 1]]));
+    violates(
+        V::Value,
+        dc_host((1..=9).map(|k| vec![10, 0, 0, k]).collect()),
+    );
+    violates(V::Value, dc_host(vec![vec![10, 0, 0]]));
+    violates(V::Exception, |plan| {
+        let svc = object(plan, ObjectRole::LdapService);
+        svc.attributes
+            .push((directory_pip::HOST_ADDRESS, vec![vec![10, 0, 0, 11]]));
+    });
+    violates(V::NotModifiable, |plan| {
+        let admin = object(plan, ObjectRole::FirstAdmin(0));
+        admin
+            .attributes
+            .push((directory_pip::HOST_ADDRESS, vec![vec![10, 0, 0, 12]]));
+    });
+}

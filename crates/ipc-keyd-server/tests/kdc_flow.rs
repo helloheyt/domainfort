@@ -56,10 +56,13 @@ fn accounts() -> InMemoryAccounts {
         .insert_client(&realm(), &alice_name(), alice_account())
         .unwrap();
     let mut bob = alice_account();
-    bob.key = BOB;
     bob.sid = bob_sid();
     bob.groups = Default::default();
     bob.etype_info = etype_info(BOB_SALT);
+    // Task PN10: bob's record carries the resolution of bob's name — and,
+    // since task PN10c, through it bob's key set (the record's one
+    // statement of its handle).
+    bob.resolution = test_resolution(&bob_name(), BOB);
     accounts.insert_client(&realm(), &bob_name(), bob).unwrap();
     accounts
         .insert_client(&realm(), &machine_name(), machine_account())
@@ -69,9 +72,9 @@ fn accounts() -> InMemoryAccounts {
             &realm(),
             &service_name(),
             kdc::ServiceAccount {
-                key: SERVICE,
                 state: kdc::AccountState::ACTIVE,
                 enctypes: vec![AES256, AES128],
+                resolution: test_resolution(&service_name(), SERVICE),
             },
         )
         .unwrap();
@@ -123,6 +126,15 @@ impl IpcWorld {
                 .unwrap()
                 .unwrap();
         }
+        // The ceremony hands keyd dird's attestation key (task PN11: keyd
+        // verifies the resolutions the kdc forwards with it), over the
+        // channel as keyadm does.
+        admin
+            .install_attestation_key(
+                ipc_keyd::AttestationKeyOctets::from_slice(&TEST_ATTESTATION_KEY).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
         let mut directory = KeydClient::new(
             Loopback::new(&server, DIRECTORY),
             ipc_keyd::ExpectedPeer::new(KEYD_UID, DIRECTORY.role).unwrap(),
@@ -229,6 +241,12 @@ impl IpcWorld {
             snapshot: &self.snapshot,
             pip: &self.pip,
         };
+        // dird states each resolution at lookup time (the kdc fixtures'
+        // `Resigning`, task PN11).
+        let accounts = Resigning {
+            inner: &self.accounts,
+            at: when,
+        };
         self.kdc.handle(
             request,
             Peer {
@@ -237,7 +255,7 @@ impl IpcWorld {
             },
             when,
             &inputs,
-            &self.accounts,
+            &accounts,
         )
     }
 

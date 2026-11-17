@@ -257,3 +257,25 @@ fn dird_must_be_verified() {
         Some(DaemonError::DirdConfig(_))
     ));
 }
+
+/// docs/53 R53-3 (TCP only — A-117: no UDP code path); docs/50 §6.2: the
+/// binding makes one TCP listener per address and nothing else. The file
+/// names port 464 only (crates/config `NonStandardPort`, task DN10c —
+/// docs/questions/Q-1024), so the binding is exercised here, in-crate, on a
+/// loopback port the system picks, through the crate-private
+/// `bind_addresses` (moved from tests/settings.rs).
+#[test]
+fn only_tcp_listeners_are_bound() {
+    // A port the system picks, then freed.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let address = core::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let listeners = crate::startup::bind_addresses(&[address]).unwrap();
+    assert_eq!(listeners.tcp.len(), 1);
+    assert_eq!(listeners.tcp[0].local_addr().unwrap(), address);
+    // The UDP port of the same number is still free: no UDP socket exists.
+    assert!(std::net::UdpSocket::bind(address).is_ok());
+}

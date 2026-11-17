@@ -47,18 +47,28 @@
 //!    KDC_ERR_SVC_UNAVAILABLE); gone, disabled, locked or
 //!    expired → KDC_ERR_CLIENT_REVOKED; TGT authtime before the account's
 //!    revocation instant → KDC_ERR_TGT_REVOKED (3.3.3.1 hot-list);
-//! 8. the service account: unknown → KDC_ERR_S_PRINCIPAL_UNKNOWN; disabled,
-//!    locked or expired → KDC_ERR_SERVICE_REVOKED (decision 8);
+//! 8. the service account: unknown → KDC_ERR_S_PRINCIPAL_UNKNOWN; a record
+//!    whose resolution names a key set that is no service's → KRB_ERR_GENERIC
+//!    (inconsistent, fail closed); the change-password
+//!    service — by the purpose of the key set dird resolved the name to,
+//!    not by the request's spelling (task PN11; Q-1009 item 4) →
+//!    KDC_ERR_POLICY; disabled, locked or expired → KDC_ERR_SERVICE_REVOKED
+//!    (decision 8);
 //! 9. no acceptable AES enctype for the session key → KDC_ERR_ETYPE_NOSUPP
 //!    (3.1.3 via 3.3.2; decision 6);
-//! 10. the PDP (`KdcTgs`, resource = the service, `armored = true`) denies →
+//! 10. the PDP (`KdcTgs`, resource = the service as dird resolved it — its
+//!     canonical name, Q-1009 item 5 — `armored = true`) denies →
 //!     KDC_ERR_POLICY (docs/30 §3.3; docs/48 §4.2; decision 7);
 //! 11. times planned within policy and within the TGT (3.3.3; decision 10)
 //!     → KDC_ERR_NEVER_VALID if too short;
-//! 12. keyd `issue_tgs_rep` on the armored context seals the service ticket,
-//!     the reply under the strengthened reply key, and the KrbFastResponse
-//!     (RFC 6113 5.4.3); a refusal leaves the context live for the armored
-//!     error (docs/questions/Q-150 item 3);
+//! 12. keyd `issue_tgs_rep` on the armored context — with dird's resolution
+//!     of the service's name as the record carried it, and no handle beside
+//!     it (task PN11: keyd reaches the service key only through it, docs/59
+//!     §7.2; task PN11b: keyd looks the key set up by it,
+//!     docs/questions/Q-1067) — seals the
+//!     service ticket, the reply under the strengthened reply key, and the
+//!     KrbFastResponse (RFC 6113 5.4.3); a refusal leaves the context live
+//!     for the armored error (docs/questions/Q-150 item 3);
 //! 13. the TGS-REP: padata = [PA-FX-FAST(enc-fast-rep)] (5.4.3); crealm /
 //!     cname of the TGT (3.3.3: "the client's name and realm ... of the
 //!     newly-issued ticket" come from the TGT).
@@ -74,7 +84,8 @@
 //! RFC 6113 5.4.1.1, 5.4.2, 5.4.3, 5.4.4, 7.3; docs/30 §3; docs/10 §5, §5a;
 //! docs/48 §5, §6, §7.2; docs/25 §4 (D53); docs/50 §3.7 (R50-8); docs/53
 //! §5.2 (task K5); docs/questions/Q-124, Q-125 (A-32), Q-150 (A-43), Q-217
-//! (A-56); main-session decisions 3-10, 13; A-25, A-26, A-117.
+//! (A-56); main-session decisions 3-10, 13; A-25, A-26, A-117; docs/59 §7.2,
+//! §7.5; docs/questions/Q-1009 items 4-5, Q-1011 items 7-8 (A-173).
 
 use crate::accounts::AccountSource;
 use crate::as_exchange::has_unsupported_content;
@@ -87,12 +98,14 @@ use crate::kdc::{
     Refusal, Scope,
 };
 use crate::lifetime::{check_starttime, plan, LifetimeRequest, Limits};
-use crate::names::{classify_server, same_realm, service_spn, ServerNameKind};
+use crate::names::{
+    classify_server, resolved_server_kind, same_realm, service_spn, ServerNameKind,
+};
 use crate::options::{asks_unsupported_operation, delegation_flags, FlagRequests};
 use crate::time::seconds;
 use crate::transport::Peer;
 use core::time::Duration;
-use keyd_types::{AuthnError, KeyCustody, KeyPurpose, TgsFastRequest, TgsTicketTemplate};
+use keyd_types::{AuthnError, KeyCustody, TgsFastRequest, TgsTicketTemplate};
 use krb_proto::constants::{
     KDC_ERR_BADOPTION, KDC_ERR_CLIENT_REVOKED, KDC_ERR_ETYPE_NOSUPP, KDC_ERR_PADATA_TYPE_NOSUPP,
     KDC_ERR_POLICY, KDC_ERR_PREAUTH_FAILED, KDC_ERR_SERVICE_REVOKED, KDC_ERR_S_PRINCIPAL_UNKNOWN,
@@ -336,12 +349,27 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
             }
             Ok(Some(service)) => service,
         };
-        // A service ticket is sealed under the key set of its service's
-        // purpose: Service, or AdminService for the admin service's name —
-        // and only for that name (R2, docs/52 §5 item 3; keyd's binding
-        // check refuses any other pairing too, A-19).
-        if service.key.purpose != KeyPurpose::of_service_name(sname) {
-            return Err(internal(AuditReason::AccountRecordInvalid));
+        // Which kind of server the name is comes from the key set dird
+        // resolved it to — its purpose, derived from the stored name and
+        // the provisioning claim (docs/59 §4.7), the record's one statement
+        // of its key set (task PN10c) — never from the request's spelling
+        // (task PN11; Q-1009 item 4): Service or AdminService is a service;
+        // the change-password service's key set is refused here too (its
+        // tickets come only from an armored AS, docs/53 §5.2 — the step-6
+        // check sees only the exact spelling); anything else is no service
+        // (an inconsistent record).
+        let resolution = service.resolution.resolution();
+        match resolved_server_kind(resolution.key_purpose()) {
+            Some(ServerNameKind::Service) => {}
+            Some(ServerNameKind::ChangePassword) => {
+                return Err(Refusal::new(
+                    KDC_ERR_POLICY,
+                    AuditReason::TgsForChangePassword,
+                ))
+            }
+            Some(ServerNameKind::LocalTgs | ServerNameKind::ForeignTgs) | None => {
+                return Err(internal(AuditReason::AccountRecordInvalid))
+            }
         }
         if !service.state.usable_at(now) {
             return Err(Refusal::new(
@@ -360,8 +388,11 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
         };
 
         // 10. The PDP (docs/30 §3.3; decision 7): armored — keyd verified
-        // the implicit armor (docs/48 §4.2).
-        let spn = service_spn(sname)
+        // the implicit armor (docs/48 §4.2). The resource is the service as
+        // dird resolved it — its canonical (stored) name — so a rule written
+        // for a service matches every spelling that resolves to it, and no
+        // spelling reaches another resource (task PN11; Q-1009 item 5).
+        let spn = service_spn(service.resolution.resolution().canonical_name())
             .ok_or_else(|| Refusal::new(KDC_ERR_POLICY, AuditReason::AmbiguousServiceName))?;
         let age = u64::try_from(seconds(now) - seconds(&tgt.authtime)).unwrap_or(0);
         enforce(
@@ -445,9 +476,14 @@ impl<K: KeyCustody, U: AuditSink, R: RateLimiter> Kdc<K, U, R> {
             session_enctype,
             nonce: body.nonce,
         };
+        // dird's resolution goes with the call as the record carried it —
+        // the call's only name of the service's key set: keyd looks the set
+        // up by it and binds the service key only through it (docs/59 §7.2;
+        // task PN11b, docs/questions/Q-1067). The client needs none — it is
+        // the TGT's (Q-1011 item 7).
         let parts = self
             .custody
-            .issue_tgs_rep(&service.key, &tgt.ctx_id, &template, now)
+            .issue_tgs_rep(&service.resolution, &tgt.ctx_id, &template, now)
             .map_err(issue_refusal)?;
 
         // 13. The TGS-REP (5.4.2): PA-FX-FAST only (RFC 6113 5.4.3).

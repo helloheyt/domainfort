@@ -160,8 +160,9 @@ fn strict_decoding() {
     b[0] = EVENT_FORMAT + 1;
     assert_eq!(decode_event(&b), Err(EventError::UnsupportedFormat));
     // Shapes 5 (DirAdmin) and 6 (Admind) were appended for the admin plane
-    // (docs/51 §5.7); 7 is the first code outside the closed table.
-    for shape in [0u8, 7, 0xFF] {
+    // (docs/51 §5.7), 7 (ZoneSerial) by task DN10b; 8 is the first code
+    // outside the closed table.
+    for shape in [0u8, 8, 0xFF] {
         let mut b = good.clone();
         b[1] = shape;
         assert_eq!(
@@ -271,8 +272,12 @@ fn code_tables_are_closed() {
     // R6b the discard of a deleted principal's set-secret entries
     // (docs/questions/Q-520); task K3 the fourteen change-password reasons
     // (docs/53 §9, codes 80-93); task F3 the two revocation reasons
-    // (docs/questions/Q-976, codes 94-95), `Unlisted` last (96).
-    assert_eq!(table!(KeydReason), 96);
+    // (docs/questions/Q-976, codes 94-95); task PN9 the attestation-key
+    // install's own reason (docs/59 §7.5, docs/questions/Q-1033 item 4, code
+    // 96); task PN11 the four name-resolution reasons (codes 97-100) and the
+    // seal's refusal without the attestation key (Q-1056 item 4, code 101),
+    // `Unlisted` last (102).
+    assert_eq!(table!(KeydReason), 102);
     assert_eq!(KeydReason::NoGrant.code(), 66);
     assert_eq!(KeydReason::GrantTableFull.code(), 69);
     assert_eq!(KeydReason::NoDecision.code(), 70);
@@ -285,7 +290,13 @@ fn code_tables_are_closed() {
     assert_eq!(KeydReason::KpasswdInitialFlagNeeded.code(), 93);
     assert_eq!(KeydReason::DecisionRevoked.code(), 94);
     assert_eq!(KeydReason::DecisionExecuted.code(), 95);
-    assert_eq!(KeydReason::Unlisted.code(), 96);
+    assert_eq!(KeydReason::AttestationKeyInstalled.code(), 96);
+    assert_eq!(KeydReason::AttestationKeyMissing.code(), 97);
+    assert_eq!(KeydReason::NameResolutionInvalid.code(), 98);
+    assert_eq!(KeydReason::NameResolutionStale.code(), 99);
+    assert_eq!(KeydReason::NameResolutionMismatch.code(), 100);
+    assert_eq!(KeydReason::AttestationKeyNotInstalled.code(), 101);
+    assert_eq!(KeydReason::Unlisted.code(), 102);
     assert_eq!(table!(LdapReason), 53);
     assert_eq!(table!(CodecErrorCode), 35);
     assert_eq!(table!(CodecLimit), 12);
@@ -294,9 +305,11 @@ fn code_tables_are_closed() {
     // `SealCeremony`, `ListDestroyDecisions` (18-20) by A-102 (docs/52 §4);
     // `VerifyOperationTicket` (21) by Q-523; the three change-password
     // operations (22-24) by task K3 (docs/53 §9); `RevokeDecision` (25) by
-    // task F3 (docs/questions/Q-976); 1-16 keep their codes.
-    assert_eq!(table!(KeydOperation), 25);
+    // task F3 (docs/questions/Q-976); `InstallAttestationKey` (26) by task
+    // PN9 (docs/59 §7.5, docs/questions/Q-1033); 1-16 keep their codes.
+    assert_eq!(table!(KeydOperation), 26);
     assert_eq!(KeydOperation::RevokeDecision.code(), 25);
+    assert_eq!(KeydOperation::InstallAttestationKey.code(), 26);
     assert_eq!(KeydOperation::VerifyOperationTicket.code(), 21);
     assert_eq!(KeydOperation::OpenChangePasswordRequest.code(), 22);
     assert_eq!(KeydOperation::CompleteChangePassword.code(), 23);
@@ -344,16 +357,18 @@ fn code_tables_are_closed() {
     table!(LdapOperationCode);
     table!(BindMechanismCode);
     table!(LdapTargetCode);
-    // The first four shapes keep their codes; the admin plane appended two.
-    assert_eq!(table!(EventShape), 6);
+    // The first four shapes keep their codes; the admin plane appended two;
+    // task DN10b appended `ZoneSerial` (docs/questions/Q-1013).
+    assert_eq!(table!(EventShape), 7);
     assert_eq!(
         EventShape::ALL.iter().map(|s| s.code()).collect::<Vec<_>>(),
-        [1, 2, 3, 4, 5, 6]
+        [1, 2, 3, 4, 5, 6, 7]
     );
     assert_eq!(EventShape::Kdc.code(), 1);
     assert_eq!(EventShape::WindowSummary.code(), 4);
     assert_eq!(EventShape::DirAdmin.code(), 5);
     assert_eq!(EventShape::Admind.code(), 6);
+    assert_eq!(EventShape::ZoneSerial.code(), 7);
     // Task A16 appended `ChangePolicy` (docs/51 §5.10; docs/questions/Q-592):
     // the earlier eighteen keep their codes. Task D2-c appended the request
     // queue's five (docs/questions/Q-882, Q-938). Task K6 appended

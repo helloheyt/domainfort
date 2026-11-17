@@ -10,7 +10,10 @@
 //! its NC root and krbtgt); A-68, A-69 (dird's and kdc's policy loaders);
 //! docs/50 §7.1 (every configuration parsed by its schema); docs/47 §1.3,
 //! §1.4 (the account source resolves the first administrators; the krbtgt
-//! handle); A-86 (the manifest parses back). Fixtures: tests/common.
+//! handle); A-86 (the manifest parses back); docs/59 §7.4, §10 (PN12) and
+//! docs/questions/Q-1039 item 1 (A-183), Q-1048 (A-187) for the attestation
+//! key's two files (dird's root:0400 file and keyadm's 0400 copy, one key).
+//! Fixtures: tests/common.
 
 mod common;
 
@@ -18,17 +21,18 @@ use common::*;
 
 use std::os::unix::fs::MetadataExt;
 
-use directory_daemon::startup::{read_integrity_key, read_policy};
+use directory_daemon::startup::{read_attestation_key, read_integrity_key, read_policy};
 use directory_pip::{DirectoryContext, NamingContext};
 use dirstore::Store;
 use kdc::AccountSource;
 use keyd_types::KeydConfig;
 use krb_proto::constants::{KRB_NT_PRINCIPAL, KRB_NT_SRV_INST};
 use krb_proto::{KerberosString, PrincipalName, Realm};
+use name_attestation::AttestationKey;
 use provision::install::InstallCause;
 use provision::{
-    install, provision_domain, InstallState, ObjectRole, Owner, Plan, ProvisionError, Staged, Step,
-    Target,
+    install, keyadm_key_owner, provision_domain, InstallState, ObjectRole, Owner, Plan,
+    ProvisionError, Staged, Step, Target,
 };
 use provision_manifest::Manifest;
 
@@ -76,15 +80,23 @@ fn provisioning_installs_files_the_daemons_accept() {
     assert_eq!(progress.seen.first(), Some(&Step::StagingCreated));
     assert_eq!(progress.seen.last(), Some(&Step::StagingRemoved));
     // Nine configuration files since task K9 (kpasswd-front, dnsd), the
-    // policy, the key, the manifest, the database.
-    assert_eq!(installed.targets.len(), 13);
+    // policy, the integrity key, the attestation key's two files (task
+    // PN12), the manifest, the database.
+    assert_eq!(installed.targets.len(), 15);
     assert!(std::fs::symlink_metadata(input.paths.staging.as_path()).is_err());
 
     // Owners (Q-270 item 3; A-68; docs/51 §4.3): root for everything but
-    // the database, which is dird's.
+    // the database, which is dird's, and (task PN12) keyadm's copy of the
+    // attestation key, which is keyadm's (Q-1039 item 1).
     let root = Owner { uid: 0, gid: 0 };
     assert_eq!(recorder.owner_of(Staged::StagingDirectory), Some(root));
     assert_eq!(recorder.owner_of(Staged::IntegrityKey), Some(root));
+    assert_eq!(recorder.owner_of(Staged::AttestationKey), Some(root));
+    assert_eq!(
+        recorder.owner_of(Staged::KeyadmAttestationKey),
+        Some(Owner { uid: 61007, gid: 0 })
+    );
+    assert_eq!(plan.keyadm_key_owner, keyadm_key_owner(61007));
     assert_eq!(recorder.owner_of(Staged::Policy), Some(root));
     assert_eq!(recorder.owner_of(Staged::Manifest), Some(root));
     for daemon in provision::Daemon::ALL {
@@ -94,11 +106,13 @@ fn provisioning_installs_files_the_daemons_accept() {
         recorder.owner_of(Staged::Store),
         Some(Owner { uid, gid: uid })
     );
-    assert_eq!(recorder.records.len(), 14);
+    assert_eq!(recorder.records.len(), 16);
 
-    // Modes: key 0400, database 0600, the rest 0644.
+    // Modes: the keys 0400, database 0600, the rest 0644.
     let p = &input.paths;
     assert_eq!(mode(p.integrity_key.as_path()), 0o400);
+    assert_eq!(mode(p.attestation_key.as_path()), 0o400);
+    assert_eq!(mode(p.keyadm_attestation_key.as_path()), 0o400);
     assert_eq!(mode(p.database.as_path()), 0o600);
     for path in [
         &p.policy,
@@ -120,6 +134,16 @@ fn provisioning_installs_files_the_daemons_accept() {
         32
     );
 
+    // Task PN12 (docs/59 §7.4): the attestation key's two files pass their
+    // readers — dird's one key-file reader (root:0400, 32 octets, not all
+    // zero) and keyadm's (the running account's file, 0400/0600, 32 octets,
+    // not all zero) — the test's uid standing in for root and for keyadm.
+    read_attestation_key(p.attestation_key.as_path(), uid).unwrap();
+    let keyadm_copy = keyadm_attestation_key(p, uid);
+    for path in [&p.attestation_key, &p.keyadm_attestation_key] {
+        assert_eq!(std::fs::metadata(path.as_path()).unwrap().len(), 32);
+    }
+
     // The database: dird's file rule (owned by dird's uid, no group /
     // other access), then the store with that key, then the domain check
     // dird makes before it binds anything (Q-270 item 3).
@@ -131,7 +155,18 @@ fn provisioning_installs_files_the_daemons_accept() {
     let store = Store::open(p.database.as_path(), key, schema.schema().clone()).unwrap();
     let realm = Realm::new("EXAMPLE.TEST").unwrap();
     let nc = NamingContext::new(&["example", "test"]).unwrap();
-    let ctx = DirectoryContext::new(schema, &KeydConfig::new(realm.clone()), nc).unwrap();
+    // As dird builds its contexts (task PN10): the manifest's provisioned
+    // service objects (Q-1019 (a)) and dird's signer (common `dird_signer`).
+    let service_objects = plan
+        .manifest
+        .service_objects()
+        .into_iter()
+        .map(|set| dtyp::Guid::from_packet(set.handle.principal.as_bytes()))
+        .collect();
+    let ctx = DirectoryContext::new(schema, &KeydConfig::new(realm.clone()), nc)
+        .unwrap()
+        .with_service_objects(service_objects)
+        .with_name_resolution_signer(dird_signer(p, uid));
 
     // The policy: dird's and kdc's loaders (A-68, A-69).
     let policy = read_policy(p.policy.as_path(), uid).unwrap();
@@ -162,6 +197,14 @@ fn provisioning_installs_files_the_daemons_accept() {
         let account = view.client(&realm, &cname).unwrap().unwrap();
         let planned = plan.object(ObjectRole::FirstAdmin(i)).unwrap();
         assert_eq!(Some(account.sid), planned.sid);
+        // Task PN12 (docs/59 §7.2 step 1, §7.4): the resolution dird's signer
+        // made under dird's produced key file verifies under keyadm's
+        // produced copy — the key the ceremony hands keyd — and under no
+        // other key: one draw, one key (no octet is shown).
+        let keyadm_key = AttestationKey::from_bytes(keyadm_copy.expose()).unwrap();
+        assert!(name_attestation::verify(&keyadm_key, &account.resolution).is_ok());
+        let other = AttestationKey::from_bytes(&[0x4B; 32]).unwrap();
+        assert!(name_attestation::verify(&other, &account.resolution).is_err());
         assert!(account.state.usable_at(&at(10, 0, 5)));
         assert_eq!(account.tier, pdp::Tier::Tier0);
         let tier0 = plan.object(ObjectRole::Tier0Group).unwrap().sid.unwrap();
@@ -186,9 +229,12 @@ fn provisioning_installs_files_the_daemons_accept() {
             .collect(),
     };
     let changepw = view.service(&realm, &changepw_name).unwrap().unwrap();
-    assert_eq!(changepw.key, plan.manifest.change_password_service().handle);
     assert_eq!(
-        changepw.key.purpose,
+        changepw.key(),
+        plan.manifest.change_password_service().handle
+    );
+    assert_eq!(
+        changepw.key().purpose,
         keyd_types::KeyPurpose::ChangePasswordService
     );
     assert!(changepw.state.usable_at(&at(10, 0, 5)));
@@ -225,10 +271,32 @@ fn provisioning_installs_files_the_daemons_accept() {
     let dird_settings = config::DirdSettings::parse(&read(&p.dird_config)).unwrap();
     assert_eq!(dird_settings.run_as().uid(), uid);
     assert_eq!(dird_settings.database_path().as_str(), p.database.as_str());
+    // Task PN12: dird's file names its attestation-key file (a path only —
+    // A-60) — the file installed above, distinct from the integrity key's.
+    assert_eq!(
+        dird_settings.attestation_key_path().as_str(),
+        p.attestation_key.as_str()
+    );
 
     // The manifest parses back (A-86), and has only identifiers.
     let manifest = Manifest::parse(&read(&p.manifest)).unwrap();
     assert_eq!(manifest, plan.manifest);
+
+    // docs/CLEAN-ROOM.md (task PN12): the attestation key's octets are in its two
+    // files and in no other file the run installed — not the manifest, not a
+    // configuration file (compared here, never printed).
+    let octets = keyadm_copy.expose();
+    for (target, path) in &installed.targets {
+        if matches!(
+            target,
+            Target::AttestationKey | Target::KeyadmAttestationKey
+        ) {
+            assert!(read(path).as_slice() == octets.as_slice(), "{target:?}");
+            continue;
+        }
+        let holds = read(path).windows(octets.len()).any(|w| w == octets);
+        assert!(!holds, "{target:?} holds the attestation key");
+    }
 }
 
 /// docs/51 §4.4 ("every target path absent; no `--force`"): any existing
@@ -370,7 +438,9 @@ fn a_csprng_failure_writes_nothing() {
         return;
     }
     let i = input(&dir, uid, 61007);
-    for fail_at in [1, 5, 13, 14] {
+    // 1 SID draw + 12 GUIDs + node id + integrity key + attestation key
+    // (task PN12) = 16 fills.
+    for fail_at in [1, 5, 13, 14, 15, 16] {
         let mut rng = FailingRandom {
             fail_at,
             inner: CountingRandom::default(),
@@ -408,6 +478,17 @@ fn a_crash_at_each_point_leaves_the_documented_state_and_a_rerun_refuses() {
             InstallState::StagingOnly,
             0,
         ),
+        // Task PN12: the attestation key's two files.
+        (
+            Step::Staged(Target::AttestationKey),
+            InstallState::StagingOnly,
+            0,
+        ),
+        (
+            Step::Staged(Target::KeyadmAttestationKey),
+            InstallState::StagingOnly,
+            0,
+        ),
         (Step::Staged(Target::Store), InstallState::StagingOnly, 0),
         (
             Step::Staged(Target::Config(provision::Daemon::Admind)),
@@ -421,17 +502,22 @@ fn a_crash_at_each_point_leaves_the_documented_state_and_a_rerun_refuses() {
             1,
         ),
         (
+            Step::Installed(Target::KeyadmAttestationKey),
+            InstallState::PartlyInstalled,
+            13,
+        ),
+        (
             Step::Installed(Target::Manifest),
             InstallState::PartlyInstalled,
-            12,
+            14,
         ),
-        (Step::TargetsSynced, InstallState::PartlyInstalled, 12),
+        (Step::TargetsSynced, InstallState::PartlyInstalled, 14),
         (
             Step::Installed(Target::Store),
             InstallState::InstalledStagingLeft,
-            13,
+            15,
         ),
-        (Step::StagingRemoved, InstallState::InstalledStagingLeft, 13),
+        (Step::StagingRemoved, InstallState::InstalledStagingLeft, 15),
     ];
     for (step, state, in_place) in cases {
         let dir = TempDir::new();
@@ -446,7 +532,7 @@ fn a_crash_at_each_point_leaves_the_documented_state_and_a_rerun_refuses() {
         assert_eq!(present.len(), in_place, "{step:?}: {present:?}");
         // The database is never in place before every other target.
         if present.contains(&Target::Store) {
-            assert_eq!(present.len(), 13, "{step:?}");
+            assert_eq!(present.len(), 15, "{step:?}");
         }
         let staging_left = std::fs::symlink_metadata(i.paths.staging.as_path()).is_ok();
         assert_eq!(staging_left, step != Step::StagingRemoved, "{step:?}");
@@ -477,6 +563,8 @@ fn an_owner_change_failure_leaves_only_the_staging_directory() {
     for fail_on in [
         Staged::StagingDirectory,
         Staged::IntegrityKey,
+        Staged::AttestationKey,
+        Staged::KeyadmAttestationKey,
         Staged::Store,
         Staged::Manifest,
     ] {

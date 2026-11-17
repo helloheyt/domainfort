@@ -24,9 +24,10 @@
 //! stored set is reachable only through a proof type built here, after the
 //! check:
 //!
-//! * `StoredKeySet::bound_to` checks that the set is bound to (realm, name)
-//!   and only then returns a `BoundKeys` — whose `KeyVersion`s are the
-//!   only way to a key (`KeyVersion::key_for`, `KeyVersion::preferred`);
+//! * a `BoundKeys` — whose `KeyVersion`s are the only way to a key
+//!   (`KeyVersion::key_for`, `KeyVersion::preferred`) — is returned only by
+//!   one of four doors, each after its check (task PN11 — see "The doors"
+//!   below);
 //! * an operation in which the principal's name is **not** an input gets the
 //!   current version through `StoredKeySet::unbound_current`, which names a
 //!   closed `UnboundUse` — each variant states where A-19 is enforced
@@ -39,7 +40,28 @@
 //!   one, the binding unchanged);
 //! * a set is created only from a `NewBinding` — built only by
 //!   `template::check_new_binding`, the creation rule of A-19 — so a key set
-//!   bound to a name the rule refuses is unrepresentable.
+//!   bound to a name the rule refuses is unrepresentable;
+//!
+//! # The doors (task PN11; docs/59 §7.2, §7.3)
+//!
+//! | door | for | check |
+//! |---|---|---|
+//! | `bound_by` | AS / TGS issuance under a client or service key set (the AS client, the change-password service, every TGS service) | the set is the one stored under the handle a `VerifiedNameResolution` names — dird's statement whose tag, realm and freshness keyd checked (crate name_resolution); the door looks it up itself, so no other set can be handed to it (task PN11b) — it is no krbtgt, the resolution's canonical name is its bound name in the namespace's equivalence (`principal-names`), and the name the ticket will carry is one of the resolution's two names |
+//! | `StoredKeySet::ticket_granting` | the krbtgt: sealing a TGT, opening a TGT or a FAST armor ticket | the set is a Krbtgt key set bound to this realm's TGS name — the canonical `krbtgt/<REALM>` the KDC always writes, exactly, no resolution ([MS-KILE] 3.3.5.1.2; RFC 4120 §7.3; docs/59 §7.2) |
+//! | `StoredKeySet::accepting` | the acceptor (a service AP-REQ, a change-password request) | the ticket's (srealm, sname) and the set's binding are the same principal in the namespace's one equivalence (`principal-names` — Q-1011 item 6, A-173) |
+//! | `StoredKeySet::bound_to` | `set_secret` on an existing set (dird's own install path) | the set is bound to the (realm, name) of the request's binding — never an issuance (docs/59 §3 M4: `directory.rs` stays) |
+//!
+//! So the KDC cannot choose which key set a name maps to (class C3, closed
+//! for names), no issuance reaches a client or service key on the KDC's word
+//! alone (C5 kept closed: every door is a proof type built after its check),
+//! no issuance request names a resolved key set twice — the resolution is
+//! the only name keyd looks it up by (task PN11b; "one request states one
+//! fact twice", docs/questions/Q-1067),
+//! and no door compares names by a second equivalence (C49: the two
+//! namespace compares go through `principal-names`; the two exact ones
+//! compare against one fixed name — the canonical TGS name — or the
+//! request's own binding). `tests/key_access_inventory.rs` pins which file
+//! uses which door.
 //!
 //! The raw accessors (the current and previous versions, the binding, and the
 //! key lookups of a version) are private to this module. A new operation that
@@ -61,18 +83,50 @@
 //! [`KeyStore::destroy`] removes a whole key set and zeroizes it inside the
 //! store; no store destroys a krbtgt key set (it is only ever rotated).
 //!
+//! # The attestation key lives in the store (A-190)
+//!
+//! **The class:** a key keyd needs in order to operate was held outside its
+//! key store (a field of `Keyd`), so a store that outlives a keyd lifetime —
+//! KL3's sealed store, or a test custody that emulates one — did not carry
+//! it, and a keyd restarted over that store was operational yet could verify
+//! no name resolution: it issued nothing. **The root-level change:** the
+//! attestation key is part of the store — [`KeyStore::attestation_key`]
+//! (read) and [`KeyStore::install_attestation_key`] (once; `Exists` when one
+//! is held — never replaced) — and `Keyd` holds no copy: it reads the key
+//! only from its store. A store that carries its key sets carries the key
+//! with them; [`KeyStore::is_empty`] means no key set **and** no attestation
+//! key. keyd's PEP rules are unchanged: only `Keyd::install_attestation_key`
+//! (Role::Admin, the ceremony only, an acknowledged intent) installs it,
+//! and `seal_ceremony` refuses without it (Q-1056).
+//!
+//! The read accessor hands a reference only to the store's owner; inside
+//! keyd the owner is `Keyd`, which exposes no reference to its store, and
+//! the one use is `name_attestation::verify` (pinned by
+//! tests/attestation_key_custody.rs). `AttestationKey` has no accessor,
+//! `Debug` or `Clone`, and wipes itself on drop (crate name-attestation:
+//! a `Zeroizing` buffer).
+//!
+//! The development store ([`InMemoryKeyStore`]) holds the key in RAM, like
+//! its key sets. KL3's sealed store must persist it with them; the sealed
+//! format (KL1, crates/keyd-types `sealed_store`) has no record for it yet —
+//! docs/questions/Q-1064.
+//!
 //! Spec: docs/10 §1 (StoredKeySet; current + previous kvno), §7, §11, §12 I1;
 //! docs/09 A.7 (D32 rotation); docs/33 §6.1 (D178); docs/questions/Q-115
 //! (A-35); docs/questions/Q-040 (A-19); RFC 4120 6.2 (name equivalence);
-//! docs/52 §3.5, §7 R7.
+//! docs/52 §3.5, §4.4, §7 R7; docs/59 §7.4; docs/questions/Q-1033 item 5,
+//! Q-1063 item 3 (A-190).
 
 use crate::audit::AuditReason;
 use crate::error::{Deny, Internal};
 use crate::model::{KeyHandle, KeyPurpose, Kvno, PrincipalBinding};
-use crate::template::NewBinding;
+use crate::name_resolution::{same_principal, VerifiedNameResolution};
+use crate::template::{tgs_name, NewBinding};
 use core::fmt;
 use krb_crypto::{EncType, ProtocolKey};
 use krb_proto::{PrincipalName, Realm};
+use name_attestation::AttestationKey;
+use principal_names::NameContext;
 use std::collections::HashMap;
 
 /// The keys of one key version: one protocol key per configured enctype, in
@@ -190,11 +244,14 @@ impl fmt::Debug for KeyVersion<'_> {
     }
 }
 
-/// Proof that a stored key set is bound to the (realm, name) an operation
-/// uses it for (A-19): built only by [`StoredKeySet::bound_to`], after the
-/// check. The key versions of the set are reached through it.
+/// Proof that a stored key set may be used for the name an operation uses
+/// it for (A-19): built only by one of the four doors — `bound_by`, and
+/// [`StoredKeySet`]'s `ticket_granting`, `accepting`, `bound_to` (module
+/// documentation, "The doors") — after its check. The key versions of the
+/// set are reached through it.
 ///
-/// Spec: docs/questions/Q-040 (A-19); RFC 4120 6.2; docs/52 §3.5 (R7).
+/// Spec: docs/questions/Q-040 (A-19); RFC 4120 6.2; docs/52 §3.5 (R7);
+/// docs/59 §7.2.
 #[derive(Clone, Copy)]
 pub(crate) struct BoundKeys<'a> {
     set: &'a StoredKeySet,
@@ -241,9 +298,11 @@ impl fmt::Debug for BoundKeys<'_> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UnboundUse {
     /// `verify_preauth`: it issues nothing — its `AuthnProof` is bound to the
-    /// key handle, and `issue_as_rep`, its only redeemer, binds the ticket's
-    /// crealm / cname to that same key set ([`StoredKeySet::bound_to`])
-    /// before anything is sealed. Spec: docs/10 §4, §8; A-19.
+    /// key handle, and `issue_as_rep`, its only redeemer, requires that key
+    /// set to be the one dird's verified client resolution names and binds
+    /// the ticket's crealm / cname to it through that resolution
+    /// (`bound_by`, tasks PN11, PN11b) before anything is sealed.
+    /// Spec: docs/10 §4, §8; A-19; docs/59 §7.2; docs/questions/Q-1080.
     Preauthentication,
     /// `verify_secret`: it compares a candidate password with the current
     /// password-derived key and issues nothing under any name; no role holds
@@ -258,15 +317,22 @@ pub(crate) enum UnboundUse {
 /// The set is bound, at creation, to one principal name
 /// ([`PrincipalBinding`]); the binding has no setter and survives every
 /// rotation (no rename in phase 1). Its keys are reachable only through
-/// `StoredKeySet::bound_to` or a declared `UnboundUse` (module
-/// documentation).
+/// one of its four doors or a declared `UnboundUse` (module documentation).
 ///
 /// Opaque: no public constructor, no public key accessor (I1).
 ///
+/// The set also keeps the handle its creation rule was checked for (task
+/// PN8) — the purpose its doors judge (a krbtgt set opens only through
+/// `ticket_granting`). The issuance door `bound_by` looks a set up by the
+/// handle a verified name resolution names, so no handle passed alongside
+/// the resolution exists to compare (task PN11b).
+///
 /// Spec: docs/10 §1 ("keyd holds current + previous"; "decrypt may try a set
 /// of kvnos; signing/sealing always with the current kvno"); docs/09 D32;
-/// docs/questions/Q-040 (A-19, name binding); docs/52 §3.5 (R7).
+/// docs/questions/Q-040 (A-19, name binding); docs/52 §3.5 (R7); docs/59
+/// §7.2 step 4.
 pub struct StoredKeySet {
+    handle: KeyHandle,
     binding: PrincipalBinding,
     current: KvnoKeys,
     previous: Option<KvnoKeys>,
@@ -276,11 +342,12 @@ impl StoredKeySet {
     /// A new key set from its creation proof — the binding passed the
     /// creation rule (`template::check_new_binding`) for one handle — and its
     /// first version. Returns that handle, under which the caller stores the
-    /// set.
-    /// Spec: docs/questions/Q-040 (A-19); docs/10 §6, §7.
+    /// set; the set keeps it too (the purpose its doors judge).
+    /// Spec: docs/questions/Q-040 (A-19); docs/10 §6, §7; docs/59 §7.2.
     pub(crate) fn create(binding: NewBinding, current: KvnoKeys) -> (KeyHandle, StoredKeySet) {
         let (handle, binding) = binding.into_parts();
         let set = StoredKeySet {
+            handle,
             binding,
             current,
             previous: None,
@@ -302,11 +369,75 @@ impl StoredKeySet {
     /// its keys are used; otherwise `Denied` (reason `NameBindingMismatch`).
     /// The realm and every name component are compared exactly; the
     /// name-type is not significant ([`PrincipalBinding::matches`]).
+    ///
+    /// Since task PN11 the door of one path only: `set_secret` on an
+    /// existing set, where the name compared is the request's own binding
+    /// (dird's install path — docs/59 §3 M4) — never an issuance, which
+    /// reaches a key only through `bound_by` or, for the krbtgt,
+    /// [`StoredKeySet::ticket_granting`] (pinned by
+    /// tests/key_access_inventory.rs).
+    ///
     /// Spec: RFC 4120 6.2 ("Principal names that differ only in the
     /// name-type identify the same principal"); docs/questions/Q-040 (A-19);
-    /// docs/52 §3.5 (R7).
+    /// docs/52 §3.5 (R7); docs/59 §7.2, §7.3.
     pub(crate) fn bound_to(&self, realm: &Realm, name: &PrincipalName) -> Internal<BoundKeys<'_>> {
         if self.binding.matches(realm, name) {
+            Ok(BoundKeys { set: self })
+        } else {
+            Err(Deny::denied(AuditReason::NameBindingMismatch))
+        }
+    }
+
+    /// The proof that this is a krbtgt key set bound to the TGS name of
+    /// `realm` — `krbtgt/<realm>`, the realm and both components exactly,
+    /// the name-type not significant — through which its keys are used;
+    /// otherwise `Denied` (`NameBindingMismatch`). No name resolution: the
+    /// TGS name never reaches the namespace (it is reserved — RFC 4120 §6.2,
+    /// §7.3), and the KDC always writes the canonical `krbtgt/<REALM>` for
+    /// a TGT ([MS-KILE] 3.3.5.1.2), so its one stored binding is the check
+    /// (docs/59 §7.2: "the krbtgt check stays against the stored binding,
+    /// exact"). The door of sealing a TGT (`issue_as_rep`) and of opening a
+    /// TGT or an armor ticket (`open_local_tgt`).
+    /// Spec: RFC 4120 §6.2, §7.3; [MS-KILE] v20261110 3.3.5.1.2; docs/59
+    /// §7.2; docs/questions/Q-040 (A-19), Q-1034 item 5 (i).
+    pub(crate) fn ticket_granting(&self, realm: &Realm) -> Internal<BoundKeys<'_>> {
+        if self.handle.purpose == KeyPurpose::Krbtgt
+            && self.binding.matches(realm, &tgs_name(realm))
+        {
+            Ok(BoundKeys { set: self })
+        } else {
+            Err(Deny::denied(AuditReason::NameBindingMismatch))
+        }
+    }
+
+    /// The proof that a ticket presented for (`srealm`, `sname`) may be
+    /// opened under this (non-krbtgt) key set: the two names are the same
+    /// principal in the namespace's one equivalence — the same
+    /// `principal-names` key, the name-type ignored and the case folded —
+    /// otherwise `Denied` (`NameBindingMismatch`). The acceptor's door
+    /// (`verify_service_ap_req`: the LDAP front, dird's admin channel, the
+    /// change-password request). The sname is outside the ticket's enc-part
+    /// (RFC 4120 §5.3), so this is a consistency check, not the protection —
+    /// the key the ticket decrypts under is (docs/59 §9 S6, C21); it is kept
+    /// rather than dropped, and never an octet compare (Q-1011 item 6).
+    /// Spec: docs/59 §7.2 (acceptor), §4.2; docs/questions/Q-1011 item 6
+    /// (A-173: "the acceptor-side sname compare goes through principal-names
+    /// (folded key equality)"); RFC 4120 §5.3, §6.2.
+    pub(crate) fn accepting(
+        &self,
+        srealm: &Realm,
+        sname: &PrincipalName,
+        context: &NameContext,
+    ) -> Internal<BoundKeys<'_>> {
+        if self.handle.purpose != KeyPurpose::Krbtgt
+            && same_principal(
+                srealm,
+                sname,
+                &self.binding.realm,
+                &self.binding.name,
+                context,
+            )
+        {
             Ok(BoundKeys { set: self })
         } else {
             Err(Deny::denied(AuditReason::NameBindingMismatch))
@@ -380,6 +511,7 @@ impl StoredKeySet {
 impl fmt::Debug for StoredKeySet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StoredKeySet")
+            .field("handle", &self.handle)
             .field("binding", &self.binding)
             .field("current", &self.current)
             .field("previous", &self.previous)
@@ -413,10 +545,28 @@ pub trait KeyStore {
     /// `true` if this store may hold keys of `purpose`. Spec: D178.
     fn accepts(&self, purpose: KeyPurpose) -> bool;
 
-    /// Whether the store holds no key set at all — keyd then starts in its
-    /// provisioning ceremony (A-102, docs/52 §4.4: "keyd comes up in
-    /// `Provisioning` only when the store is empty").
+    /// Whether the store holds nothing — no key set **and** no attestation
+    /// key — keyd then starts in its provisioning ceremony (A-102, docs/52
+    /// §4.4: "keyd comes up in `Provisioning` only when the store is
+    /// empty"; A-190: the attestation key is part of the store).
     fn is_empty(&self) -> bool;
+
+    /// The attestation key dird's name resolutions are verified with, once
+    /// the ceremony installed it (module documentation); `None` before.
+    /// Only its owner reads it — inside keyd, `Keyd`, for
+    /// `name_attestation::verify` alone.
+    /// Spec: docs/59 §7.2 step 1, §7.4; docs/questions/Q-1011 item 2
+    /// (A-173), Q-1063 item 3 (A-190).
+    fn attestation_key(&self) -> Option<&AttestationKey>;
+
+    /// Keep `key` as the store's attestation key. Must refuse when one is
+    /// already held ([`StoreError::Exists`]: never replaced — the refused
+    /// key is dropped, and wipes itself). Called only by
+    /// `Keyd::install_attestation_key`, after its own checks (Role::Admin,
+    /// the ceremony only, an acknowledged intent).
+    /// Spec: docs/59 §7.4; docs/questions/Q-1011 item 2 (A-173), Q-1033
+    /// (A-177), Q-1063 item 3 (A-190).
+    fn install_attestation_key(&mut self, key: AttestationKey) -> Result<(), StoreError>;
 
     /// The key set of `handle`, if stored.
     fn get(&self, handle: &KeyHandle) -> Option<&StoredKeySet>;
@@ -438,13 +588,81 @@ pub trait KeyStore {
     fn destroy(&mut self, handle: &KeyHandle) -> Result<(), StoreError>;
 }
 
-/// In-memory key store (keys in process RAM, zeroized on drop), bounded.
+/// The door of AS / TGS issuance to a client or service key set (task
+/// PN11): the proof that the key set a **verified** name resolution names
+/// may be used for a ticket that will carry (`ticket_realm`,
+/// `ticket_name`) — dird's statement, checked by keyd
+/// (`name_attestation::verify` ⇒ realm ⇒ freshness,
+/// `Keyd::verify_name_resolution`). Otherwise `Denied`: `KeyNotFound` when
+/// no set is stored for the resolution's key set, `NameResolutionMismatch`
+/// for every other refusal.
 ///
-/// Spec: docs/10 §11 (software fallback only for development, D35); D178.
+/// **The set comes from the resolution** (task PN11b; docs/questions/
+/// Q-1067): the door looks it up in `store` under the resolution's own
+/// `(principal, key_purpose)` (docs/59 §7.1, §7.2 step 4) — it takes no set
+/// and no handle from its caller, so no request can name the key set beside
+/// the resolution, and no keyd code can open one set with another set's
+/// resolution. Step 4's compare (`principal == handle.principal`,
+/// `key_purpose == handle.purpose`) is the lookup itself: nothing is left to
+/// compare.
+///
+/// Then all of:
+/// 1. the set is not a krbtgt key set — the krbtgt is reached only by its
+///    exact stored binding ([`StoredKeySet::ticket_granting`]), never by a
+///    resolution (docs/59 §7.2: "the KDC always writes the canonical
+///    `krbtgt/<REALM>`"; RFC 4120 §7.3);
+/// 2. the resolution's canonical name is the set's bound name in the
+///    namespace's one equivalence — the same `principal-names` key, the
+///    name-type ignored (RFC 4120 §6.2) and the case folded — never an
+///    octet comparison: keyd holds no second definition of "the same name"
+///    (class C49, docs/59 §3 M3; Q-1011 item 6);
+/// 3. the ticket's (realm, name) is one of the resolution's two pairs — as
+///    the request sent it, or canonical — exactly: keyd does not fold here,
+///    dird already chose (docs/59 §7.2 step 5). Checked in the door, so no
+///    issuance can take the keys and write another name.
+///
+/// The type does the rest: a `VerifiedNameResolution` exists only after the
+/// tag, realm and freshness checks (crate name_resolution), so an unchecked
+/// or stale resolution cannot reach this function.
+///
+/// Spec: docs/59 §7.1, §7.2 steps 1–5, §3 (M4 = C3, keeping C5 closed —
+/// R7); docs/questions/Q-1011 items 4–6 (A-173), Q-1034 (A-177: the binding
+/// compare is kept through PN11), Q-1067 (task PN11b); RFC 4120 §6.2, §7.3;
+/// docs/CLEAN-ROOM.md (a proof type built only after the check, one chokepoint;
+/// the restatement unrepresentable).
+pub(crate) fn bound_by<'s, S: KeyStore + ?Sized>(
+    store: &'s S,
+    verified: &VerifiedNameResolution,
+    ticket_realm: &Realm,
+    ticket_name: &PrincipalName,
+) -> Internal<BoundKeys<'s>> {
+    let set = store
+        .get(&verified.handle())
+        .ok_or(Deny::denied(AuditReason::KeyNotFound))?;
+    let mismatch = Err(Deny::denied(AuditReason::NameResolutionMismatch));
+    if set.handle.purpose == KeyPurpose::Krbtgt {
+        return mismatch;
+    }
+    if !verified.names_binding(&set.binding) {
+        return mismatch;
+    }
+    if !verified.names_ticket(ticket_realm, ticket_name) {
+        return mismatch;
+    }
+    Ok(BoundKeys { set })
+}
+
+/// In-memory key store (keys in process RAM, zeroized on drop), bounded.
+/// It holds the attestation key too (A-190), in RAM, wiped on drop
+/// (`AttestationKey`'s `Zeroizing` buffer).
+///
+/// Spec: docs/10 §11 (software fallback only for development, D35); D178;
+/// docs/59 §7.4.
 pub struct InMemoryKeyStore {
     sets: HashMap<KeyHandle, StoredKeySet>,
     capacity: usize,
     allow_krbtgt: bool,
+    attestation_key: Option<AttestationKey>,
 }
 
 impl InMemoryKeyStore {
@@ -457,6 +675,7 @@ impl InMemoryKeyStore {
             sets: HashMap::new(),
             capacity,
             allow_krbtgt: false,
+            attestation_key: None,
         }
     }
 
@@ -475,6 +694,7 @@ impl InMemoryKeyStore {
             sets: HashMap::new(),
             capacity,
             allow_krbtgt: true,
+            attestation_key: None,
         }
     }
 
@@ -483,9 +703,10 @@ impl InMemoryKeyStore {
         self.sets.len()
     }
 
-    /// `true` if no key set is stored.
+    /// `true` if nothing is stored: no key set and no attestation key
+    /// ([`KeyStore::is_empty`]).
     pub fn is_empty(&self) -> bool {
-        self.sets.is_empty()
+        self.sets.is_empty() && self.attestation_key.is_none()
     }
 }
 
@@ -501,9 +722,24 @@ impl KeyStore for InMemoryKeyStore {
         }
     }
 
-    /// Spec: docs/52 §4.4 (A-102).
+    /// Spec: docs/52 §4.4 (A-102); A-190.
     fn is_empty(&self) -> bool {
-        self.sets.is_empty()
+        InMemoryKeyStore::is_empty(self)
+    }
+
+    /// Spec: docs/59 §7.4; A-190.
+    fn attestation_key(&self) -> Option<&AttestationKey> {
+        self.attestation_key.as_ref()
+    }
+
+    /// Once; `Exists` when one is held (the refused key wipes on drop).
+    /// Spec: docs/59 §7.4; docs/questions/Q-1011 item 2; A-190.
+    fn install_attestation_key(&mut self, key: AttestationKey) -> Result<(), StoreError> {
+        if self.attestation_key.is_some() {
+            return Err(StoreError::Exists);
+        }
+        self.attestation_key = Some(key);
+        Ok(())
     }
 
     fn get(&self, handle: &KeyHandle) -> Option<&StoredKeySet> {
@@ -514,7 +750,7 @@ impl KeyStore for InMemoryKeyStore {
         self.sets.get_mut(handle)
     }
 
-    /// Spec: docs/33 §6.1 (D178); bounded per docs/CLEAN-ROOM.md
+    /// Spec: docs/33 §6.1 (D178); bounded per docs/CLEAN-ROOM.md.
     fn insert(&mut self, handle: KeyHandle, set: StoredKeySet) -> Result<(), StoreError> {
         if !self.accepts(handle.purpose) {
             return Err(StoreError::Refused);
@@ -547,12 +783,14 @@ impl KeyStore for InMemoryKeyStore {
 }
 
 impl fmt::Debug for InMemoryKeyStore {
-    /// Counts and mode only — never keys (docs/CLEAN-ROOM.md).
+    /// Counts and mode only — never keys (docs/CLEAN-ROOM.md); whether the
+    /// attestation key is held, never anything of it.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("InMemoryKeyStore")
             .field("key_sets", &self.sets.len())
             .field("capacity", &self.capacity)
             .field("insecure_development_krbtgt", &self.allow_krbtgt)
+            .field("attestation_key_held", &self.attestation_key.is_some())
             .finish()
     }
 }
@@ -586,6 +824,7 @@ mod tests {
     /// `template::check_new_binding`'s, tested there and through keyd).
     fn set(kvno: u32) -> StoredKeySet {
         StoredKeySet {
+            handle: KeyHandle::new(PrincipalId::from_bytes([1; 16]), KeyPurpose::Service),
             binding: binding(),
             current: KvnoKeys::random(Kvno::new(kvno), vec![key(0x11)]),
             previous: None,
@@ -750,10 +989,36 @@ mod tests {
         );
     }
 
+    /// A-190 (docs/59 §7.4; Q-1011 item 2): the store holds the attestation
+    /// key once — a second install is `Exists` and leaves the first — and a
+    /// store holding only the key is not empty (a keyd started over it is
+    /// operational, docs/52 §4.4); its `Debug` says only whether the key is
+    /// held.
+    #[test]
+    fn the_store_holds_the_attestation_key_once() {
+        let key = |byte| AttestationKey::from_bytes(&[byte; 32]).unwrap();
+        let mut store = InMemoryKeyStore::new(4);
+        assert!(store.is_empty());
+        assert!(store.attestation_key().is_none());
+        assert!(format!("{store:?}").contains("attestation_key_held: false"));
+        assert_eq!(store.install_attestation_key(key(0x5A)), Ok(()));
+        assert!(store.attestation_key().is_some());
+        assert!(!store.is_empty());
+        assert!(!KeyStore::is_empty(&store));
+        assert_eq!(
+            store.install_attestation_key(key(0x6B)),
+            Err(StoreError::Exists)
+        );
+        let text = format!("{store:?}");
+        assert!(text.contains("attestation_key_held: true"), "{text}");
+        assert!(!text.contains("5a") && !text.contains("5A") && !text.contains("90,"));
+    }
+
     /// Debug output carries no key octets (docs/CLEAN-ROOM.md).
     #[test]
     fn debug_has_no_key_material() {
         let s = StoredKeySet {
+            handle: KeyHandle::new(PrincipalId::from_bytes([1; 16]), KeyPurpose::Service),
             binding: binding(),
             current: KvnoKeys::random(Kvno::new(3), vec![key(0x5A)]),
             previous: None,

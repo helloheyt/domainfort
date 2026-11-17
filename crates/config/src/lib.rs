@@ -17,6 +17,14 @@
 //! | admind | [`AdmindSettings`] | §2.4 (blocked on Q-220) |
 //! | keyadm (tool, not a daemon) | [`KeyadmSettings`] | §2.4, R50-3; docs/51 §6 |
 //!
+//! The listeners whose endpoint the zone advertises (the kdc's `listen`,
+//! ldap-front's `ldap_listen`, kpasswd-front's `listen`, and dnsd's `listen`
+//! — the name server the NS record names) take only their service's
+//! standard port, [`StandardPort`] — the one copy of those port numbers,
+//! which the SRV synthesis reads too (task DN10c; task DN10d; docs/questions/
+//! Q-1016, Q-1024, Q-1025). ldap-front's file requires its StartTLS
+//! listener (task DN10d; Q-1025 item 3).
+//!
 //! Each type has `parse(&[u8])` and a public `KEYS` table. Parsing is pure: it
 //! opens no file, reads no environment, resolves no name and checks no file
 //! mode — the daemon does those (docs/50 §7.1: the configuration file is
@@ -89,13 +97,14 @@ mod ldap_front;
 pub mod limits;
 pub mod line_format;
 mod schema;
+mod standard_port;
 mod value;
 
 pub use admind::AdmindSettings;
 pub use auditd::{AuditSource, AuditdSettings, SourceMap};
 pub use dird::{
-    AdminServiceSettings, Channel, DirdSettings, IntegrityKeySource, PolicyStoreFormat,
-    VIEW_LIFETIME_SECS,
+    AdminServiceSettings, Channel, DirdSettings, DnsServiceSettings, IntegrityKeySource,
+    PolicyStoreFormat, SoaSettings, VIEW_LIFETIME_SECS,
 };
 pub use dnsd::{
     DnsdLimits, DnsdSettings, DNSD_MAX_REQUESTS_PER_TCP_CONNECTION_BOUND,
@@ -117,7 +126,8 @@ pub use ldap_front::{
     MAX_CONN_IDLE_TIME_SECS, TLS_HANDSHAKE_TIMEOUT_SECS,
 };
 pub use schema::{Account, Endpoint};
+pub use standard_port::StandardPort;
 pub use value::{
-    is_internal, AbsolutePath, NamingContextLabels, Network, MAX_NAMING_CONTEXT_LABELS,
-    NODE_ID_OCTETS,
+    is_internal, AbsolutePath, NamingContextLabels, Network, MAX_DOMAIN_NAME_OCTETS,
+    MAX_LABEL_OCTETS, MAX_NAMING_CONTEXT_LABELS, NODE_ID_OCTETS,
 };

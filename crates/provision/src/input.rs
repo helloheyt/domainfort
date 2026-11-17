@@ -5,21 +5,28 @@
 //! Task K9 adds the two network fronts (kpasswd-front, docs/53 §3.3, §10;
 //! dnsd, docs/54 §4.3, §10 row DN13 — its account, file and auditd mapping
 //! only) and the change-password service object's name (docs/53 §5.2).
+//! Task DN10b adds the DC's own addresses (`--dc-address`, docs/54 §3.1, §10
+//! row DN13), written as the DC's host record through the one checker.
+//! Task PN12 adds the two files of the name-resolution attestation key
+//! (docs/59 §7.4, §10 row PN12): dird's key file (`--attestation-key-path`)
+//! and keyadm's input copy for the ceremony (`--keyadm-attestation-key-path`,
+//! docs/questions/Q-1039 item 1 — A-183).
 //!
 //! Spec: docs/51 §4.3 ("input (without any secret)"; step 1), §4.4, §4.6,
 //! §11; docs/50 §2.4, §3.1, R50-3, §7.1; docs/53 §3.3, §5.2, §10 (K9);
-//! docs/54 §4.3, §4.6, §4.7, §10 (DN13); decisions A-55, A-60, A-72, A-79,
-//! A-117, A-119, A-160, P-22 (Q-295); docs/questions/Q-345 items 6-8,
-//! Q-973.
+//! docs/54 §3.1, §4.3, §4.6, §4.7, §10 (DN13); decisions A-55, A-60, A-72,
+//! A-79, A-117, A-119, A-160, A-172, P-22 (Q-295); docs/questions/Q-345
+//! items 6-8, Q-973, Q-1003, Q-1014.
 
 use core::fmt;
+use core::net::Ipv4Addr;
 use std::path::Path;
 
 use directory_admin::{
     admin_service_spn_ok, computer_name_ok, computer_sam, dns_host_name_ok, group_sam_ok,
     rdn_value_ok, spn_ok, user_sam_ok,
 };
-use directory_pip::NamingContext;
+use directory_pip::{host_label, NamingContext};
 use krb_proto::Realm;
 use provision_manifest::limits::{MAX_FIRST_ADMINS, MIN_FIRST_ADMINS};
 use provision_manifest::{ADMIN_SERVICE_CLASS, LDAP_SERVICE_CLASS};
@@ -150,6 +157,13 @@ pub struct Paths {
     pub database: FilePath,
     /// The development integrity key (`integrity_key_path`).
     pub integrity_key: FilePath,
+    /// dird's name-resolution attestation key (`attestation_key_path` in
+    /// dird's file; root:0400, 32 octets — task PN12, docs/59 §7.4).
+    pub attestation_key: FilePath,
+    /// keyadm's input copy of the same attestation key — the operand of
+    /// `keyadm ceremony`, which installs it in keyd (keyadm's uid, 0400 —
+    /// task PN12; docs/questions/Q-1039 item 1, A-183).
+    pub keyadm_attestation_key: FilePath,
     /// The policy file (`policy_store_path`, dird and kdc).
     pub policy: FilePath,
     /// The manifest.
@@ -211,9 +225,16 @@ pub struct Paths {
 pub struct Network {
     /// kdc's `listen` addresses (at least one).
     pub kdc_listen: Vec<String>,
-    /// ldap-front's `ldap_listen` addresses.
+    /// ldap-front's `ldap_listen` addresses (StartTLS, port 389): at least
+    /// one — the zone advertises `_ldap._tcp` on 389, so it always has a
+    /// listener. The rule is ldap-front's own schema's (task DN10d; A-178 on
+    /// docs/questions/Q-1025 item 3): crates/config refuses a file without
+    /// `ldap_listen` (`MissingKey`) or with another port
+    /// (`NonStandardPort`), and the plan's parse-back of the produced file
+    /// is how provisioning refuses it — before anything is written.
     pub ldap_listen: Vec<String>,
-    /// ldap-front's `ldaps_listen` addresses.
+    /// ldap-front's `ldaps_listen` addresses (optional; no SRV record
+    /// advertises LDAPS).
     pub ldaps_listen: Vec<String>,
     /// `internal_networks` (ldap-front, required — every LDAP listener lies
     /// inside one of them, docs/52 R14; and kdc, kpasswd-front and dnsd,
@@ -223,8 +244,19 @@ pub struct Network {
     /// docs/53 R53-3, §3.3; A-117).
     pub kpasswd_listen: Vec<String>,
     /// dnsd's `listen` addresses (each served on UDP and TCP, at least one —
-    /// docs/54 §4.3, §4.7).
+    /// docs/54 §4.3, §4.7; every one on port 53, the NS record's name server
+    /// — crates/config refuses any other, task DN10d, docs/questions/Q-1025
+    /// item 1).
     pub dnsd_listen: Vec<String>,
+    /// The DC's own addresses — its host record, the zone's A records of the
+    /// DC's name (`--dc-address`, task DN10b; docs/54 §3.1: "written in
+    /// `provision domain` only", §10 row DN13): IPv4 in the standard dotted
+    /// form, 1 ..= 8 distinct, each registrable — inside an IPv4 internal
+    /// network (dird's `dns_registrable_networks`), never loopback,
+    /// unspecified or multicast (directory-pip `registrable`, the write
+    /// checker's own rule). docs/questions/Q-619 item 7, Q-1003 item 3,
+    /// Q-1014.
+    pub dc_addresses: Vec<String>,
 }
 
 /// The names chosen at provisioning — never hard-coded (docs/47 §6.3).
@@ -317,12 +349,34 @@ pub enum InputErrorKind {
     SharedPolicyNextDirectory,
     /// A network list item is empty or holds a separator.
     NetworkItem,
-    /// No kdc listener, neither LDAP nor LDAPS listener, no kpasswd-front
-    /// listener or no dnsd listener.
+    /// No kdc listener, no kpasswd-front listener or no dnsd listener.
     MissingListener,
     /// No internal network: ldap-front listens only inside the internal
     /// networks (docs/52 §7 R14; A-102 on docs/questions/Q-469 (b)).
     MissingInternalNetwork,
+    /// No IPv4 internal network: dird's `dns_registrable_networks` are the
+    /// IPv4 internal networks (phase 1 serves A records only — docs/54
+    /// §3.1, §5.5; docs/questions/Q-1003 item 1).
+    MissingIpv4InternalNetwork,
+    /// The DC's host name is not `<dc-name>.<zone>` with `<dc-name>` one LDH
+    /// label (the host-name rule of the zone — directory-pip `host_label`;
+    /// [MS-ADTS] 3.1.1.5.3.1.1.2): the zone projection would refuse the DC
+    /// (docs/questions/Q-994 item 6 (b)).
+    DcHostName,
+    /// No DC address: the zone cannot be served without the DC's A record
+    /// (docs/54 §3.1; the projection refuses a DC without one — task DN10b,
+    /// docs/questions/Q-1014).
+    MissingDcAddress,
+    /// A DC address is not an IPv4 address in the standard dotted form, is
+    /// listed twice, or there are more than eight (the host-record bound,
+    /// directory-pip `MAX_HOST_ADDRESSES`; phase 1 serves A records only —
+    /// docs/54 §3.1; task DN10b).
+    DcAddress,
+    /// A DC address is not registrable: loopback, unspecified, multicast, or
+    /// outside every IPv4 internal network (dird's registrable networks —
+    /// directory-pip `registrable`, the write checker's rule; docs/54 §5.5;
+    /// task DN10b).
+    DcAddressNotRegistrable,
 }
 
 /// An input error: the field (the command-line flag's name) and the rule.
@@ -368,6 +422,22 @@ impl fmt::Display for InputError {
             InputErrorKind::MissingInternalNetwork => {
                 "at least one internal network is required (LDAP listens only inside them)"
             }
+            InputErrorKind::MissingIpv4InternalNetwork => {
+                "at least one IPv4 internal network is required (the DNS zone's registrable networks)"
+            }
+            InputErrorKind::DcHostName => {
+                "the DC host name must be <dc-name>.<zone>, <dc-name> one letter-digit-hyphen label"
+            }
+            InputErrorKind::MissingDcAddress => {
+                "at least one DC address is required (the zone's A record of the DC)"
+            }
+            InputErrorKind::DcAddress => {
+                "a DC address must be a distinct IPv4 address in dotted form, at most eight"
+            }
+            InputErrorKind::DcAddressNotRegistrable => {
+                "a DC address must lie in an IPv4 internal network and not be loopback, \
+                 unspecified or multicast"
+            }
         };
         write!(f, "{}: {rule}", self.field)
     }
@@ -380,6 +450,9 @@ impl std::error::Error for InputError {}
 pub(crate) struct Checked {
     pub(crate) realm: Realm,
     pub(crate) naming_context: NamingContext,
+    /// The DC's addresses, parsed (their registrability is judged against
+    /// dird's parsed file by the plan — one network rule, crate config's).
+    pub(crate) dc_addresses: Vec<Ipv4Addr>,
 }
 
 /// A uid or gid that is neither 0 nor all-ones.
@@ -430,12 +503,59 @@ impl DomainInput {
         }
         self.check_accounts()?;
         self.check_names()?;
+        // Task DN10a (Q-994 item 6 (b)): the DC's host name passes the
+        // zone's host-name rule — the one function the write checker, the
+        // PIP and the zone projection use (directory-pip `host_label`) —
+        // or the projection refuses the DC (`DcName`) and no zone is served.
+        // Spec: [MS-ADTS] 3.1.1.5.3.1.1.2; RFC 1035 §2.3.1; docs/54 §5.3.
+        let dc_sam = computer_sam(&self.names.dc_name);
+        if host_label(&dc_sam, &self.dc_fqdn, &naming_context.dns_name()).is_none() {
+            return Err(InputError::new("dc-fqdn", InputErrorKind::DcHostName));
+        }
         self.check_paths()?;
         self.check_network()?;
+        let dc_addresses = self.dc_addresses()?;
         Ok(Checked {
             realm,
             naming_context,
+            dc_addresses,
         })
+    }
+
+    /// The DC's addresses (`--dc-address`, task DN10b): at least one, at
+    /// most `MAX_HOST_ADDRESSES`, each an IPv4 address written exactly as
+    /// the standard library prints it (one spelling per address, as crates/
+    /// config reads addresses — docs/50 §7.1), none twice. Whether each is
+    /// registrable needs the parsed internal networks: the plan judges it
+    /// against dird's own parsed file (`Plan::build`), so the rule and the
+    /// networks are the write checker's and dird's, not a copy here.
+    ///
+    /// # Errors
+    /// `dc-address`: [`InputErrorKind::MissingDcAddress`],
+    /// [`InputErrorKind::DcAddress`].
+    ///
+    /// Spec: docs/54 §3.1 (A only), §4.4 (≤ 8 addresses), §10 row DN13;
+    /// RFC 1035 §3.4.1; docs/questions/Q-619 item 7, Q-1003 item 3, Q-1014.
+    fn dc_addresses(&self) -> Result<Vec<Ipv4Addr>, InputError> {
+        let field = "dc-address";
+        let items = &self.network.dc_addresses;
+        if items.is_empty() {
+            return Err(InputError::new(field, InputErrorKind::MissingDcAddress));
+        }
+        if items.len() > directory_pip::MAX_HOST_ADDRESSES {
+            return Err(InputError::new(field, InputErrorKind::DcAddress));
+        }
+        let mut addresses: Vec<Ipv4Addr> = Vec::with_capacity(items.len());
+        for item in items {
+            let address: Ipv4Addr = item
+                .parse()
+                .map_err(|_| InputError::new(field, InputErrorKind::DcAddress))?;
+            if address.to_string() != *item || addresses.contains(&address) {
+                return Err(InputError::new(field, InputErrorKind::DcAddress));
+            }
+            addresses.push(address);
+        }
+        Ok(addresses)
     }
 
     /// uids: never 0 or all-ones, one per process (keyadm included); gids:
@@ -520,11 +640,15 @@ impl DomainInput {
             computer_name_ok(&n.change_password_service_name),
         )?;
         // The two service SPNs (docs/51 §4.3 step 5; A-73) pass the
-        // runtime's own SPN rule: `service "/" host`, host = the object's
-        // dNSHostName (the DC's FQDN), lower case, service not "krbtgt"
-        // (directory-admin `spn_ok`; Q-355 item 3) — the admin service's
-        // through `admin_service_spn_ok`, the same shape with the name that
-        // only its provisioning exception may carry (docs/questions/Q-541).
+        // runtime's own SPN shape: `service "/" host`, host = the object's
+        // dNSHostName (the DC's FQDN), lower case (directory-admin `spn_ok`;
+        // Q-355 item 3) — the admin service's through
+        // `admin_service_spn_ok`, the same shape with the name that only its
+        // provisioning exception may carry (docs/questions/Q-541). `spn_ok`
+        // judges the shape only: a reserved service name (`krbtgt/…` and the
+        // like) is refused by directory-admin's one checker on the folded
+        // key, at the write (task PN5; docs/questions/Q-1030 item 1, A-179)
+        // — provision's own SPN is `ldap/<fqdn>`, never a reserved one.
         let ldap_spn = format!("{LDAP_SERVICE_CLASS}/{}", self.dc_fqdn);
         let admin_spn = format!("{ADMIN_SERVICE_CLASS}/{}", self.dc_fqdn);
         if !spn_ok(&ldap_spn, &self.dc_fqdn) || !admin_service_spn_ok(&admin_spn, &self.dc_fqdn) {
@@ -605,10 +729,14 @@ impl DomainInput {
     /// directory, owned by the server's uid"); Q-230 item 16.
     fn check_paths(&self) -> Result<(), InputError> {
         let p = &self.paths;
-        let named: [(&'static str, &FilePath); 26] = [
+        let named: [(&'static str, &FilePath); 28] = [
             ("staging-dir", &p.staging),
             ("database-path", &p.database),
             ("integrity-key-path", &p.integrity_key),
+            // Task PN12 (docs/59 §7.4): the attestation key's two files —
+            // dird's and keyadm's — each its own path.
+            ("attestation-key-path", &p.attestation_key),
+            ("keyadm-attestation-key-path", &p.keyadm_attestation_key),
             ("policy-path", &p.policy),
             ("manifest-path", &p.manifest),
             ("audit-log-path", &p.audit_log),
@@ -686,21 +814,27 @@ impl DomainInput {
 
     /// Network items are non-empty and hold no list separator (they are
     /// written as `", "`-separated lists, crates/config); kdc needs a
-    /// listener, ldap-front at least one of LDAP / LDAPS, kpasswd-front and
-    /// dnsd one each, and at least one internal network (crates/config
-    /// re-checks every address, and that every listener of the four network
-    /// daemons lies in an internal network).
+    /// listener, kpasswd-front and dnsd one each, and at least one internal
+    /// network. crates/config re-checks every address, that every listener
+    /// of the four network daemons lies in an internal network, that the
+    /// advertised listeners are on their standard ports (`NonStandardPort`
+    /// — the kdc's, ldap-front's StartTLS, kpasswd-front's and dnsd's), and
+    /// that ldap-front has a StartTLS listener at all (`MissingKey` at
+    /// `ldap_listen`, task DN10d): those rules are the daemons' schemas',
+    /// applied by the plan's parse-back, with no copy here.
     /// Spec: docs/50 §4.1, §4.2, §7.1; docs/52 §7 R14; docs/53 R53-3, §3.3;
-    /// docs/54 §4.7.
+    /// docs/54 §3.1, §4.7; [MS-ADTS] §6.3.2.3; docs/questions/Q-1016 item 3
+    /// (A-176), Q-1024, Q-1025 items 1, 3 (A-178).
     fn check_network(&self) -> Result<(), InputError> {
         let n = &self.network;
-        let lists: [(&'static str, &Vec<String>); 6] = [
+        let lists: [(&'static str, &Vec<String>); 7] = [
             ("kdc-listen", &n.kdc_listen),
             ("ldap-listen", &n.ldap_listen),
             ("ldaps-listen", &n.ldaps_listen),
             ("internal-network", &n.internal_networks),
             ("kpasswd-listen", &n.kpasswd_listen),
             ("dnsd-listen", &n.dnsd_listen),
+            ("dc-address", &n.dc_addresses),
         ];
         for (field, items) in lists {
             if items
@@ -716,12 +850,11 @@ impl DomainInput {
                 InputErrorKind::MissingListener,
             ));
         }
-        if n.ldap_listen.is_empty() && n.ldaps_listen.is_empty() {
-            return Err(InputError::new(
-                "ldaps-listen",
-                InputErrorKind::MissingListener,
-            ));
-        }
+        // No StartTLS check here (task DN10d, A-178 on Q-1025 item 3): the
+        // rule "ldap-front listens for StartTLS on 389" is ldap-front's own
+        // schema's — the produced file carries `ldap_listen` only when it
+        // was given, and its parse-back refuses a file without it
+        // (`PlanError::Config(LdapFront, MissingKey)`), so one rule decides.
         // kpasswd-front's and dnsd's files require `listen` (crates/config
         // kpasswd_front.rs, dnsd.rs).
         for (field, items) in [
@@ -736,6 +869,15 @@ impl DomainInput {
             return Err(InputError::new(
                 "internal-network",
                 InputErrorKind::MissingInternalNetwork,
+            ));
+        }
+        // Task DN10a: dird's `dns_registrable_networks` are the IPv4
+        // internal networks (A records only — docs/54 §3.1, §5.5); dird's
+        // schema requires at least one.
+        if crate::configs::ipv4_networks(&n.internal_networks).is_empty() {
+            return Err(InputError::new(
+                "internal-network",
+                InputErrorKind::MissingIpv4InternalNetwork,
             ));
         }
         Ok(())

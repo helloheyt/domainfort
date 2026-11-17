@@ -45,7 +45,7 @@ use crate::callers::{CallerMap, CallerMapError};
 use crate::clock::{Clock, SystemClock};
 use crate::engine::{Engine, EngineError, EnginePanicked, EngineThread, IntentAckBudget};
 use crate::listener::{accept_loop, ServeContext};
-use crate::log::{note, Note};
+use crate::log::{audit_undelivered, note, Note};
 use crate::startup::development_keyd;
 use config::KeydSettings;
 use core::fmt;
@@ -486,20 +486,16 @@ where
     // R6): keyd's rule ends the wait early when auditd counts as unreachable
     // (A-87 kept it). What auditd did not acknowledge is lost with this
     // process (Q-252 item 9) — among it, perhaps, the outcome of a key-state
-    // change whose intent is in the log (A-86): say so, with the count.
+    // change whose intent is in the log (A-86): say so, with the count —
+    // and with every count never sent as a summary (a lost-outcome count
+    // among them; docs/questions/Q-990 item 4, A-166; Q-995).
     let unflushed = gate
         .close(AUDIT_FLUSH_GRACE, async {
             audit_task.abort();
             let _ = audit_task.await;
         })
-        .await
-        .events();
-    if unflushed > 0 {
-        note(
-            Note::AuditUnflushed,
-            Some(u64::try_from(unflushed).unwrap_or(u64::MAX)),
-        );
-    }
+        .await;
+    audit_undelivered(unflushed);
     // And the total of outcomes that never reached the window (A-86).
     let unrecorded = gate.unrecorded_outcomes();
     if unrecorded > 0 {

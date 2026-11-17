@@ -49,12 +49,19 @@
 //! 1. `now` past the expiry time → Notice of Disconnection ([MS-ADTS]
 //!    5.1.1.6: "the DC MUST NOT execute the LDAP request. Instead, the DC
 //!    MUST disconnect the connection and send a Notice of Disconnection");
-//! 2. the account, read again through the request's [`AccountSource`] by the
-//!    same exact name lookup the KDC uses (docs/49 §3.2, R47-1), must exist,
-//!    be usable now, not revoke the identity's authtime (`revoked_before`,
-//!    the RFC 4120 3.3.3.1 hot-list — docs/49 §3.2), and still carry the
-//!    SID bound at bind time; otherwise Notice of Disconnection. A failing
-//!    account source is a failure too (fail closed).
+//! 2. the account, read again through the request's ticket-subject lookup
+//!    ([`TicketSubjects`] — directory-pip's one lookup path in the
+//!    `TicketClient` context, the same exact name rule the KDC applies to an
+//!    AS client: docs/49 §3.2, R47-1; docs/59 §6.2, §6.4), must exist, be
+//!    usable now, not revoke the identity's authtime (`revoked_before`, the
+//!    RFC 4120 3.3.3.1 hot-list — docs/49 §3.2), and still carry the SID
+//!    bound at bind time; otherwise Notice of Disconnection. A failing
+//!    lookup is a failure too (fail closed).
+//!
+//! The re-check reads only the facts it uses (state, SID, groups, tier) and
+//! never the KDC's account source: those records carry dird's attested name
+//! resolution for keyd, which no LDAP session reads (task PN10b;
+//! docs/questions/Q-1047, A-187).
 //!
 //! The groups and tier of the request's PDP subject come from this fresh
 //! record, never from bind time. Both failures use `strongerAuthRequired`
@@ -67,8 +74,9 @@
 use core::time::Duration;
 use std::collections::BTreeSet;
 
+use directory_pip::TicketSubjects;
 use dtyp::Sid;
-use kdc::{AccountSource, NamedPrincipal};
+use kdc::NamedPrincipal;
 use krb_proto::KerberosTime;
 use parse_ldap::AuthState;
 use pdp::Tier;
@@ -121,7 +129,7 @@ pub(crate) enum Phase {
 pub(crate) struct BoundIdentity {
     /// The client principal keyd verified (crealm, cname).
     pub(crate) principal: NamedPrincipal,
-    /// The account SID read through the account source at bind time.
+    /// The account SID read through the ticket-subject lookup at bind time.
     pub(crate) sid: Sid,
     /// The ticket's authtime (hot-list check). Spec: RFC 4120 5.3.
     pub(crate) authtime: KerberosTime,
@@ -246,15 +254,16 @@ pub(crate) enum Recheck {
     Expired,
     /// The account is gone, unusable, revoked, or names another SID.
     Revoked,
-    /// The account source failed (fail closed).
+    /// The ticket-subject lookup failed (fail closed).
     Unavailable,
 }
 
 /// Re-check a bound identity for one request (module documentation).
-/// Spec: [MS-ADTS] 5.1.1.6; docs/49 §3.2, §4.4 (R49-15); RFC 4120 3.3.3.1.
+/// Spec: [MS-ADTS] 5.1.1.6; docs/49 §3.2, §4.4 (R49-15); RFC 4120 3.3.3.1;
+/// docs/59 §6.2 (`TicketClient`); docs/questions/Q-1047 (A-187).
 pub(crate) fn recheck(
     identity: &BoundIdentity,
-    accounts: &dyn AccountSource,
+    subjects: &dyn TicketSubjects,
     now: &KerberosTime,
 ) -> Recheck {
     // "where the current time exceeds the expiry time". Spec: [MS-ADTS]
@@ -262,7 +271,8 @@ pub(crate) fn recheck(
     if *now > identity.endtime {
         return Recheck::Expired;
     }
-    let account = match accounts.client(&identity.principal.realm, &identity.principal.name) {
+    let account = match subjects.ticket_subject(&identity.principal.realm, &identity.principal.name)
+    {
         Ok(Some(account)) => account,
         Ok(None) => return Recheck::Revoked,
         Err(_) => return Recheck::Unavailable,

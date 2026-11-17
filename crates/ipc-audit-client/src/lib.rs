@@ -33,7 +33,10 @@
 //! point that takes it by value cannot run before the acknowledgement
 //! (dird's `apply`, keyd's key-state changes, dird's decision
 //! registrations). [`AuditGate::close`] is the one bounded flush at stop
-//! ([`AUDIT_FLUSH_GRACE`], [`FlushWait`], [`Unflushed`]). The gate's link
+//! ([`AUDIT_FLUSH_GRACE`], [`FlushWait`]); its report, [`Unflushed`], holds
+//! the events auditd did not acknowledge and the counts that never left as
+//! a summary, read whole as [`Undelivered`] kinds (docs/questions/Q-990
+//! item 4, A-166; Q-995). The gate's link
 //! side — auditd reachable, the batch to send, auditd's `Ack`, a lost batch
 //! — is crate-private: only the one audit client (which verified the
 //! connection) drives it, so no code outside this crate can open a gate or
@@ -74,6 +77,6 @@ pub use client::{
     LinkedGate, AUDIT_DEADLINE, HEARTBEAT,
 };
 pub use gate::{
-    AckedIntent, AuditGate, FlushWait, IntentRecord, PendingIntent, Unflushed, WindowSteps,
-    AUDIT_FLUSH_GRACE, FLUSH_POLL,
+    AckedIntent, AuditGate, FlushWait, IntentRecord, PendingIntent, Undelivered, Unflushed,
+    WindowSteps, AUDIT_FLUSH_GRACE, FLUSH_POLL,
 };

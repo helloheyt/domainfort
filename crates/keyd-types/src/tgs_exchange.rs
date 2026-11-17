@@ -74,13 +74,19 @@ pub struct TgtContext {
 /// The KDC's request for a service ticket. keyd copies the client name,
 /// realm, authtime and transited field from the verified TGT (RFC 4120
 /// 3.3.3: by default these fields of the new ticket come from the TGT) and
-/// fills in the session key itself.
+/// fills in the session key itself. The service's key set is reached only
+/// through dird's attested name resolution of `sname`, which `issue_tgs_rep`
+/// takes beside the template (task PN11; docs/59 §7.2).
 ///
-/// Spec: docs/10 §5 (`tgs_template: TicketTemplate`); RFC 4120 3.3.3, 5.3.
+/// Spec: docs/10 §5 (`tgs_template: TicketTemplate`); RFC 4120 3.3.3, 5.3;
+/// docs/59 §7.2 step 5.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TgsTicketTemplate {
-    /// Service name; must equal the sname of the authenticated KDC-REQ-BODY
-    /// and must not be a TGS name.
+    /// Service name; must equal the sname of the authenticated KDC-REQ-BODY,
+    /// must be a name of the principal namespace (never a TGS name, in any
+    /// case — crate principal-names), and together with this realm must be
+    /// one of the two (realm, name) pairs of the service's attested name
+    /// resolution — as sent or canonical, exactly (docs/59 §7.2 step 5).
     pub sname: PrincipalName,
     /// Requested starttime; within the clock skew of now (no postdating).
     pub starttime: Option<KerberosTime>,

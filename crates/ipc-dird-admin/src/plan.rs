@@ -27,6 +27,7 @@
 //!   4 TicketsRevoked     kind:u8 {1 PasswordSet, 2 AccountUnusable}
 //!   5 ProtectedDataLoss  (none)
 //!   6 KeyDestruction     kvno:Option<u32>
+//!   7 NamesReleased      names:seq<bytes<2048>, 36>       (appended, task PN7)
 //! tier        := 0 Tier0 | 1 Tier1 | 2 Tier2 | 3 none (Untiered / unclassified)
 //! ```
 //!
@@ -37,10 +38,18 @@
 //! non-empty and strictly ascending, as are `gained` and `lost`, which are
 //! disjoint and not both empty; a `TierDelta` changes at least one tier;
 //! `PolicyReference` pairs `TierMap` with a tier 0-2 and `PolicyPrincipal`
-//! with 3; effects strictly ascending by their head (`tag ‖ parameters`) —
-//! so two effects never share a head; the whole encoding at most
-//! [`MAX_PLAN`] octets. `encode(decode(b)) == b` for every `b` that
-//! decodes.
+//! with 3; a `NamesReleased` names exactly one principal and a non-empty set
+//! of names, strictly ascending by octets, each a namespace key's form
+//! (printable ASCII without `A`-`Z` — the fold of docs/59 §4.2), and no
+//! principal or name is in two of them (a key has one holder, docs/59 §4.4
+//! N1); effects strictly ascending by their head (`tag ‖ parameters`) — so
+//! two effects never share a head; the whole encoding at most [`MAX_PLAN`]
+//! octets. `encode(decode(b)) == b` for every `b` that decodes.
+//!
+//! Tag 7 is appended to the closed table under layout 1 (no code reused or
+//! renumbered, every earlier plan keeps its octets and digest): a decoder
+//! that does not know it refuses the plan — fail closed (docs/questions/
+//! Q-1037).
 //!
 //! The effects group principals that share the same change: "these 41
 //! principals gain {G, P}" is one `MembershipDelta`, "these 40 go from
@@ -59,7 +68,10 @@
 //! docs/questions/Q-874 items 1-3, 7; docs/50 §3.3; FIPS 180-4 §6.2;
 //! PENDING-OWNER A-147.
 
-use crate::channel::{codes, MAX_NAME, MAX_PLAN, MAX_PLAN_EFFECTS, MAX_PLAN_PRINCIPALS, MAX_SID};
+use crate::channel::{
+    codes, MAX_NAME, MAX_PLAN, MAX_PLAN_EFFECTS, MAX_PLAN_PRINCIPALS, MAX_PLAN_RELEASED_NAME,
+    MAX_PLAN_RELEASED_NAMES, MAX_SID,
+};
 use core::fmt;
 use dtyp::{Guid, Sid};
 use ipc::{FrameLimit, Reader, Writer};
@@ -266,6 +278,31 @@ pub enum Effect {
         /// The accounts.
         principals: BTreeSet<Sid>,
     },
+    /// The principal-namespace keys this principal holds are released (task
+    /// PN7): the object is deleted, so every name it held — in every form
+    /// (sAMAccountName, a computer's base name, a userPrincipalName's local
+    /// part, an SPN, a host name) — is free for another object to take. A
+    /// ticket authenticated under one of them before stays refused for an
+    /// object that later takes the name (`revoked_before`; docs/59 §2, §9
+    /// S7).
+    NamesReleased {
+        /// The keys, as the namespace stores them: folded (docs/59 §4.2).
+        names: BTreeSet<String>,
+        /// The one principal that held them.
+        principals: BTreeSet<Sid>,
+    },
+}
+
+/// Whether `name` has a namespace key's form: non-empty printable ASCII
+/// without `A`-`Z` (docs/59 §4.2: printable octets 0x20-0x7E only, `A`-`Z`
+/// folded to `a`-`z`). Its length is the field's bound
+/// ([`MAX_PLAN_RELEASED_NAME`]).
+/// Spec: docs/59 §4.2, §4.6; docs/questions/Q-080 items 1-2.
+fn released_name_ok(name: &[u8]) -> bool {
+    !name.is_empty()
+        && name
+            .iter()
+            .all(|b| (0x20..=0x7E).contains(b) && !b.is_ascii_uppercase())
 }
 
 impl Effect {
@@ -278,7 +315,8 @@ impl Effect {
             | Effect::PolicyReference { principals, .. }
             | Effect::TicketsRevoked { principals, .. }
             | Effect::ProtectedDataLoss { principals }
-            | Effect::KeyDestruction { principals, .. } => principals,
+            | Effect::KeyDestruction { principals, .. }
+            | Effect::NamesReleased { principals, .. } => principals,
         }
     }
 
@@ -347,6 +385,18 @@ impl Effect {
                     .write_option(kvno.as_ref(), |w, k| w.write_u32(*k))
                     .map_err(enc)
             }
+            Effect::NamesReleased { names, .. } => {
+                writer
+                    .write_enum(codes::EFFECT_NAMES_RELEASED)
+                    .map_err(enc)?;
+                // A `BTreeSet<String>` iterates in ascending octet order.
+                let names: Vec<&String> = names.iter().collect();
+                writer
+                    .write_seq(&names, MAX_PLAN_RELEASED_NAMES, |w, n| {
+                        w.write_bytes(n.as_bytes(), MAX_PLAN_RELEASED_NAME)
+                    })
+                    .map_err(enc)
+            }
         }
     }
 
@@ -380,6 +430,16 @@ impl Effect {
                     return Err(PlanError::Malformed);
                 }
             }
+            Effect::NamesReleased { names, principals } => {
+                // One holder per key (docs/59 §4.4 N1): the names of one
+                // principal, never a set shared by several.
+                if principals.len() != 1
+                    || names.is_empty()
+                    || names.iter().any(|n| !released_name_ok(n.as_bytes()))
+                {
+                    return Err(PlanError::Malformed);
+                }
+            }
             Effect::TicketsRevoked { .. }
             | Effect::ProtectedDataLoss { .. }
             | Effect::KeyDestruction { .. } => {}
@@ -400,6 +460,7 @@ impl Effect {
                         | codes::EFFECT_TICKETS_REVOKED
                         | codes::EFFECT_PROTECTED_DATA_LOSS
                         | codes::EFFECT_KEY_DESTRUCTION
+                        | codes::EFFECT_NAMES_RELEASED
                 )
                 .then_some(c)
             })
@@ -465,6 +526,13 @@ impl Effect {
             codes::EFFECT_PROTECTED_DATA_LOSS => Effect::ProtectedDataLoss {
                 principals: read_sids(reader)?,
             },
+            codes::EFFECT_NAMES_RELEASED => {
+                let names = read_released_names(reader)?;
+                Effect::NamesReleased {
+                    names,
+                    principals: read_sids(reader)?,
+                }
+            }
             _ => {
                 let kvno = reader.read_option(Reader::read_u32).map_err(dec)?;
                 Effect::KeyDestruction {
@@ -520,6 +588,25 @@ fn read_sids(reader: &mut Reader<'_>) -> Result<BTreeSet<Sid>, PlanError> {
         .collect()
 }
 
+/// Read the names of a `NamesReleased`: at most [`MAX_PLAN_RELEASED_NAMES`],
+/// each at most [`MAX_PLAN_RELEASED_NAME`] octets of a key's form, strictly
+/// ascending by octets (module documentation).
+/// Spec: docs/50 §3.3 (one encoding per value); docs/59 §4.2, §4.6.
+fn read_released_names(reader: &mut Reader<'_>) -> Result<BTreeSet<String>, PlanError> {
+    let names = reader
+        .read_seq(MAX_PLAN_RELEASED_NAMES, |r| {
+            r.read_bytes(MAX_PLAN_RELEASED_NAME).map(<[u8]>::to_vec)
+        })
+        .map_err(|e| map_ipc(&e))?;
+    if names.windows(2).any(|w| w[0] >= w[1]) || names.iter().any(|n| !released_name_ok(n)) {
+        return Err(PlanError::Malformed);
+    }
+    names
+        .into_iter()
+        .map(|n| String::from_utf8(n).map_err(|_| PlanError::Malformed))
+        .collect()
+}
+
 /// An `ipc` error of the plan's codec: a bound exceeded is `TooLarge`, any
 /// other `Malformed`.
 fn map_ipc(error: &ipc::Error) -> PlanError {
@@ -556,8 +643,9 @@ impl EffectPlan {
     ///
     /// # Errors
     /// [`PlanError::Malformed`] when an effect breaks a canonical rule, two
-    /// effects share a head, two principals share a SID, or an effect names
-    /// a SID without a principal; [`PlanError::TooLarge`] beyond the bounds.
+    /// effects share a head, two principals share a SID, an effect names a
+    /// SID without a principal, or two `NamesReleased` effects share a
+    /// principal or a name; [`PlanError::TooLarge`] beyond the bounds.
     ///
     /// Spec: module documentation.
     pub fn new(
@@ -576,6 +664,20 @@ impl EffectPlan {
         let effects: Vec<Effect> = keyed.into_iter().map(|(_, e)| e).collect();
         if effects.len() > MAX_PLAN_EFFECTS as usize {
             return Err(PlanError::TooLarge);
+        }
+        // A key has one holder (docs/59 §4.4 N1): no principal and no name
+        // in two `NamesReleased` effects — so each released name has one
+        // spelling in the plan, beside the one principal that held it.
+        let mut holders: BTreeSet<&Sid> = BTreeSet::new();
+        let mut released: BTreeSet<&String> = BTreeSet::new();
+        for effect in &effects {
+            if let Effect::NamesReleased { names, principals } = effect {
+                if !principals.iter().all(|p| holders.insert(p))
+                    || !names.iter().all(|n| released.insert(n))
+                {
+                    return Err(PlanError::Malformed);
+                }
+            }
         }
         let named: BTreeSet<&Sid> = effects.iter().flat_map(Effect::sids).collect();
         let mut kept: Vec<(Vec<u8>, PlanPrincipal)> = Vec::new();

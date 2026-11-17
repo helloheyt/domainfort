@@ -9,7 +9,10 @@
 //! (`S-1-5-21-r1-r2-r3`), 2.4.4.1-2.4.4.3, 2.4.5, 2.4.6; [MS-ADTS]
 //! v20261026 3.1.1.5.2.4, 5.1.3.2, 6.1.3, 6.1.3.1; A-75, A-76, A-79, A-84
 //! (Q-335/Q-336: no INHERIT_ONLY, no CREATOR_*, no generic bit on the
-//! root), A-86, P-22. Fixtures: tests/common (obviously fake values).
+//! root), A-86, P-22; docs/59 §7.4, §10 (PN12) and docs/questions/Q-1011
+//! item 2 (A-173), Q-1048 item 1 (A-187) for the attestation key's draw and
+//! dird's `attestation_key_path`. Fixtures: tests/common (obviously fake
+//! values).
 
 mod common;
 
@@ -821,13 +824,98 @@ fn the_manifest_carries_the_directorys_salts() {
         .any(|l| l.starts_with("first_admin_salts = ")));
 }
 
-/// docs/CLEAN-ROOM.md: the plan's debug output never shows the integrity key.
+/// docs/CLEAN-ROOM.md: the plan's debug output never shows the integrity key —
+/// nor (task PN12) the attestation key: both appear only as their redacted
+/// placeholders.
 #[test]
 fn the_integrity_key_is_redacted_in_debug_output() {
     let dir = TempDir::new();
     let p = plan(&input(&dir, 61002, 61007));
     let debug = format!("{p:?}");
-    assert!(debug.contains("<redacted>"));
+    assert!(debug.contains("IntegrityKeyMaterial(<redacted>)"));
+    assert!(debug.contains("AttestationKeyOctets(<redacted>)"));
+}
+
+/// docs/59 §7.4; A-187 on docs/questions/Q-1048 item 1 (task PN12): dird's
+/// generated file names the attestation-key file — the input's
+/// `--attestation-key-path`, beside (and distinct from) the integrity key's —
+/// and parses back with dird's own schema, which requires the key; no
+/// configuration file carries anything of the key itself (A-60: paths only).
+#[test]
+fn dirds_file_names_the_attestation_key_file() {
+    let dir = TempDir::new();
+    let input = input(&dir, 61002, 61007);
+    let p = plan(&input);
+    let dird = p
+        .configs
+        .iter()
+        .find(|f| f.daemon == provision::Daemon::Dird)
+        .unwrap()
+        .text();
+    let line = format!(
+        "attestation_key_path = {}",
+        input.paths.attestation_key.as_str()
+    );
+    assert!(dird.lines().any(|l| l == line), "{dird}");
+    let settings = config::DirdSettings::parse(dird.as_bytes()).unwrap();
+    assert_eq!(
+        settings.attestation_key_path().as_str(),
+        input.paths.attestation_key.as_str()
+    );
+    assert_ne!(
+        settings.attestation_key_path().as_str(),
+        settings.integrity_key_path().as_str()
+    );
+    // keyadm's copy is named nowhere but on keyadm's command line (an
+    // operand, task PN9): keyadm's file names keyd only.
+    for file in &p.configs {
+        assert!(
+            !file
+                .text()
+                .contains(input.paths.keyadm_attestation_key.as_str()),
+            "{:?}",
+            file.daemon
+        );
+    }
+}
+
+/// The attestation key's carrier refuses all zeros (ipc-keyd
+/// `AttestationKeyOctets`), so a source whose 16th fill — the attestation
+/// key's, the last draw — is all zero is broken: the plan stops
+/// (`RandomUnusable`, like a zero node id), before anything is written.
+/// Source: docs/59 §7.4 (task PN12); A-173 (the key is drawn at random);
+/// docs/CLEAN-ROOM.md (fail closed).
+#[test]
+fn an_all_zero_attestation_key_draw_stops_the_plan() {
+    struct ZeroAt {
+        zero_at: u64,
+        inner: CountingRandom,
+    }
+    impl directory_admin::RandomSource for ZeroAt {
+        fn fill(&mut self, out: &mut [u8]) -> Result<(), directory_admin::RandomError> {
+            self.inner.fill(out)?;
+            if self.inner.fills == self.zero_at {
+                out.fill(0);
+            }
+            Ok(())
+        }
+    }
+    let dir = TempDir::new();
+    let i = input(&dir, 61002, 61007);
+    let mut rng = ZeroAt {
+        zero_at: 16,
+        inner: CountingRandom::default(),
+    };
+    assert_eq!(
+        Plan::build(&i, now(), &mut rng).unwrap_err(),
+        PlanError::RandomUnusable
+    );
+    assert_eq!(rng.inner.fills, 16);
+    // The same source without the zero fill builds a plan: the 16th fill is
+    // the attestation key's, and the last.
+    let mut counting = CountingRandom::default();
+    Plan::build(&i, now(), &mut counting).unwrap();
+    assert_eq!(counting.fills, 16);
 }
 
 fn refused(input: &provision::DomainInput) -> PlanError {
@@ -981,10 +1069,175 @@ fn the_fronts_files_parse_and_name_dird_and_auditd() {
     for key in provision::configs::DIRD_KPASSWD_CHANNEL_KEYS {
         assert!(dird_text.contains(&format!("\n{key} = ")), "{key}");
     }
-    // dird does not serve `dird-dns.sock` before task DN10: its file names
-    // no DNS key (docs/questions/Q-973).
-    assert!(!dird_text.contains("dns_socket"));
-    assert!(!dird_text.contains("dnsd_uid"));
+    // Task DN10a (docs/54 §4.6; docs/questions/Q-973 item 6, Q-1003 item
+    // 1): dird serves `dird-dns.sock` — the very path dnsd's file names — to
+    // dnsd's uid only, with the zone values of its image.
+    let dns = dird.dns_service().expect("the DNS channel");
+    assert_eq!(dns.channel().socket(), dnsd.dird().socket());
+    assert_eq!(dns.channel().peer_uid(), dnsd.run_as().uid());
+    for key in provision::configs::DIRD_DNS_CHANNEL_KEYS {
+        assert!(dird_text.contains(&format!("\n{key} = ")), "{key}");
+    }
+    // The registrable networks: the IPv4 internal networks (A records only
+    // — docs/54 §3.1): of 10.0.0.0/8 and 127.0.0.0/8, both.
+    assert_eq!(
+        dns.registrable_networks(),
+        dnsd.internal_networks(),
+        "every internal network of the input is IPv4"
+    );
+    // RNAME = hostmaster.<zone> (RFC 1035 §8); the timers of RFC 1035 §5.3's
+    // example; the TTLs; dns_record_max_age keeps the schema's default.
+    assert_eq!(dns.soa().rname(), "hostmaster.example.test");
+    assert_eq!(
+        [
+            dns.soa().refresh(),
+            dns.soa().retry(),
+            dns.soa().expire(),
+            dns.soa().minimum()
+        ],
+        [7200, 600, 3_600_000, 60]
+    );
+    assert_eq!(dns.infrastructure_ttl(), 3600);
+    assert_eq!(dns.host_ttl(), 600);
+    assert_eq!(dns.record_max_age().as_secs(), 7 * 24 * 60 * 60);
+    assert!(!dird_text.contains("dns_record_max_age"));
+}
+
+/// Task DN10a (docs/54 §3.1, §5.3, §5.5; docs/questions/Q-994 item 6 (b),
+/// Q-1003 item 1): the DC's host name must be `<dc-name>.<zone>` (the zone's
+/// host-name rule, compared without case), and at least one internal network
+/// must be IPv4 (dird's registrable networks); otherwise nothing is built.
+/// An IPv6 internal network beside an IPv4 one stays internal but is not
+/// registrable.
+#[test]
+fn the_dc_host_name_and_an_ipv4_internal_network_are_required() {
+    let dir = TempDir::new();
+    let base = input(&dir, 61002, 61007);
+    for fqdn in ["dc2.example.test", "dc1.other.test", "dc1.sub.example.test"] {
+        let mut i = base.clone();
+        i.dc_fqdn = fqdn.to_owned();
+        let err = Plan::build(&i, now(), &mut CountingRandom::default()).unwrap_err();
+        assert_eq!(
+            err,
+            PlanError::Input(provision::input::InputError {
+                field: "dc-fqdn",
+                kind: InputErrorKind::DcHostName
+            }),
+            "{fqdn}"
+        );
+    }
+    // Case does not matter (RFC 1035 §2.3.3): DC1 / dc1.example.test is the
+    // base input itself.
+    assert!(Plan::build(&base, now(), &mut CountingRandom::default()).is_ok());
+
+    let mut v6 = base.clone();
+    v6.network.internal_networks = vec!["::1/128".to_owned()];
+    v6.network.kdc_listen = vec!["[::1]:88".to_owned()];
+    v6.network.ldap_listen = vec!["[::1]:389".to_owned()];
+    v6.network.ldaps_listen = vec!["[::1]:636".to_owned()];
+    v6.network.kpasswd_listen = vec!["[::1]:464".to_owned()];
+    v6.network.dnsd_listen = vec!["[::1]:53".to_owned()];
+    let err = Plan::build(&v6, now(), &mut CountingRandom::default()).unwrap_err();
+    assert_eq!(
+        err,
+        PlanError::Input(provision::input::InputError {
+            field: "internal-network",
+            kind: InputErrorKind::MissingIpv4InternalNetwork
+        })
+    );
+
+    let mut mixed = base.clone();
+    mixed
+        .network
+        .internal_networks
+        .push("fd00:1234::/32".to_owned());
+    let p = Plan::build(&mixed, now(), &mut CountingRandom::default()).unwrap();
+    let dird_text = p
+        .configs
+        .iter()
+        .find(|f| f.daemon == provision::Daemon::Dird)
+        .unwrap()
+        .text();
+    let dird = config::DirdSettings::parse(dird_text.as_bytes()).unwrap();
+    assert_eq!(dird.dns_service().unwrap().registrable_networks().len(), 2);
+}
+
+/// Task DN10b (docs/54 §3.1 — the DC's A record "written in `provision
+/// domain` only", §4.4 — at most 8 addresses, §5.5 — registrable; §10 row
+/// DN13 `--dc-address`; docs/questions/Q-1003 item 3, Q-1014): the planned
+/// DC object carries its addresses as the internal host-address attribute
+/// (4 octets each, RFC 1035 §3.4.1); and the plan refuses, naming the flag,
+/// no address, one not in the standard dotted IPv4 form, one twice, more
+/// than eight, and one that is not registrable — loopback (even inside the
+/// internal network 127.0.0.0/8), unspecified, multicast, or outside every
+/// IPv4 internal network. The session's networks are dird's parsed
+/// `dns_registrable_networks`. Addresses are hand-made test data.
+#[test]
+fn the_dc_addresses_are_planned_and_checked() {
+    let dir = TempDir::new();
+    let base = input(&dir, 61002, 61007);
+    let p = plan(&base);
+    let dc = p.object(ObjectRole::DcComputer).unwrap();
+    assert_eq!(
+        dc.attributes
+            .iter()
+            .find(|(id, _)| *id == directory_pip::HOST_ADDRESS)
+            .map(|(_, values)| values.clone()),
+        Some(vec![vec![10, 0, 0, 10]])
+    );
+    assert_eq!(
+        p.dns_registration
+            .networks()
+            .iter()
+            .map(|n| (n.address().to_string(), n.prefix_len()))
+            .collect::<Vec<_>>(),
+        [("10.0.0.0".to_owned(), 8), ("127.0.0.0".to_owned(), 8)]
+    );
+    // No other planned object holds a host address.
+    assert!(p
+        .objects
+        .iter()
+        .filter(|o| o.role != ObjectRole::DcComputer)
+        .all(|o| o
+            .attributes
+            .iter()
+            .all(|(id, _)| *id != directory_pip::HOST_ADDRESS)));
+
+    let refused = |addresses: &[&str], kind: InputErrorKind| {
+        let mut i = base.clone();
+        i.network.dc_addresses = addresses.iter().map(|a| (*a).to_owned()).collect();
+        assert_eq!(
+            Plan::build(&i, now(), &mut CountingRandom::default()).unwrap_err(),
+            PlanError::Input(provision::input::InputError {
+                field: "dc-address",
+                kind
+            }),
+            "{addresses:?}"
+        );
+    };
+    refused(&[], InputErrorKind::MissingDcAddress);
+    for malformed in ["10.0.0.010", "10.0.0", "10.0.0.256", "fd00::1", "dc1"] {
+        refused(&[malformed], InputErrorKind::DcAddress);
+    }
+    refused(&["10.0.0.10", "10.0.0.10"], InputErrorKind::DcAddress);
+    let nine: Vec<String> = (1..=9).map(|k| format!("10.0.0.{k}")).collect();
+    let nine: Vec<&str> = nine.iter().map(String::as_str).collect();
+    refused(&nine, InputErrorKind::DcAddress);
+    for unregistrable in ["127.0.0.1", "0.0.0.0", "224.0.0.1", "192.0.2.10"] {
+        refused(&[unregistrable], InputErrorKind::DcAddressNotRegistrable);
+    }
+    // Eight distinct registrable addresses are the bound, not over it.
+    let mut eight = base.clone();
+    eight.network.dc_addresses = (1..=8).map(|k| format!("10.0.0.{k}")).collect();
+    let p = plan(&eight);
+    let values = p
+        .object(ObjectRole::DcComputer)
+        .unwrap()
+        .attributes
+        .iter()
+        .find(|(id, _)| *id == directory_pip::HOST_ADDRESS)
+        .map(|(_, values)| values.len());
+    assert_eq!(values, Some(8));
 }
 
 /// Task K9 — the fronts' listeners lie inside the internal networks
@@ -1040,6 +1293,122 @@ fn a_front_listener_outside_the_internal_networks_or_missing_is_refused() {
             other => panic!("{other:?}"),
         }
     }
+}
+
+/// Task DN10c (docs/questions/Q-1016 item 3, decision A-176 option (a);
+/// Q-1024) and task DN10d (A-178 on Q-1025 item 3): the zone advertises
+/// `_ldap._tcp` on port 389 ([MS-ADTS] §6.3.2.3; docs/54 §3.1), so a
+/// StartTLS listener is required — by ldap-front's own schema, the one
+/// rule: without one, LDAPS listeners notwithstanding, the plan's
+/// parse-back of the produced file refuses it before anything is built
+/// (`PlanError::Config(LdapFront, MissingKey)` at `ldap_listen`, the file
+/// carrying no `ldap_listen` line); with one, LDAPS is optional and the
+/// file carries `ldap_listen`. Addresses are test data.
+#[test]
+fn a_starttls_listener_is_required() {
+    let dir = TempDir::new();
+    let base = input(&dir, 61002, 61007);
+    let mut ldaps_only = base.clone();
+    ldaps_only.network.ldap_listen.clear();
+    assert!(!ldaps_only.network.ldaps_listen.is_empty());
+    let mut neither = ldaps_only.clone();
+    neither.network.ldaps_listen.clear();
+    for i in [&ldaps_only, &neither] {
+        match refused(i) {
+            PlanError::Config(daemon, error) => {
+                assert_eq!(daemon, provision::Daemon::LdapFront);
+                assert_eq!(error.kind(), config::ErrorKind::MissingKey);
+                assert_eq!(error.key(), Some("ldap_listen"));
+                assert_eq!(
+                    PlanError::Config(daemon, error).to_string(),
+                    "generated ldap-front configuration refused: configuration key \
+                     `ldap_listen`: required key is missing"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    let files = provision::configs::domain_configs(&ldaps_only, &dirstore::NodeId([7; 16]));
+    let front = files
+        .iter()
+        .find(|f| f.daemon == provision::Daemon::LdapFront)
+        .unwrap()
+        .text();
+    assert!(!front.lines().any(|l| l.starts_with("ldap_listen")));
+    assert!(front.lines().any(|l| l.starts_with("ldaps_listen = ")));
+
+    let mut starttls_only = base.clone();
+    starttls_only.network.ldaps_listen.clear();
+    let p = plan(&starttls_only);
+    let text = p
+        .configs
+        .iter()
+        .find(|f| f.daemon == provision::Daemon::LdapFront)
+        .unwrap()
+        .text();
+    let front = config::LdapFrontSettings::parse(text.as_bytes()).unwrap();
+    assert_eq!(front.ldap_listen(), ["127.0.0.1:389".parse().unwrap()]);
+    assert!(front.ldaps_listen().is_empty());
+    assert!(text.lines().any(|l| l == "ldap_listen = 127.0.0.1:389"));
+    assert!(!text.lines().any(|l| l.starts_with("ldaps_listen")));
+}
+
+/// Task DN10c (docs/questions/Q-1016 item 4, decision A-176 option (a);
+/// Q-1024) and task DN10d (A-178 on Q-1025 item 1): the listeners the zone
+/// advertises take only their standard port (RFC 4120 §7.2.3.2: 88;
+/// [MS-ADTS] §6.3.2.3: 389, 464; RFC 1035 §4.2: 53 for the name server the
+/// NS record names — crates/config `StandardPort`). One on another port
+/// fails the parse-back by the daemon's own schema (`NonStandardPort` at
+/// its listener key) — the one rule, not a copy in provision; LDAPS (no SRV
+/// record) keeps any port. Addresses are test data.
+#[test]
+fn an_advertised_listener_on_another_port_is_refused() {
+    let dir = TempDir::new();
+    let base = input(&dir, 61002, 61007);
+    for (daemon, key, change) in [
+        (
+            provision::Daemon::Kdc,
+            "listen",
+            Box::new(|i: &mut provision::DomainInput| {
+                i.network.kdc_listen = vec!["127.0.0.1:1088".to_owned()];
+            }) as Box<dyn Fn(&mut provision::DomainInput)>,
+        ),
+        (
+            provision::Daemon::LdapFront,
+            "ldap_listen",
+            Box::new(|i: &mut provision::DomainInput| {
+                i.network.ldap_listen = vec!["127.0.0.1:3389".to_owned()];
+            }),
+        ),
+        (
+            provision::Daemon::KpasswdFront,
+            "listen",
+            Box::new(|i: &mut provision::DomainInput| {
+                i.network.kpasswd_listen = vec!["127.0.0.1:88".to_owned()];
+            }),
+        ),
+        (
+            provision::Daemon::Dnsd,
+            "listen",
+            Box::new(|i: &mut provision::DomainInput| {
+                i.network.dnsd_listen = vec!["127.0.0.1:5353".to_owned()];
+            }),
+        ),
+    ] {
+        let mut i = base.clone();
+        change(&mut i);
+        match refused(&i) {
+            PlanError::Config(refused_daemon, error) => {
+                assert_eq!(refused_daemon, daemon);
+                assert_eq!(error.kind(), config::ErrorKind::NonStandardPort);
+                assert_eq!(error.key(), Some(key));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    let mut ldaps_elsewhere = base.clone();
+    ldaps_elsewhere.network.ldaps_listen = vec!["127.0.0.1:6360".to_owned()];
+    assert!(Plan::build(&ldaps_elsewhere, now(), &mut CountingRandom::default()).is_ok());
 }
 
 fn input_kind(e: PlanError) -> InputErrorKind {
@@ -1255,6 +1624,26 @@ fn shared_paths_and_socket_directories_are_refused() {
     let mut i = input(&dir, 61002, 61007);
     i.paths.dnsd_config = i.paths.kpasswd_front_config.clone();
     assert_eq!(input_kind(refused(&i)), InputErrorKind::DuplicatePath);
+    // Task PN12 (docs/59 §7.4; A-129: "never the dirstore integrity key"):
+    // the attestation key's two files are distinct targets — from each
+    // other, from the integrity key's file, and outside the staging
+    // directory.
+    for change in [
+        |i: &mut provision::DomainInput| i.paths.attestation_key = i.paths.integrity_key.clone(),
+        |i: &mut provision::DomainInput| {
+            i.paths.keyadm_attestation_key = i.paths.attestation_key.clone();
+        },
+        |i: &mut provision::DomainInput| {
+            i.paths.keyadm_attestation_key = i.paths.integrity_key.clone();
+        },
+    ] {
+        let mut i = input(&dir, 61002, 61007);
+        change(&mut i);
+        assert_eq!(input_kind(refused(&i)), InputErrorKind::DuplicatePath);
+    }
+    let mut i = input(&dir, 61002, 61007);
+    i.paths.keyadm_attestation_key = path(&dir, "etc/provision-staging/keyadm.key");
+    assert_eq!(input_kind(refused(&i)), InputErrorKind::DuplicatePath);
 }
 
 /// A-15 / A-77: a CSPRNG failure at any draw stops the plan; a broken
@@ -1263,8 +1652,9 @@ fn shared_paths_and_socket_directories_are_refused() {
 fn a_csprng_failure_stops_the_plan() {
     let dir = TempDir::new();
     let i = input(&dir, 61002, 61007);
-    // 1 SID draw + 11 GUIDs + node id + key = 14 fills.
-    for fail_at in 1..=14 {
+    // 1 SID draw + 12 GUIDs + node id + integrity key + attestation key
+    // (task PN12) = 16 fills.
+    for fail_at in 1..=16 {
         let mut rng = FailingRandom {
             fail_at,
             inner: CountingRandom::default(),

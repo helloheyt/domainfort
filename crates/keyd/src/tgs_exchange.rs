@@ -38,10 +38,23 @@
 //! requests"; docs/questions/Q-124). The armor key, the strengthen key and the
 //! reply key never leave keyd (docs/48 §2.2, A-33).
 //!
-//! Spec: RFC 4120 3.2.3, 3.3.2, 3.3.3, 5.2.7.1, 5.4.1, 5.4.2, 5.5.1, 7.3,
-//! 7.5.1; RFC 6113 5.1, 5.4.1.1, 5.4.2, 5.4.3, 6.2, 8; docs/10 §5, §8, D33;
-//! docs/30 §3, §7; docs/48 §3.2, §5; docs/questions/Q-121, Q-122, Q-124
-//! (A-32), Q-150.
+//! **The service key only through dird's attested name resolution** (task
+//! PN11; docs/59 §7.2): `issue_tgs_rep` verifies the resolution the KDC
+//! forwarded with the service's account record and reaches the service key
+//! set only through the door `store::bound_by`, which looks the set up by
+//! the resolution and requires its binding and the template's sname to be
+//! the resolution's. The request names the service key set nowhere else —
+//! no handle travels beside the resolution (task PN11b; docs/questions/
+//! Q-1067: "one request states one fact twice" made unrepresentable). The
+//! TGT is opened under the krbtgt reached by its exact stored binding
+//! (`StoredKeySet::ticket_granting`). The client needs no resolution: it is
+//! the TGT's, which keyd sealed (docs/questions/Q-1011 item 7).
+//!
+//! Spec: RFC 4120 3.2.3, 3.3.2, 3.3.3, 5.2.7.1, 5.4.1, 5.4.2, 5.5.1, 6.2,
+//! 7.3, 7.5.1; RFC 6113 5.1, 5.4.1.1, 5.4.2, 5.4.3, 6.2, 8; docs/10 §5, §8,
+//! D33; docs/30 §3, §7; docs/48 §3.2, §5; docs/59 §7.1, §7.2;
+//! docs/questions/Q-121, Q-122, Q-124 (A-32), Q-150, Q-1011 (A-173),
+//! Q-1067.
 
 use crate::as_exchange::token_deny;
 use crate::audit::{AuditReason, AuditSink};
@@ -55,24 +68,27 @@ use crate::error::{AuthnError, Deny, Internal, IssueError};
 use crate::fast_armor::{
     open_armored_request, seal_fast_reply, seal_strengthened, ticket_armor_key, ArmoredConversation,
 };
-use crate::keyd::{draw, new_random_key, seal, AuditFields, Keyd};
+use crate::keyd::{admit_resolved, draw, new_random_key, seal, AuditFields, Keyd};
 use crate::model::KeyHandle;
 use crate::replay::{ReplayKey, ReplayRefusal};
-use crate::store::{KeyStore, KeyVersion};
-use crate::template::{check_times, is_tgs_name, tgs_name, tgs_ticket_flags, TemplateTimes};
+use crate::store::{bound_by, KeyStore, KeyVersion};
+use crate::template::{check_times, tgs_name, tgs_ticket_flags, TemplateTimes};
 use crate::time::{kerberos_time_seconds, within_skew};
 use crate::tokens::{CtxId, TOKEN_ID_LENGTH};
 use crate::usage::{
     TGS_REP_ENC_PART_SESSION_KEY, TGS_REP_ENC_PART_SUBKEY, TGS_REQ_AUTHENTICATOR,
     TGS_REQ_AUTHENTICATOR_CKSUM, TICKET_ENC_PART,
 };
-use keyd_types::{TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext};
+use keyd_types::{
+    AttestedNameResolution, TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext,
+};
 use krb_crypto::{ChecksumType, EncType, ProtocolKey};
 use krb_proto::{
     ApOptions, ApReq, Authenticator, EncKdcRepPart, EncTgsRepPart, EncTicketPart, EncryptedData,
     EncryptionKey, KdcReqBody, KerberosTime, KeyValue, KrbFastReq, LastReq, PrincipalName, Realm,
     Ticket, TicketFlags, TransitedEncoding,
 };
+use principal_names::{key_of_request, RequestKey};
 use zeroize::Zeroizing;
 
 // The argument and result types of this exchange (`TgsFastRequest`,
@@ -540,9 +556,10 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// shared by `open_and_verify_tgt` (PA-TGS-REQ, `authenticator_usage`
     /// 7) and `open_fast_armor` (armor AP-REQ, usage 11):
     /// 4. the ticket is this realm's TGT (realm, sname krbtgt/realm), and the
-    ///    krbtgt key set is bound to krbtgt/realm (Q-040, A-19) — RFC 6113
-    ///    5.4.1.1 "The server name field of the armor ticket MUST identify
-    ///    the TGS of the target realm";
+    ///    krbtgt key set is bound to krbtgt/realm (Q-040, A-19; the krbtgt's
+    ///    door, `StoredKeySet::ticket_granting`) — RFC 6113 5.4.1.1 "The
+    ///    server name field of the armor ticket MUST identify the TGS of the
+    ///    target realm";
     /// 5. decrypt the ticket under krbtgt (kvno-selected, else current then
     ///    previous), usage 2; decode EncTicketPart; the kvno goes to audit;
     /// 6. client realm is this realm; no INVALID flag; no authorization-data
@@ -574,13 +591,14 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             return Err(Deny::denied(AuditReason::NotLocalTgt));
         }
         // Name binding (Q-040, A-19): the krbtgt key is used only through the
-        // proof that it is bound to the ticket's sname — this realm's TGS name
-        // (RFC 4120 7.3), checked above (crate::store, R7).
+        // proof that it is a krbtgt key set bound to this realm's TGS name —
+        // the ticket's sname, checked above (RFC 4120 7.3; crate::store, R7,
+        // "The doors").
         let bound = self
             .store
             .get(krbtgt)
             .ok_or(Deny::denied(AuditReason::KeyNotFound))?
-            .bound_to(&tgt.realm, &tgt.sname)?;
+            .ticket_granting(realm)?;
 
         // 5-7. Decrypt under krbtgt, then the ticket and the authenticator.
         self.open_ap_req(bound.versions(), ap_req, authenticator_usage, now_s, fields)
@@ -725,7 +743,9 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// `issue_tgs_rep`: consume `ctx` and issue a service ticket — armored
     /// when the context was opened with FAST.
     ///
-    /// 1. authorize and admit (Kdc; service handle Service);
+    /// 1. authorize and admit (Kdc; the role and the hold-down — the
+    ///    request names the service key set only through its resolution,
+    ///    task PN11b);
     /// 2. the context: live and issued to this caller (`Denied` otherwise;
     ///    destroyed either way). A context opened without FAST is consumed
     ///    now, whatever follows (unchanged). An ARMORED context is consumed
@@ -734,15 +754,23 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     ///    `seal_fast_error(Tgs(ctx))` — the rule A-42 set for the AS armor
     ///    (docs/questions/Q-145 item 3), applied to the TGS conversation
     ///    (docs/questions/Q-150);
-    /// 3. armored: template.sname and template.nonce are the INNER request's
+    /// 3. dird's service resolution verifies (tag, realm, 30 s on keyd's
+    ///    clock — `Denied`: `AttestationKeyMissing`, `NameResolutionInvalid`,
+    ///    `WrongRealm`, `NameResolutionStale`; task PN11, docs/59 §7.2), and
+    ///    the key set it names is a service's — Service or AdminService, the
+    ///    capability table's slot (`Denied`, `PurposeMismatch`; task PN11b);
+    ///    armored: template.sname and template.nonce are the INNER request's
     ///    stored ones (`Denied`, docs/48 §3.4, §9.2 item 7); then, for every
     ///    context, validate the template (`BadTemplate`): sname equals the
-    ///    authenticated request's sname and is not a TGS name; nonce equals
-    ///    the request nonce; enctype configured; flags (mask, RFC 4120 2.1 /
-    ///    5.4.1 TGT rules); times within policy, endtime and renew-till not
-    ///    beyond the TGT's (RFC 4120 3.3.3); the service key set's name
-    ///    binding must identify template.sname in this realm (`Denied`, Q-040
-    ///    A-19);
+    ///    authenticated request's sname and is a name of the principal
+    ///    namespace — never a TGS name, in any case (crate principal-names;
+    ///    C49); nonce equals the request nonce; enctype configured; flags
+    ///    (mask, RFC 4120 2.1 / 5.4.1 TGT rules); times within policy,
+    ///    endtime and renew-till not beyond the TGT's (RFC 4120 3.3.3); the
+    ///    service key set is the one the verified resolution names — the
+    ///    door `store::bound_by` looks it up by the resolution — and its
+    ///    binding and template.sname in this realm are the resolution's
+    ///    (`Denied`, `KeyNotFound` / `NameResolutionMismatch`; Q-040 A-19);
     /// 4. draw a fresh session key;
     /// 5. EncTicketPart — client name, realm, authtime, transited carried
     ///    over from the TGT — sealed under the CURRENT service key, usage 2;
@@ -759,17 +787,21 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     /// never leave keyd (docs/48 §2.2, §9.1 I1).
     ///
     /// Spec: docs/10 §5 (issue_tgs_rep), §8; docs/48 §2.3, §3.4, §5.2; RFC
-    /// 4120 3.3.3, 5.3, 5.4.2, 7.5.1 (usages 2, 8, 9); RFC 6113 5.4.3, 6.2;
-    /// docs/questions/Q-121, Q-122 (A-32), Q-150.
+    /// 4120 3.3.3, 5.3, 5.4.2, 6.2, 7.3, 7.5.1 (usages 2, 8, 9); RFC 6113
+    /// 5.4.3, 6.2; docs/questions/Q-121, Q-122 (A-32), Q-150; docs/10 §2
+    /// (b); docs/59 §7.1, §7.2; docs/questions/Q-1009 item 1, Q-1011 items
+    /// 4, 7, 8 (A-173), Q-1067.
     pub fn issue_tgs_rep(
         &mut self,
         caller: &CallerId,
-        service: &KeyHandle,
+        service: &AttestedNameResolution,
         ctx: &CtxId,
         template: &TgsTicketTemplate,
         now: &KerberosTime,
     ) -> Result<TgsRepParts, IssueError> {
-        let mut fields = AuditFields::for_handle(service);
+        // The record names the service's key set once keyd verified the
+        // resolution that names it — never from an unverified field.
+        let mut fields = AuditFields::default();
         let result = self.issue_tgs_rep_inner(caller, service, ctx, template, now, &mut fields);
         self.emit(caller, Operation::IssueTgsRep, now, &fields, &result);
         result.map_err(IssueError::from)
@@ -778,18 +810,16 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
     fn issue_tgs_rep_inner(
         &mut self,
         caller: &CallerId,
-        service: &KeyHandle,
+        service: &AttestedNameResolution,
         ctx: &CtxId,
         template: &TgsTicketTemplate,
         now: &KerberosTime,
         fields: &mut AuditFields,
     ) -> Internal<TgsRepParts> {
-        self.admit(
-            caller,
-            Operation::IssueTgsRep,
-            &[(HandleSlot::Primary, service)],
-            now,
-        )?;
+        // The role and the hold-down; the service key set has no handle in
+        // the request — its purpose is checked once its resolution is
+        // verified (step 3; task PN11b).
+        self.admit(caller, Operation::IssueTgsRep, &[], now)?;
         let now_s = kerberos_time_seconds(now);
 
         // 2. The context (I4): an unarmored one is consumed now; an armored
@@ -810,7 +840,21 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
             )
         };
 
-        // 3. The checks that may refuse, on the consumed (unarmored) or the
+        // 3. dird's resolution of the service, verified on keyd's clock
+        // before any key is touched (docs/59 §7.2 steps 1-3; task PN11) —
+        // after the context step, so an unarmored context is consumed and an
+        // armored one stays live for the armored error whatever it says. The
+        // key set it names is the only one the request names (task PN11b):
+        // its purpose must be a service's, by the capability table's slot
+        // (docs/10 §2 (b)).
+        let resolution = self.verify_name_resolution(service, now)?;
+        let service_handle = resolution.handle();
+        fields.principal = Some(service_handle.principal);
+        fields.purpose = Some(service_handle.purpose);
+        admit_resolved(Operation::IssueTgsRep, HandleSlot::Primary, &service_handle)?;
+        let names = self.name_context()?;
+
+        // The checks that may refuse, on the consumed (unarmored) or the
         // still-live (armored) entry.
         let (flags, version, service_key) = {
             let entry: &ContextEntry = match &consumed {
@@ -830,8 +874,16 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
                 return Err(Deny::denied(AuditReason::FastBindingMismatch));
             }
 
-            // The template.
-            if is_tgs_name(&template.sname) || entry.req_sname.as_ref() != Some(&template.sname) {
+            // The template. A service ticket names a principal of the
+            // namespace: a TGS name in any case (`KRBTGT/…`), a realm alias
+            // or a malformed name gives no namespace key (crate
+            // principal-names — the one equivalence, C49; RFC 4120 §6.2
+            // "reserved", §7.3).
+            let namespace_name = matches!(
+                key_of_request(&template.sname, &self.config.realm, &names),
+                RequestKey::Key(_)
+            );
+            if !namespace_name || entry.req_sname.as_ref() != Some(&template.sname) {
                 return Err(Deny::bad_template(AuditReason::TemplateNames));
             }
             if template.nonce != entry.req_nonce {
@@ -867,19 +919,20 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
                 }
             }
 
-            // The service key (current version).
-            let service_set = self
-                .store
-                .get(service)
-                .ok_or(Deny::denied(AuditReason::KeyNotFound))?;
-            fields.kvno = Some(service_set.current_kvno());
-            // Name binding (Q-040, A-19): the ticket for sname may only be
-            // sealed under the key bound to sname in this realm — otherwise
-            // service X could receive tickets naming service S. The key is
-            // reached only through that proof (crate::store, R7).
-            let version = service_set
-                .bound_to(&self.config.realm, &template.sname)?
-                .current();
+            // The service key (current version). Name binding (Q-040, A-19;
+            // docs/59 §7.2): the ticket for sname may only be sealed under
+            // the key set dird resolved sname to — otherwise service X could
+            // receive tickets naming service S. The door looks that set up
+            // by the resolution itself (task PN11b) and the key is reached
+            // only through its proof (crate::store, R7, "The doors").
+            let version = bound_by(
+                &self.store,
+                &resolution,
+                &self.config.realm,
+                &template.sname,
+            )?
+            .current();
+            fields.kvno = Some(version.kvno());
             let service_key = version
                 .preferred()
                 .ok_or(Deny::denied(AuditReason::KeyNotFound))?;

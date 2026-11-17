@@ -14,12 +14,37 @@
 //!
 //! # The rules (docs/47 §12, all accepted)
 //!
-//! - **Names (R47-1):** AS client = exactly one component, looked up by
-//!   sAMAccountName through the unique index, then re-compared octet for
-//!   octet; user or computer only; never the krbtgt account (RID 502). TGS
-//!   server = two or more components joined with "/", looked up by
-//!   servicePrincipalName, octet for octet, on computers only. No UPN, "$",
-//!   enterprise or canonicalisation fallbacks.
+//! - **Names (R47-1):** AS client = exactly one component, accepted only
+//!   as an object's sAMAccountName, re-compared octet for octet; user or
+//!   computer only; never the krbtgt account (RID 502). TGS server = two or
+//!   more components joined with "/", accepted only as a computer's
+//!   servicePrincipalName, octet for octet. No UPN, "$", enterprise or
+//!   canonicalisation fallbacks. Both go through the one lookup path by
+//!   name, [`DirectoryView::canonical_principal`] (tasks PN4, PN4b; docs/59
+//!   §6): one key per request from crate `principal-names`, one probe of
+//!   the namespace's union index (`PRINCIPAL_NAME_KEY` — no per-attribute
+//!   index is asked for a name), the kind and the key purpose read from the
+//!   object found, and R47-1 as the acceptance of wave 2 (module `resolve`;
+//!   docs/questions/Q-1026, Q-1027, Q-1042). The DNS record owner is found
+//!   through the same probe, by its `HostName` key (module `host`;
+//!   Q-1036 item 6).
+//! - **dird's statement (task PN10; docs/59 §7):** every account record the
+//!   view answers carries the resolution of its lookup —
+//!   `ResolvedPrincipal::name_resolution`, attested by the
+//!   [`NameResolutionSigner`] the deployment installs on the context (dird's
+//!   attestation key, crates/ipc-directory-server); no signer ⇒ no record
+//!   (fail closed). A reserved key purpose resolves only on a configured
+//!   provisioned service object (A-163 at the lookup; Q-1027 item 6). The
+//!   `principal-namespace` marker is defined here, with dird's check of it
+//!   ([`principal_namespace_marked`]; docs/59 §5.5).
+//! - **The subject of a ticket (task PN10b; docs/59 §6.2, §6.4; A-187):**
+//!   the admin plane's, kpasswd's, the DNS update's and the LDAP session's
+//!   subject checks and the self-lockout guard read
+//!   [`TicketSubjects::ticket_subject`] — the one lookup path in the
+//!   `TicketClient` context and only the facts those checks read (object,
+//!   SID, state, expansion, tier), with **no** name resolution and no
+//!   signer — never the KDC's account source. Only the KDC channel needs
+//!   the signer (module `subject`; docs/questions/Q-1047).
 //! - **krbtgt (R47-2):** never a client or a service;
 //!   [`DirectoryView::krbtgt_handle`] gives `KdcConfig.krbtgt`.
 //! - **Keys (R47-3):** `KeyHandle = (objectGUID, purpose)`.
@@ -56,7 +81,7 @@
 //! authority's own lookup, not a requester's read — module `visible`).
 //!
 //! A PEP receives the directory as a [`PepView`] — the gate, the locators
-//! of gate questions, the PIP and the account source — never the
+//! of gate questions, the PIP and the ticket-subject lookup — never the
 //! [`DirectoryView`] or its snapshot, so a new PEP cannot put a raw object on
 //! the wire (docs/52 R-a; decision A-103 on docs/questions/Q-486). The raw
 //! snapshot is reachable only through
@@ -76,6 +101,29 @@
 //! PENDING-OWNER A-36, A-147, docs/47 §4-§6 and this crate's own code
 //! (interpretations in docs/questions/Q-980..Q-984). No other
 //! implementation was consulted or recalled (docs/CLEAN-ROOM.md).
+//!
+//! # DNS: the host record, its tier, and the zone projection (task DN6)
+//!
+//! A member host's DNS addresses are an attribute of its own computer object
+//! (module `host`; docs/54 §5.2, decision A-119 on docs/questions/Q-614):
+//! [`host_label`] derives its one LDH label from its sAMAccountName and
+//! dNSHostName ([MS-ADTS] 3.1.1.5.3.1.1.2), so the name comes from the
+//! identity, never from a message. `Pip::object_tier` of
+//! `Resource::Dns { zone, record: Some(k) }` is the tier of the one computer
+//! owning `k` (docs/54 §5.6; Q-614 item 6) — so a computer that is not Tier0
+//! may update its own record. [`DirectoryView::zone_projection`] (module
+//! `zone`) builds dnsd's `dns_zone::ZoneImage` from one snapshot: SOA / NS /
+//! SRV synthesized, the DC's and the usable member hosts' A records, SERIAL
+//! from the `dns-zone-serial` counter, and the instant the image holds until
+//! ([`ZoneProjection::valid_until`]). Written only from docs/54 (§3.1, §4.4,
+//! §5.1-§5.6), docs/questions/Q-613, Q-614, Q-616, Q-618, PENDING-OWNER
+//! A-111, A-119, the pinned [MS-ADTS] v20261026 3.1.1.2.6, 3.1.1.5.3.1.1.2,
+//! [MS-ADSC] v20240423 2.21, 2.67, [MS-ADA1] v20180912 2.315, RFC 1035
+//! §2.3.1, §2.3.3, §2.3.4, §3.4.1 and RFC 2136 §3.6, §7.11, §7.12 (opened
+//! in-session from tools/spec-pin/cache/, SHA-256 verified), and this
+//! repository's crates dns-zone, parse-dns and config; interpretations in
+//! docs/questions/Q-991..Q-994. No other implementation was consulted or
+//! recalled (docs/CLEAN-ROOM.md).
 //!
 //! # Residuals and follow-ups (documented, not hidden)
 //!
@@ -119,23 +167,56 @@
 mod error;
 mod facts;
 mod groups;
+mod host;
 mod names;
 mod naming;
 mod pep;
+mod principal;
 mod record;
+mod resolve;
 mod salt;
 mod state;
+mod subject;
 mod tier;
 mod time;
 mod view;
 mod visible;
+mod zone;
 
 pub use error::ViewError;
 pub use facts::{PrincipalFacts, PrincipalKind};
 pub use groups::{MemberChange, MAX_EXPANDED_GROUPS, MAX_NESTING_DEPTH};
+// A computer's DNS host record: the rules its writer, the PIP and the zone
+// projection share (task DN6; docs/54 §5.2-§5.5).
+pub use host::{
+    computer_label, host_address_of, host_address_value, host_label, registrable, zone_serial,
+    DNS_ZONE_SERIAL_COUNTER, DNS_ZONE_SERIAL_END_EXCLUSIVE, DNS_ZONE_SERIAL_FIRST, HOST_ADDRESS,
+    MAX_HOST_ADDRESSES,
+};
 pub use naming::{NamingContext, MAX_NC_LABELS, NC_RDN_ATTRIBUTE};
 pub use pep::PepView;
+// An object's principal names and keys in the one namespace (task PN1;
+// docs/59 §4.3): `DirectoryView::{principal_names_of, principal_keys}`.
+pub use principal::{name_context_of, PrincipalNamesError};
+// The `principal-namespace` marker, defined once beside the namespace it
+// marks (task PN10; docs/questions/Q-1043 item 1, A-185), and dird's check
+// of it (docs/59 §5.5).
+pub use principal::{
+    principal_namespace_marked, PRINCIPAL_NAMESPACE_COUNTER, PRINCIPAL_NAMESPACE_END_EXCLUSIVE,
+    PRINCIPAL_NAMESPACE_FIRST,
+};
+// The one lookup path by name (task PN4; docs/59 §6.1-§6.3):
+// `DirectoryView::canonical_principal`; from task PN10 its attestation
+// (docs/59 §7.1, §7.4): the signer the deployment installs.
+pub use resolve::{LookupCtx, NameResolutionSigner, ResolvedPrincipal, SignerRefused};
 pub use salt::{account_salt, AccountKind, SaltError};
+// The subject lookup of a ticket's client (task PN10b; docs/59 §6.2, §6.4;
+// A-187): what the subject checks read — no name resolution, no signer.
+pub use subject::{TicketSubject, TicketSubjectError, TicketSubjects};
+// The KDC's account state, as the subject records carry it (one derivation —
+// docs/47 §4), so a subject consumer need not link crate kdc (task PN10b:
+// crates/directory-admin names the KDC's account source nowhere).
+pub use kdc::AccountState;
 pub use tier::TierMap;
 pub use time::{dstime_of, time_of_dstime};
 pub use view::{DirectoryContext, DirectoryView, MAX_DN_DEPTH};
@@ -143,3 +224,10 @@ pub use visible::{
     hides, GateFault, Unseen, UnseenCause, Visibility, VisibilityGate, VisibilityProof,
     VisibilityRule, VisibleObject,
 };
+// The zone projection (task DN6; docs/54 §4.4): the one function from the
+// directory to dnsd's zone image, for dird's DNS channel (task DN10a).
+pub use zone::{ZoneParameters, ZoneProjection, ZoneProjectionError, MAX_ZONE_WALK_OBJECTS};
+// The zone crate's types the projection's API speaks in, so its consumer
+// (dird, task DN10a) names them through this crate.
+pub use dns_zone::{KpasswdService, SoaParameters, ZoneImage, ZoneImageError, ZoneImageParts};
+pub use parse_dns::Name as DnsName;

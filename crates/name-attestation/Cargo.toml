@@ -1,0 +1,49 @@
+# name-attestation — dird's attestation of a name resolution to keyd (task
+# PN3; docs/59 §7.4; decision A-173 — docs/questions/Q-1011 item 2): the
+# attestation key (`AttestationKey`, one purpose, wiped on drop, never
+# printed, never handed out) and the two operations on a
+# `keyd_types::NameResolution` — `tag` (dird) and `verify` (keyd, a
+# constant-time comparison). HMAC-SHA-256 over the one MAC input keyd-types
+# defines (`NameResolution::mac_input`, label `principal-name-resolution.v1`).
+# There is no function that MACs caller-chosen bytes (A-145 RC-6, class C42).
+#
+# Why a separate crate: keyd-types stays free of crypto (A-65, D182), and the
+# KDC — which only forwards a resolution — links neither this crate nor a MAC.
+# dird (the signer) and keyd (the verifier) link this one; neither gets the
+# Kerberos crypto profile (krb-crypto) through it (tests/linkage.rs).
+#
+# Written only from this project's docs/59 §7, docs/questions/Q-1011, Q-792,
+# Q-722, PENDING-OWNER A-65, A-145, A-173, FIPS 198-1 §2.3, §3, §4, §5 and
+# FIPS 180-4 §1 (csrc.nist.gov, opened in-session), RFC 8009 §3, §5, App. A
+# (pinned, SHA-256 re-checked against tools/spec-pin/manifest.json) and the
+# docs.rs API pages of the linked RustCrypto crates (hmac 0.13.0, digest
+# 0.11.3, crypto-common 0.2.2, hybrid-array 0.4.15, sha2 0.11.1). No other
+# implementation consulted or recalled (docs/CLEAN-ROOM.md).
+
+[package]
+name = "name-attestation"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Our own crate: the NameResolution types and their one MAC-input encoding.
+keyd-types = { path = "../keyd-types" }
+# HMAC (FIPS 198-1) and SHA-256 (FIPS 180-4) — RustCrypto, owner decision
+# OD-9; already in the workspace lock (krb-crypto, dirstore), the same
+# versions and features as dirstore's. `zeroize`: the MAC state, which is
+# derived from the key, is wiped on drop (digest/zeroize). License: MIT OR
+# Apache-2.0.
+hmac = { version = "0.13", default-features = false, features = ["zeroize"] }
+sha2 = { version = "0.11", default-features = false, features = ["zeroize"] }
+# Holds the attestation key in a container that is wiped on drop (docs/CLEAN-ROOM.md
+# "secrets"). Fixed-size array only, so no `alloc` feature. Already in the
+# lock.
+zeroize = { version = "1.9", default-features = false }
+
+[dev-dependencies]
+# The tests build names, realms and times (RFC 4120 §5.2.2, §5.2.3).
+krb-proto = { path = "../krb-proto" }
+
+[lints]
+workspace = true

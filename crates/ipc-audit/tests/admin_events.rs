@@ -1068,7 +1068,10 @@ fn peek_shape_reads_two_octets_only() {
     assert_eq!(peek_shape(&[]), None);
     assert_eq!(peek_shape(&[EVENT_FORMAT]), None);
     assert_eq!(peek_shape(&[EVENT_FORMAT, 0]), None);
-    assert_eq!(peek_shape(&[EVENT_FORMAT, 7]), None);
+    // Task DN10b appended `ZoneSerial` (7): the first code past the table is
+    // now 8.
+    assert_eq!(peek_shape(&[EVENT_FORMAT, 7]), Some(EventShape::ZoneSerial));
+    assert_eq!(peek_shape(&[EVENT_FORMAT, 8]), None);
     assert_eq!(peek_shape(&[EVENT_FORMAT + 1, 5]), None);
     assert_eq!(peek_shape(&[0xAD, 0x02]), None); // auditd's own record format
     assert_eq!(peek_shape(&[EVENT_FORMAT, 5]), Some(EventShape::DirAdmin));

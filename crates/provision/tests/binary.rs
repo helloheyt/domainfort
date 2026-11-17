@@ -61,6 +61,8 @@ fn args(input: &provision::DomainInput) -> Vec<String> {
         ("--staging-dir", &p.staging),
         ("--database-path", &p.database),
         ("--integrity-key-path", &p.integrity_key),
+        ("--attestation-key-path", &p.attestation_key),
+        ("--keyadm-attestation-key-path", &p.keyadm_attestation_key),
         ("--policy-path", &p.policy),
         ("--manifest-path", &p.manifest),
         ("--audit-log-path", &p.audit_log),
@@ -88,11 +90,15 @@ fn args(input: &provision::DomainInput) -> Vec<String> {
         push(flag, path.as_str().to_owned());
     }
     push("--kdc-listen", input.network.kdc_listen[0].clone());
+    push("--ldap-listen", input.network.ldap_listen[0].clone());
     push("--ldaps-listen", input.network.ldaps_listen[0].clone());
     push("--kpasswd-listen", input.network.kpasswd_listen[0].clone());
     push("--dnsd-listen", input.network.dnsd_listen[0].clone());
     for network in &input.network.internal_networks {
         push("--internal-network", network.clone());
+    }
+    for address in &input.network.dc_addresses {
+        push("--dc-address", address.clone());
     }
     v
 }

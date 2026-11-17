@@ -3,8 +3,9 @@
 //!
 //! Every message is fixed text, at most followed by an error's own fixed
 //! description, a path the operator gave, or identifiers that are not
-//! secret (realm, domain SID, the manifest's GUIDs — docs/47 §2.3). The
-//! integrity key is never printed. Exit status: 0 — done; 1 — refused,
+//! secret (realm, domain SID, the manifest's GUIDs — docs/47 §2.3). Neither
+//! the integrity key nor the attestation key (task PN12) is ever printed —
+//! only the paths of their files. Exit status: 0 — done; 1 — refused,
 //! nothing was written; 2 — stopped after writing (the message names what
 //! was left, module `install`).
 //!
@@ -101,9 +102,14 @@ fn domain(input: &provision::DomainInput) -> ExitCode {
             for (target, path) in &installed.targets {
                 let _ = writeln!(out, "provision: {} = {}", target.name(), path.as_str());
             }
+            // Task PN12: the ceremony's two operands are files this run
+            // wrote — the manifest and keyadm's attestation-key copy (paths
+            // only; the key is never printed).
             let _ = writeln!(
                 out,
-                "provision: next: start auditd and keyd, run keyadm ceremony with the manifest, set the first administrators' passwords (docs/51 4.3 part B), then start dird, kdc, ldap-front, admind"
+                "provision: next: start auditd and keyd, run keyadm ceremony with the manifest ({}) and keyadm's attestation key file ({}), set the first administrators' passwords (docs/51 4.3 part B), then start dird, kdc, ldap-front, admind",
+                input.paths.manifest.as_str(),
+                input.paths.keyadm_attestation_key.as_str()
             );
             ExitCode::SUCCESS
         }

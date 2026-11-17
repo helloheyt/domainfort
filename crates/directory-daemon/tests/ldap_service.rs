@@ -386,7 +386,7 @@ fn direct(w: &World, session: &mut Session, message: &[u8], tls: bool) -> ldap::
         RequestInputs {
             snapshot: &snapshot,
             pip: &view,
-            accounts: &view,
+            subjects: &view,
             rate: &mut rate,
             now: now(),
             transport: TransportReport {

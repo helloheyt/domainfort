@@ -10,15 +10,17 @@
 #![allow(dead_code)] // each test binary uses a different subset
 
 use ipc_keyd::{
-    AccountKind, Answer, Call, DecidedOperation, DecisionId, DescribedConfig, DestructionPage,
-    Password, PendingDestruction, SetSecretTarget, TgsFast,
+    AccountKind, Answer, AsServerArgument, AttestationKeyOctets, Call, DecidedOperation,
+    DecisionId, DescribedConfig, DestructionPage, Password, PendingDestruction, SetSecretTarget,
+    TgsFast,
 };
 use keyd_types::{
-    ArmorId, AsRepParts, AsTicketTemplate, AuthnError, AuthnProof, ChangePasswordContext,
-    ChangePasswordCtxId, ChangePasswordVerdict, ConfigDescription, CtxId, EncTypeId, ExchangeId,
-    FastArmor, FastConversation, HostAddr, IssueError, KeyHandle, KeyPurpose, Kvno,
-    PrincipalBinding, PrincipalId, Role, SealedReply, ServiceContext, ServiceCtxId, TgsRepParts,
-    TgsTicketTemplate, TgtContext, TicketPolicy,
+    ArmorId, AsRepParts, AsTicketTemplate, AttestedNameResolution, AuthnError, AuthnProof,
+    ChangePasswordContext, ChangePasswordCtxId, ChangePasswordVerdict, ConfigDescription, CtxId,
+    EncTypeId, ExchangeId, FastArmor, FastConversation, HostAddr, IssueError, KeyHandle,
+    KeyPurpose, Kvno, NameResolution, NameResolutionFields, PrincipalBinding, PrincipalId, Role,
+    SealedReply, ServiceContext, ServiceCtxId, TgsRepParts, TgsTicketTemplate, TgtContext,
+    TicketPolicy,
 };
 use krb_proto::{
     ApOptions, ApRep, ApReq, Checksum, EncryptedData, FastOptions, KdcOptions, KdcReqBody,
@@ -28,6 +30,15 @@ use krb_proto::{
 use zeroize::Zeroizing;
 
 pub const PASSWORD: &str = "Nook-Petrel-16-Quay";
+
+/// A made-up attestation key (task PN9): 32 octets, a pattern no test
+/// output may show (`0x6B`, decimal 107).
+pub const ATTESTATION_KEY: [u8; 32] = [0x6B; 32];
+
+/// [`ATTESTATION_KEY`] as the call's carrier.
+pub fn attestation_key() -> AttestationKeyOctets {
+    AttestationKeyOctets::from_slice(&ATTESTATION_KEY).unwrap()
+}
 
 pub fn realm() -> Realm {
     Realm::new("EXAMPLE.ORG").unwrap()
@@ -45,6 +56,30 @@ pub fn name(name_type: i32, parts: &[&str]) -> PrincipalName {
 
 pub fn time(offset_minutes: u8) -> KerberosTime {
     KerberosTime::new(2026, 11, 13, 10, offset_minutes, 7).unwrap()
+}
+
+/// A name resolution as dird would state it (task PN11): `sent` resolved to
+/// `canonical` and the key set `key`, issued at `time(3)`, with a made-up
+/// tag `[tag; 32]` — the codec carries the tag, it never checks it (keyd
+/// does, docs/59 §7.2), so no MAC is needed here.
+pub fn resolution(
+    sent: PrincipalName,
+    canonical: PrincipalName,
+    key: KeyHandle,
+    tag: u8,
+) -> AttestedNameResolution {
+    let resolution = NameResolution::new(NameResolutionFields {
+        realm_as_sent: realm(),
+        name_as_sent: sent,
+        canonical_realm: realm(),
+        canonical_name: canonical,
+        principal: key.principal,
+        key_purpose: key.purpose,
+        snapshot: 0x0102_0304_0506_0708,
+        issued_at: time(3),
+    })
+    .unwrap();
+    AttestedNameResolution::new(resolution, [tag; 32])
 }
 
 pub fn handle(octet: u8, purpose: KeyPurpose) -> KeyHandle {
@@ -159,7 +194,6 @@ pub fn proof() -> AuthnProof {
 
 pub fn as_template(full: bool) -> AsTicketTemplate {
     AsTicketTemplate {
-        client: PrincipalId::from_bytes([0xA1; 16]),
         crealm: realm(),
         cname: name(1, &["alice"]),
         sname: name(2, &["krbtgt", "EXAMPLE.ORG"]),
@@ -203,19 +237,48 @@ pub fn calls() -> Vec<Call> {
             padata: padata(138),
             armor: None,
         },
+        // Task PN11b: the client and the change-password service by their
+        // resolutions only; a TGT's krbtgt by its handle.
         Call::IssueAsRep {
-            client: alice,
-            krbtgt: KRBTGT,
+            client: Box::new(resolution(
+                name(10, &["ALICE"]),
+                name(1, &["alice"]),
+                alice,
+                0x9A,
+            )),
+            server: AsServerArgument::ChangePasswordService(Box::new(resolution(
+                name(2, &["kadmin", "changepw"]),
+                name(2, &["kadmin", "changepw"]),
+                handle(0xC7, KeyPurpose::ChangePasswordService),
+                0x9B,
+            ))),
             proof: proof(),
             armor: Some(ArmorId::from_bytes([0xAB; 16])),
             template: as_template(true),
         },
         Call::IssueAsRep {
-            client: alice,
-            krbtgt: KRBTGT,
+            client: Box::new(resolution(
+                name(1, &["alice"]),
+                name(1, &["alice"]),
+                alice,
+                0x9C,
+            )),
+            server: AsServerArgument::LocalTgt(KRBTGT),
             proof: proof(),
             armor: None,
             template: as_template(false),
+        },
+        Call::IssueAsRep {
+            client: Box::new(resolution(
+                name(1, &["alice"]),
+                name(1, &["alice"]),
+                alice,
+                0x9F,
+            )),
+            server: AsServerArgument::LocalTgt(KRBTGT),
+            proof: proof(),
+            armor: Some(ArmorId::from_bytes([0xAD; 16])),
+            template: as_template(true),
         },
         Call::OpenFastArmor {
             krbtgt: KRBTGT,
@@ -238,12 +301,22 @@ pub fn calls() -> Vec<Call> {
             fast: None,
         },
         Call::IssueTgsRep {
-            service,
+            service: Box::new(resolution(
+                name(3, &["host", "files.example.org"]),
+                name(3, &["host", "files.example.org"]),
+                service,
+                0x9D,
+            )),
             ctx: CtxId::from_bytes([0xC1; 16]),
             template: tgs_template(true),
         },
         Call::IssueTgsRep {
-            service: KRBTGT,
+            service: Box::new(resolution(
+                name(3, &["HOST", "files.example.org"]),
+                name(3, &["host", "files.example.org"]),
+                service,
+                0x9E,
+            )),
             ctx: CtxId::from_bytes([0xC2; 16]),
             template: tgs_template(false),
         },
@@ -435,6 +508,19 @@ pub fn calls() -> Vec<Call> {
         },
         Call::RevokeDecision {
             id: DecisionId::new(u64::MAX),
+        },
+        // Task PN9 (docs/59 §7.5): the key only — the made-up key, and one
+        // whose only non-zero octet is the last.
+        Call::InstallAttestationKey {
+            key: attestation_key(),
+        },
+        Call::InstallAttestationKey {
+            key: AttestationKeyOctets::from_slice(&{
+                let mut key = [0u8; 32];
+                key[31] = 0x01;
+                key
+            })
+            .unwrap(),
         },
     ]
 }
@@ -631,6 +717,8 @@ pub fn answers() -> Vec<Answer> {
         Answer::SealChangePasswordError(Ok(sealed_reply())),
         // Task F3 (docs/questions/Q-976).
         Answer::RevokeDecision(Ok(())),
+        // Task PN9 (docs/59 §7.5).
+        Answer::InstallAttestationKey(Ok(())),
     ];
     // Task K4: every verdict of the closed table.
     for verdict in [
@@ -700,6 +788,7 @@ pub fn answers() -> Vec<Answer> {
         answers.push(Answer::CompleteChangePassword(Err(error)));
         answers.push(Answer::SealChangePasswordError(Err(error)));
         answers.push(Answer::RevokeDecision(Err(error)));
+        answers.push(Answer::InstallAttestationKey(Err(error)));
     }
     answers
 }

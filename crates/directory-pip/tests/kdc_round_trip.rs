@@ -204,7 +204,7 @@ fn kdc_for(d: &Dir) -> TestKdc {
         &DecidedOperation::SetSecret {
             kind: keyd::AccountKind::User,
             targets: vec![SetSecretTarget {
-                handle: alice.key,
+                handle: alice.key(),
                 binding: PrincipalBinding::new(realm(), alice_name()),
                 salt: alice_salt.as_str().to_owned(),
             }],
@@ -221,12 +221,12 @@ fn kdc_for(d: &Dir) -> TestKdc {
             kind: keyd::AccountKind::Computer,
             targets: vec![
                 SetSecretTarget {
-                    handle: ws01_client.key,
+                    handle: ws01_client.key(),
                     binding: PrincipalBinding::new(realm(), ws01_name()),
                     salt: ws01_salt.as_str().to_owned(),
                 },
                 SetSecretTarget {
-                    handle: ws01.key,
+                    handle: ws01.key(),
                     binding: PrincipalBinding::new(realm(), service_name()),
                     salt: ws01_salt.as_str().to_owned(),
                 },
@@ -239,14 +239,17 @@ fn kdc_for(d: &Dir) -> TestKdc {
     .unwrap();
     keyd.set_secret(
         &DIRECTORY,
-        &alice.key,
+        &alice.key(),
         &PrincipalBinding::new(realm(), alice_name()),
         String::from(ALICE_PASSWORD).into(),
         alice_salt.as_str(),
         &n,
     )
     .unwrap();
-    for (handle, binding) in [(ws01.key, service_name()), (ws01_client.key, ws01_name())] {
+    for (handle, binding) in [
+        (ws01.key(), service_name()),
+        (ws01_client.key(), ws01_name()),
+    ] {
         keyd.set_secret(
             &DIRECTORY,
             &handle,
@@ -257,6 +260,16 @@ fn kdc_for(d: &Dir) -> TestKdc {
         )
         .unwrap();
     }
+    // The ceremony hands keyd dird's attestation key (task PN11: keyd
+    // verifies the resolution of every account record the kdc forwards —
+    // docs/59 §7.2); the context's signer issues at the fixtures' `now`
+    // (tests/common/signer.rs).
+    keyd.install_attestation_key(
+        &ADMIN,
+        keyd::AttestationKey::from_bytes(&common::signer::TEST_ATTESTATION_KEY).unwrap(),
+        &n,
+    )
+    .unwrap();
     Kdc::new(
         KdcConfig::new(realm(), krbtgt),
         LocalKeyd::new(keyd, KDC_CALLER).unwrap(),

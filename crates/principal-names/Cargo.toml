@@ -1,0 +1,45 @@
+# principal-names — the one name equivalence of the principal namespace
+# (docs/59 §4.2-§4.4, task PN1; decision A-173 on docs/questions/Q-1007,
+# Q-1009). One ASCII fold, the key a request probes (`key_of_request`), the
+# keys an object's stored names produce (`keys_of_names`, with their kinds
+# as metadata), the realm's alias set (`NameContext`) and the reserved-name
+# predicates on the folded form. The writer (directory-admin), the lookup
+# (directory-pip) and keyd's acceptor compare are to call it; there is no
+# second copy (class C49, docs/59 §3 M3).
+#
+# Pure library: no store, no I/O, no clock, no randomness, no secret (names
+# are not secrets, docs/59 §4.6). No external crate (docs/CLEAN-ROOM.md).
+#
+# Written only from docs/59 (in full), docs/questions/Q-1007..Q-1012 with
+# their Decision lines (A-173), Q-080 (A-29, P-9), Q-1008 item 2, and the
+# pinned [MS-KILE] v20261110 3.1.5.7, 3.1.5.11, 3.3.5.1.1, 3.3.5.1.2,
+# 3.3.5.6.1; [MS-ADTS] v20261026 2.2.21, 3.1.1.5.3.1.1.2, 3.1.1.5.3.1.1.4,
+# 3.1.1.13.6, 3.1.1.13.7; [MS-SAMR] v20260427 3.1.1.6 items 8-14,
+# 3.1.1.8.4; [MS-DRSR] v20260309 4.1.4.2.22; RFC 4120 §6.1, §6.2, §6.2.1,
+# §7.3; RFC 3244 §2 — opened in-session from tools/spec-pin/cache (SHA-256
+# verified against tools/spec-pin/manifest.json). No other implementation
+# was consulted or recalled (docs/CLEAN-ROOM.md).
+
+[package]
+name = "principal-names"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Our own workspace crates only (path dependencies), both crypto-free.
+#
+# The request's types (`PrincipalName`, `Realm`, `KerberosString`) — the
+# signature of `key_of_request` (docs/59 §4.2) — and the change-password
+# service's name, defined once there (`CHANGE_PASSWORD_SERVICE_NAME`, RFC
+# 3244 §2; Q-955 item 5). krb-proto links only parse-asn1 and zeroize.
+krb-proto = { path = "../krb-proto" }
+# The admin service's name class, defined once there (`ADMIN_SERVICE_CLASS`,
+# A-73; guarded by crates/keyd-types tests/one_service_purpose_derivation.rs).
+# docs/59 §4.2: keyd-types and krb-proto keep defining the NAMES; this crate
+# defines the EQUIVALENCE to them. keyd-types links only krb-proto (D182,
+# A-63: no crypto). No key-set purpose is named here.
+keyd-types = { path = "../keyd-types" }
+
+[lints]
+workspace = true

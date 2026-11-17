@@ -38,18 +38,30 @@ ad-schema = { path = "../ad-schema" }
 dtyp = { path = "../dtyp" }
 # The policy decision point: decide, Subject, Action, Resource, Transport.
 pdp = { path = "../pdp" }
-# The per-request directory view (AccountSource + Pip over one snapshot),
-# the tier map, account_salt, the DSTIME mapping.
+# The per-request directory view (Pip over one snapshot), its ticket-subject
+# lookup (the requester's account through the one lookup path in the
+# `TicketClient` context, docs/51 §5.3; docs/59 §6.2), the KDC's account
+# state it re-exports, the tier map, account_salt, the DSTIME mapping.
+#
+# NOT crate kdc (task PN10b; docs/questions/Q-1047, A-187): this crate does
+# not link the KDC's account source, whose records carry dird's attested
+# name resolutions — so no code here can even name it on the raw view the
+# `checks` module holds (compile time).
 directory-pip = { path = "../directory-pip" }
-# The AccountSource trait the view implements (the requester's account is
-# resolved exactly as the KDC resolves an AS client, docs/51 §5.3).
-kdc = { path = "../kdc" }
 # keyd's crypto-free types: KeyHandle, KeyPurpose, PrincipalBinding (the
 # BeginPasswordSet reply), ServiceContext (the verified ticket's facts) and
 # the KerberosTime-to-seconds mapping. NOT keyd and NOT krb-crypto (D182).
 keyd-types = { path = "../keyd-types" }
 # Realm, PrincipalName, KerberosString, KerberosTime and the name types.
 krb-proto = { path = "../krb-proto" }
+# Task PN5 (docs/59 §4.2, §5.1; A-173): the one name equivalence of the
+# principal namespace. The checker computes every principal's keys with
+# `keys_of_names` and writes PRINCIPAL_NAME_KEY itself (N7); A-163's reserved
+# names are judged with `reserved_name_of` on those folded keys (class C49);
+# `Lookup` probes the namespace with `key_of_request`. Our own leaf crate
+# (it links only krb-proto and keyd-types, both already above); no crypto,
+# no store, no external crate (docs/CLEAN-ROOM.md).
+principal-names = { path = "../principal-names" }
 # The `DirAdmin` audit event this crate plans (A-85). No feature.
 ipc-audit = { path = "../ipc-audit" }
 # The proof of an acknowledged intent `apply` and the decision paths take
@@ -71,6 +83,11 @@ policy-store = { path = "../policy-store" }
 # krb-proto, ipc-keyd, zeroize, sha2 and, on Linux, rustix — all already in
 # dird's graph); no store, no crypto profile.
 ipc-dird-admin = { path = "../ipc-dird-admin" }
+# Task DN6: the registrable networks of a host record (docs/54 §5.5;
+# Q-614 item 8) are `config::Network` values matched by its one matcher
+# (A-114: "one implementation for address matching"). Our own leaf crate,
+# zero dependencies, already in dird's graph.
+config = { path = "../config" }
 # SHA-256 of a pending key-operation request's operation digest (task A10,
 # docs/51 §5.6; docs/questions/Q-420). RustCrypto, OD-9; already in the
 # workspace lock and already in dird's graph (dirstore links it). License:
@@ -80,6 +97,10 @@ ipc-dird-admin = { path = "../ipc-dird-admin" }
 sha2 = { version = "0.11", default-features = false }
 
 [dev-dependencies]
+# (Task PN10b: no name-attestation — the fixtures' directory contexts carry
+# no signer, as dird's admin, kpasswd and DNS contexts carry none; docs/
+# questions/Q-1047, A-187.)
+#
 # TESTS ONLY (docs/52 C18, task R15; A-113): the tests open their stores by
 # path (`Store::open`, feature `test-seams`).
 dirstore = { path = "../dirstore", features = ["test-seams"] }

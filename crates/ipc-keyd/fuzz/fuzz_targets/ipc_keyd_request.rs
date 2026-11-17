@@ -36,6 +36,24 @@
 //! KRB5_KPASSWD_SUCCESS (the type cannot hold it; RFC 3244 §2); a decoded
 //! `register_decision` of a `ChangePassword` decision names one target.
 //!
+//! Task PN9: a decoded `install_attestation_key` (kind `0x1A`) carries
+//! exactly `ATTESTATION_KEY_OCTETS` key octets, never all zero, and its
+//! `Debug` says only that it is redacted (docs/59 §7.5; docs/50 §8.2). The
+//! dedicated target `ipc_keyd_install_attestation_key` fuzzes its payload
+//! alone.
+//!
+//! Task PN11: a decoded `issue_as_rep` (kind `0x02`) carries the client's
+//! attested name resolution and, for the change-password service, the
+//! service's; a decoded `issue_tgs_rep` (kind `0x05`) the service's. Each is
+//! within a resolution's bounds (it decoded through `NameResolution::new`:
+//! 1..=16 components, each and every realm at most 1024 octets — docs/59
+//! §7.1); its tag is carried, never checked here (keyd verifies it, §7.2).
+//! Task PN11b (docs/questions/Q-1067): the server of a decoded
+//! `issue_as_rep` is exactly one of the krbtgt's handle (Krbtgt purpose on
+//! the wire is not this layer's to judge — keyd classifies it) or the
+//! change-password service's resolution; neither request carries a handle
+//! beside a resolution (the types have no field for one).
+//!
 //! Written, not run (PENDING-OWNER P-1).
 //!
 //! Spec: docs/50 §3.3, §3.4, §9; R50-4; A-59; docs/51 §5.8;
@@ -43,7 +61,9 @@
 
 use ipc::{encode_frame, Direction};
 use ipc_keyd::channel::{request_kind, MAX_DECISION_APPROVERS, MAX_GRANT_TARGETS};
-use ipc_keyd::{decode_request, Call, DecidedOperation, KEYD_CHANNEL};
+use ipc_keyd::{
+    decode_request, AsServerArgument, Call, DecidedOperation, ATTESTATION_KEY_OCTETS, KEYD_CHANNEL,
+};
 use keyd::{ADDRESS_TYPE_IPV4, ADDRESS_TYPE_IPV6};
 use libfuzzer_sys::fuzz_target;
 
@@ -89,6 +109,36 @@ fuzz_target!(|body: &[u8]| {
             }
             if let Call::SealChangePasswordError { code, .. } = &call {
                 assert_ne!(code.value(), 0, "SUCCESS is never sealed as an error");
+            }
+            // Task PN9: exactly the key's length, never all zero, never shown.
+            if let Call::InstallAttestationKey { key } = &call {
+                assert_eq!(key.expose().len(), ATTESTATION_KEY_OCTETS);
+                assert!(
+                    key.expose().iter().any(|&octet| octet != 0),
+                    "never all zero"
+                );
+                assert_eq!(format!("{key:?}"), "AttestationKeyOctets(<redacted>)");
+            }
+            // Task PN11: every decoded resolution is within its bounds; task
+            // PN11b: they are the requests' only names of the resolved key
+            // sets (the server one closed choice).
+            let resolutions: Vec<&keyd::AttestedNameResolution> = match &call {
+                Call::IssueAsRep { client, server, .. } => match server {
+                    AsServerArgument::ChangePasswordService(server) => vec![&**client, &**server],
+                    AsServerArgument::LocalTgt(_) => vec![&**client],
+                },
+                Call::IssueTgsRep { service, .. } => vec![&**service],
+                _ => Vec::new(),
+            };
+            for attested in resolutions {
+                let r = attested.resolution();
+                for name in [r.name_as_sent(), r.canonical_name()] {
+                    assert!((1..=16).contains(&name.name_string.len()), "component bound");
+                    assert!(name.name_string.iter().all(|c| c.as_bytes().len() <= 1024));
+                }
+                for realm in [r.realm_as_sent(), r.canonical_realm()] {
+                    assert!(realm.as_bytes().len() <= 1024, "realm bound");
+                }
             }
             let request = call.to_wire().expect("a decoded call re-encodes");
             let frame = encode_frame(KEYD_CHANNEL, Direction::Request, &request)

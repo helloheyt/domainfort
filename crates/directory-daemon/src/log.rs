@@ -13,6 +13,7 @@
 //!
 //! Spec: docs/50 §8.2; docs/07 §8; docs/CLEAN-ROOM.md
 
+use ipc_audit_client::{Undelivered, Unflushed};
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -160,6 +161,54 @@ pub enum Note {
     /// new password was installed is in keyd's audit records (docs/53 §5.6
     /// step 6 — the safe state of docs/47 §9.2); answered HARDERROR.
     KpasswdCompletionUnknown,
+    /// dird listens on `dird-dns.sock` (task DN10a, docs/54 §4.6); the id is
+    /// the zone's SERIAL at start.
+    DnsListening,
+    /// The DNS service did not start (logged with the reason's code,
+    /// `dns_service::DnsNotStarted::code`); dird's other services run.
+    DnsNotStarted,
+    /// A `dird-dns.sock` connection's peer uid is not dnsd's; closed
+    /// without a reply (docs/54 §4.6; docs/50 R50-3).
+    DnsPeerRefused,
+    /// dnsd's connection bound is reached; the connection is refused `Busy`
+    /// and closed (docs/54 §4.6).
+    DnsConnectionLimit,
+    /// The DNS queue is full; the request is refused `Busy` and the
+    /// connection closed — dnsd answers SERVFAIL (docs/54 §4.6).
+    DnsBusy,
+    /// A forwarded UPDATE / TKEY was refused `Unavailable` without being
+    /// read: the DNS PEP is not built (tasks DN8, DN9; docs/questions/
+    /// Q-1000 item 4).
+    DnsForwardRefused,
+    /// A zone image could not be projected (logged with the code of
+    /// `dns_service::DnsNotStarted::code`, thinned — dnsd chooses how often
+    /// it fetches); the fetch was refused `Unavailable` (fail closed — dnsd
+    /// keeps its image until its staleness bound).
+    DnsZoneUnavailable,
+    /// The zone's SERIAL was advanced without a content write (task DN10b;
+    /// docs/questions/Q-1002): the id is the new SERIAL.
+    DnsSerialAdvanced,
+    /// The clock changed the zone's content under its SERIAL and the
+    /// advance is deferred: the previous one was less than the bound ago
+    /// (task DN10b, `dns_service::MIN_SERIAL_ADVANCE_INTERVAL`; thinned) —
+    /// the fetch was refused `Unavailable` (fail closed).
+    DnsSerialAdvanceDeferred,
+    /// A serial advance did not happen (auditd unavailable, not
+    /// acknowledged, the store, the counter — logged with the code of
+    /// `dns_service::SerialAdvanceStop::code`, thinned): the fetch was
+    /// refused `Unavailable` (fail closed).
+    DnsSerialAdvanceFailed,
+    /// At the stop, noise counted for a `WindowSummary` that never left
+    /// the audit window (auditd unreachable, or the pace held it past the
+    /// grace): lost with the process; the identifier is the count
+    /// (docs/questions/Q-990 item 4, A-166; Q-995).
+    AuditSuppressedNoiseUndelivered,
+    /// At the stop, refused gating reservations counted for a summary that
+    /// never left the audit window; the identifier is the count (Q-995).
+    AuditRefusedGatingUndelivered,
+    /// At the stop, lost outcome records counted for a summary that never
+    /// left the audit window; the identifier is the count (A-88; Q-995).
+    AuditUnrecordedOutcomesUndelivered,
     /// Stopped.
     Stopped,
 }
@@ -260,6 +309,32 @@ impl Note {
                 "password change completion not answered by keyd (keyd's records tell whether it \
                  was installed): answered hard error"
             }
+            Note::DnsListening => "listening on the DNS channel; zone serial",
+            Note::DnsNotStarted => "DNS service not started (the other services run); reason code",
+            Note::DnsPeerRefused => "DNS channel connection closed: peer uid is not dnsd's",
+            Note::DnsConnectionLimit => "DNS channel connection refused: connection bound reached",
+            Note::DnsBusy => "DNS request refused: DNS queue full",
+            Note::DnsForwardRefused => {
+                "forwarded DNS message refused unread: the DNS update service is not built"
+            }
+            Note::DnsZoneUnavailable => "zone image not projected: fetch refused; reason code",
+            Note::DnsSerialAdvanced => "zone serial advanced without a content write; serial",
+            Note::DnsSerialAdvanceDeferred => {
+                "zone content changed with the clock under its serial and the previous serial \
+                 advance is too recent: fetch refused"
+            }
+            Note::DnsSerialAdvanceFailed => {
+                "zone serial advance did not happen: fetch refused; reason code"
+            }
+            Note::AuditSuppressedNoiseUndelivered => {
+                "audit count not delivered at stop: suppressed noise"
+            }
+            Note::AuditRefusedGatingUndelivered => {
+                "audit count not delivered at stop: refused gating reservations"
+            }
+            Note::AuditUnrecordedOutcomesUndelivered => {
+                "audit count not delivered at stop: unrecorded outcomes"
+            }
             Note::Stopped => "stopped",
         }
     }
@@ -273,6 +348,25 @@ pub fn note(note: Note, id: Option<u64>) {
         Some(id) => writeln!(err, "directory-daemon: {} [{id}]", note.text()),
         None => writeln!(err, "directory-daemon: {}", note.text()),
     };
+}
+
+/// The stop's audit report (`ipc_audit_client::Unflushed::undelivered`): one
+/// note per kind auditd did not receive, with its count — the events it did
+/// not acknowledge and the counts never sent as a summary alike
+/// (docs/questions/Q-990 item 4, A-166; Q-995). Counts only, never event
+/// content. The `match` names every kind (no wildcard), so a kind added to
+/// the report reaches this log or fails to compile.
+/// Spec: docs/50 §8.2; docs/questions/Q-313 (A-82), Q-995.
+pub fn audit_undelivered(unflushed: Unflushed) {
+    for part in unflushed.undelivered() {
+        let kind = match part {
+            Undelivered::Events(_) => Note::AuditUnacknowledged,
+            Undelivered::SuppressedNoise(_) => Note::AuditSuppressedNoiseUndelivered,
+            Undelivered::RefusedGating(_) => Note::AuditRefusedGatingUndelivered,
+            Undelivered::UnrecordedOutcomes(_) => Note::AuditUnrecordedOutcomesUndelivered,
+        };
+        note(kind, Some(part.count()));
+    }
 }
 
 /// A count of one frequent per-connection note, logged on powers of two.

@@ -272,9 +272,11 @@ fn the_audit_log_verifies_and_holds_every_daemons_events() {
                 EventBody::Ldap(event) => ldap_events.push(*event),
                 EventBody::WindowSummary(_) => {}
                 // No admin-plane sender (dird's admin service, admind) runs
-                // in this test (docs/51 §5.7; A-72).
-                EventBody::DirAdmin(_) | EventBody::Admind(_) => {
-                    panic!("an admin-plane event in a test with no admin plane")
+                // in this test (docs/51 §5.7; A-72), nor dird's DNS service
+                // (task DN10b: its serial advance is the only `ZoneSerial`
+                // sender).
+                EventBody::DirAdmin(_) | EventBody::Admind(_) | EventBody::ZoneSerial(_) => {
+                    panic!("an admin-plane or zone-serial event in a test with neither")
                 }
             }
         }

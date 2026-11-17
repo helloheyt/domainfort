@@ -9,7 +9,15 @@
 //! * [`Directory`] — a directory for the identities of the kdc fixtures
 //!   (crates/kdc/tests/common: realm EXAMPLE.ORG, alice, the computer
 //!   account ws1$, the service host/files.example.org, the krbtgt account),
-//!   built through dirstore with the phase-1 schema, in a file of its own.
+//!   built through dirstore with the phase-1 schema, in a file of its own —
+//!   beneath the one checker, so it writes what the checker would have
+//!   (task PN4b; docs/59 §5.1, §5.5; docs/questions/Q-1031): the
+//!   `principal-namespace` marker when the store is made, and every
+//!   principal [`Directory::create_all`] creates gets its namespace keys in
+//!   the same transaction, through [`namespace`] — crates/directory-pip's
+//!   one fixture helper, reused through `#[path]`, which also serves this
+//!   crate's own provisioned fixtures (tests/admin_service.rs,
+//!   tests/kpasswd_service.rs) and crates/admin-daemon's.
 //! * [`Dird`] — the real `directory_daemon::serve` on its own thread with
 //!   its own current-thread runtime, stopped through `DaemonControl`.
 //! * [`connector`] — the kdc's side of both sockets. On Linux the daemons'
@@ -22,6 +30,26 @@
 //!
 //! Real peer credentials on both sides; no test-only seam in the daemon.
 //!
+//! dird's name-resolution attestation key (task PN10; docs/59 §7.4) is the
+//! fixtures' test key ([`TEST_ATTESTATION_KEY`], [`attestation_key`]) in
+//! every [`params`]; a directory context a test builds for the KDC's
+//! account source carries the product's signer under that key
+//! ([`resolution_signer`] — `directory_daemon::ResolutionSigner`), as dird's
+//! directory-view (KDC channel) context does — the only one of dird's
+//! contexts with a signer (task PN10b; docs/questions/Q-1047): a context
+//! for a subject check (the admin plane, kpasswd, DNS, the LDAP re-check)
+//! needs none.
+//!
+//! **One clock per test world** (task PN11, A-190; docs/questions/Q-1063
+//! items 1-2): keyd judges a resolution's age on its own clock (30 s —
+//! docs/59 §7.2 step 3, R50-5), and the fixtures' keyd runs at the kdc
+//! fixtures' `now` ([`fixture_now`]). So both of this support's dird clocks
+//! issue at that `now`: [`params`]' clock ([`FixtureClock`]) and
+//! [`resolution_signer`]. This support offers no signer at the system clock;
+//! a test that needs dird's clock to move sets `DaemonParams::clock` itself
+//! (tests/admin_service.rs, kpasswd_service.rs, dns_service.rs,
+//! ldap_service.rs).
+//!
 //! Sources: docs/50 §3.1-§3.7, §9; docs/46 §4.4 (musts per class), §5.4;
 //! docs/47 §1.3, §1.4, §4, §9.1 (what an account object carries; the krbtgt
 //! user, RID 502); [MS-DTYP] 2.4.2.4 (SID layout). Every value is constructed
@@ -33,6 +61,9 @@
 #[path = "../../../keyd-daemon/tests/support/mod.rs"]
 pub mod keyd;
 
+#[path = "../../../directory-pip/tests/common/namespace.rs"]
+pub mod namespace;
+
 pub use keyd::{eventually, my_uid, skip_as_root, FakeAuditd, TempDir, TestClock};
 
 use ad_schema::{flags::user_account_control as uac, phase1, Phase1Schema};
@@ -43,13 +74,15 @@ use directory_daemon::policy::{DevelopmentPolicy, MandatoryFast};
 // dev-dependency).
 use directory_daemon::test_seams::{serve, DaemonParams};
 use directory_daemon::{
-    AuditEndpoint, DaemonControl, SharedClock, StoreSource, ENGINE_QUEUE_CAPACITY,
-    LDAP_QUEUE_CAPACITY, MAX_LDAP_SESSIONS,
+    AuditEndpoint, Clock, DaemonControl, ResolutionSigner, SharedAttestationKey, SharedClock,
+    StoreSource, ATTESTATION_KEY_LEN, ENGINE_QUEUE_CAPACITY, LDAP_QUEUE_CAPACITY,
+    MAX_LDAP_SESSIONS,
 };
-use directory_pip::NamingContext;
+use directory_pip::{DirectoryContext, NameResolutionSigner, NamingContext};
 use dirstore::{AttrId, IntegrityKey, NewObject, NodeId, Origin, Store, Timestamp};
 use dtyp::{Control, Guid, SecurityDescriptor, Sid, SECURITY_NT_AUTHORITY};
 use keyd_types::KeydConfig;
+use krb_proto::KerberosTime;
 use pdp::PolicyVersion;
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -136,6 +169,46 @@ fn sd_value() -> Vec<u8> {
     .unwrap()
 }
 
+/// dird's attestation key in these fixtures — test data, made up here (the
+/// value crates/kdc tests/common and crates/directory-pip's test signer use
+/// too). Spec: docs/59 §7.4.
+pub const TEST_ATTESTATION_KEY: [u8; ATTESTATION_KEY_LEN] = [0x4B; ATTESTATION_KEY_LEN];
+
+/// dird's attestation key, as its parameters carry it (task PN10).
+pub fn attestation_key() -> SharedAttestationKey {
+    SharedAttestationKey::from_bytes(&TEST_ATTESTATION_KEY).expect("a non-zero test key")
+}
+
+/// The kdc fixtures' `now` — crates/kdc tests/common `now`
+/// (20261113100000Z), the time the fixtures' keyd runs at (module
+/// documentation, "One clock per test world").
+pub fn fixture_now() -> KerberosTime {
+    KerberosTime::new(2026, 11, 13, 10, 0, 0).expect("a valid time")
+}
+
+/// dird's clock in these fixtures: always [`fixture_now`] (a
+/// `directory_daemon::Clock` — the daemon's clock seam,
+/// `DaemonParams::clock`).
+#[derive(Debug, Clone, Copy)]
+pub struct FixtureClock;
+
+impl Clock for FixtureClock {
+    fn now(&self) -> Option<KerberosTime> {
+        Some(fixture_now())
+    }
+}
+
+/// dird's own signer — `directory_daemon::ResolutionSigner` — under the test
+/// key, issuing at [`fixture_now`] (the clock keyd judges the resolution's
+/// age on — module documentation), for a directory context a test builds
+/// itself (docs/59 §7.1, §7.2 step 3, §7.4).
+pub fn resolution_signer() -> Arc<dyn NameResolutionSigner> {
+    Arc::new(ResolutionSigner::new(
+        attestation_key(),
+        Arc::new(|| Some(fixture_now())),
+    ))
+}
+
 /// A directory in its own redb file.
 pub struct Directory {
     pub p1: Phase1Schema,
@@ -145,8 +218,24 @@ pub struct Directory {
 }
 
 impl Directory {
-    /// An empty store at `path` (mode 0600, as dird requires).
+    /// A store at `path` with no object (mode 0600, as dird requires), and
+    /// the `principal-namespace` marker (module documentation).
     pub fn empty(path: &Path) -> Directory {
+        Directory::empty_marked(path, true)
+    }
+
+    /// The standard directory at `path` WITHOUT the `principal-namespace`
+    /// marker: a store whose principals did not all get their keys from the
+    /// one checker (from before task PN5) — the store dird refuses to open
+    /// (task PN10; docs/59 §5.5).
+    pub fn standard_without_namespace_marker(path: &Path) -> Directory {
+        let d = Directory::empty_marked(path, false);
+        d.create_all(d.standard_objects());
+        d
+    }
+
+    /// A store at `path` with no object, with or without the marker.
+    fn empty_marked(path: &Path, marked: bool) -> Directory {
         let p1 = phase1().unwrap();
         let store = Store::open(
             path,
@@ -154,6 +243,11 @@ impl Directory {
             p1.schema().clone(),
         )
         .unwrap();
+        if marked {
+            let mut txn = store.begin_write().unwrap();
+            namespace::create_namespace_marker(&mut txn);
+            txn.commit().unwrap();
+        }
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
         Directory {
             p1,
@@ -309,12 +403,19 @@ impl Directory {
         ]
     }
 
+    /// Create every object in one committed transaction, each principal with
+    /// its namespace keys as the one checker writes them (module
+    /// documentation; this world holds no provisioned service object).
     pub fn create_all(&self, objects: Vec<NewObject>) {
+        let ctx = DirectoryContext::new(self.p1.clone(), &keyd_config(), naming_context()).unwrap();
         let mut txn = self.store.begin_write().unwrap();
+        let mut created = Vec::with_capacity(objects.len());
         for obj in objects {
             let origin = self.origin();
+            created.push((obj.guid, origin));
             txn.create_object(obj, &origin).unwrap();
         }
+        namespace::write_namespace_keys(&self.store, &mut txn, &ctx, &created);
         txn.commit().unwrap();
     }
 
@@ -359,7 +460,8 @@ pub fn policy(version: u64) -> DevelopmentPolicy {
 /// dird's parameters in `dir`: `d.sock`, kdc uid `kdc_uid`, auditd at
 /// `a.sock` as `auditd_uid`, view lifetime `lifetime`, `max_views` views;
 /// the LDAP channel at `l.sock` for the same uid as the kdc's, the daemon's
-/// session bound and queue, the system clock.
+/// session bound and queue, the fixtures' clock ([`FixtureClock`]: one
+/// clock per test world — module documentation).
 pub fn params(
     dir: &TempDir,
     kdc_uid: u32,
@@ -387,7 +489,8 @@ pub fn params(
         ldap_queue_capacity: LDAP_QUEUE_CAPACITY,
         dns_host_name: String::from("dc1.example.org"),
         audit_window: ipc_audit::WindowConfig::DEFAULT,
-        clock: SharedClock::system(),
+        clock: SharedClock::new(FixtureClock),
+        attestation_key: attestation_key(),
     }
 }
 

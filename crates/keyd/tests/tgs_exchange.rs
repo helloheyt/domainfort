@@ -48,7 +48,7 @@ fn tgs_round_trip_session_key() {
     let template = tgs_template(nonce);
     let parts = f
         .keyd
-        .issue_tgs_rep(&KDC, &SERVICE, &ctx.ctx_id, &template, &now())
+        .issue_tgs(&KDC, &SERVICE, &ctx.ctx_id, &template, &now())
         .unwrap();
 
     // Client side: the enc-part opens with the TGT session key, usage 8.
@@ -103,7 +103,7 @@ fn tgs_round_trip_subkey() {
         .unwrap();
     let parts = f
         .keyd
-        .issue_tgs_rep(&KDC, &SERVICE, &ctx.ctx_id, &tgs_template(7), &now())
+        .issue_tgs(&KDC, &SERVICE, &ctx.ctx_id, &tgs_template(7), &now())
         .unwrap();
     let sub = krb_crypto::random_to_key(EncType::Aes256CtsHmacSha196, &subkey).unwrap();
     assert!(EncTgsRepPart::decode(&open(&sub, 9, &parts.enc_part)).is_ok());
@@ -358,7 +358,7 @@ fn context_misuse_denied() {
 
     // No context.
     assert_eq!(
-        f.keyd.issue_tgs_rep(
+        f.keyd.issue_tgs(
             &KDC,
             &SERVICE,
             &CtxId::from_bytes([9; 16]),
@@ -376,11 +376,11 @@ fn context_misuse_denied() {
     let ctx = open_tgt(&mut f, &tgt, 21, 20);
     assert!(f
         .keyd
-        .issue_tgs_rep(&KDC, &SERVICE, &ctx.ctx_id, &tgs_template(21), &now())
+        .issue_tgs(&KDC, &SERVICE, &ctx.ctx_id, &tgs_template(21), &now())
         .is_ok());
     assert_eq!(
         f.keyd
-            .issue_tgs_rep(&KDC, &SERVICE, &ctx.ctx_id, &tgs_template(21), &now()),
+            .issue_tgs(&KDC, &SERVICE, &ctx.ctx_id, &tgs_template(21), &now()),
         Err(IssueError::Denied)
     );
 
@@ -390,7 +390,7 @@ fn context_misuse_denied() {
     late_template.starttime = None;
     assert_eq!(
         f.keyd
-            .issue_tgs_rep(&KDC, &SERVICE, &ctx.ctx_id, &late_template, &at(31)),
+            .issue_tgs(&KDC, &SERVICE, &ctx.ctx_id, &late_template, &at(31)),
         Err(IssueError::Denied)
     );
     assert_eq!(
@@ -402,7 +402,7 @@ fn context_misuse_denied() {
     let ctx = open_tgt(&mut f, &tgt, 23, 22);
     assert_eq!(
         f.keyd
-            .issue_tgs_rep(&KDC_OTHER, &SERVICE, &ctx.ctx_id, &tgs_template(23), &now()),
+            .issue_tgs(&KDC_OTHER, &SERVICE, &ctx.ctx_id, &tgs_template(23), &now()),
         Err(IssueError::Denied)
     );
     assert_eq!(
@@ -411,7 +411,7 @@ fn context_misuse_denied() {
     );
     assert_eq!(
         f.keyd
-            .issue_tgs_rep(&KDC, &SERVICE, &ctx.ctx_id, &tgs_template(23), &now()),
+            .issue_tgs(&KDC, &SERVICE, &ctx.ctx_id, &tgs_template(23), &now()),
         Err(IssueError::Denied)
     );
 }
@@ -481,8 +481,7 @@ fn tgs_template_bad_template() {
         let mut t = tgs_template(nonce);
         mutate(&mut t);
         assert_eq!(
-            f.keyd
-                .issue_tgs_rep(&KDC, &SERVICE, &ctx.ctx_id, &t, &now()),
+            f.keyd.issue_tgs(&KDC, &SERVICE, &ctx.ctx_id, &t, &now()),
             Err(IssueError::BadTemplate),
             "{name}"
         );
@@ -523,8 +522,12 @@ fn replay_cache_full_fails_closed() {
 /// Name binding (Q-040, A-19): the service key is bound to
 /// host/files.example.org; a request (authenticated req-body and template
 /// agreeing) for another service S must not be sealed under it — otherwise
-/// the holder of that key could accept tickets naming S. Source:
-/// docs/questions/Q-040 (A-19); RFC 4120 3.3.3, 5.3 (sname), 6.2.
+/// the holder of that key could accept tickets naming S. Since task PN11:
+/// with dird's (honest) resolution of the service's own name the template's
+/// S is not one of its names, and a resolution of S to this key set is not
+/// one its binding answers to — `NameResolutionMismatch` either way. Source:
+/// docs/questions/Q-040 (A-19); docs/59 §7.2 steps 4-5; RFC 4120 3.3.3, 5.3
+/// (sname), 6.2.
 #[test]
 fn service_bound_to_other_name_denied() {
     let mut f = Fixture::new();
@@ -544,14 +547,34 @@ fn service_bound_to_other_name_denied() {
         .unwrap();
     let mut t = tgs_template(60);
     t.sname = other;
+    let honest = resolution_at(&service_name(), &SERVICE, &now());
     assert_eq!(
-        f.keyd
-            .issue_tgs_rep(&KDC, &SERVICE, &ctx.ctx_id, &t, &now()),
+        f.keyd.issue_tgs_rep(&KDC, &honest, &ctx.ctx_id, &t, &now()),
         Err(IssueError::Denied)
     );
     assert_eq!(
         f.records().last().unwrap().reason,
-        AuditReason::NameBindingMismatch
+        AuditReason::NameResolutionMismatch
+    );
+    // A resolution that maps S itself to this key set (dird compromised —
+    // docs/59 §9 S5) is refused by the binding compare (Q-1034).
+    let (_, body) = tgs_req_body(61, t.sname.clone());
+    let req = ap_req(
+        &tgt.parts.ticket,
+        authenticator(&tgt.session, &AuthenticatorSpec::new(now(), 61, &body)),
+    );
+    let ctx = f
+        .keyd
+        .open_and_verify_tgt(&KDC, &KRBTGT, &req, &body, None, &now())
+        .unwrap();
+    t.nonce = 61;
+    assert_eq!(
+        f.keyd.issue_tgs(&KDC, &SERVICE, &ctx.ctx_id, &t, &now()),
+        Err(IssueError::Denied)
+    );
+    assert_eq!(
+        f.records().last().unwrap().reason,
+        AuditReason::NameResolutionMismatch
     );
 }
 
@@ -576,7 +599,7 @@ fn service_name_type_is_not_significant() {
     t.sname = sname.clone();
     let parts = f
         .keyd
-        .issue_tgs_rep(&KDC, &SERVICE, &ctx.ctx_id, &t, &now())
+        .issue_tgs(&KDC, &SERVICE, &ctx.ctx_id, &t, &now())
         .unwrap();
     assert_eq!(parts.ticket.sname, sname);
 }

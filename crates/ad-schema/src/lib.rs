@@ -15,6 +15,16 @@
 //!   only), organizationalUnit, container, person, organizationalPerson,
 //!   user, computer, group — with their classSchema values from [MS-ADSC]
 //!   and the dirstore definitions of docs/46 §4.4 (R46-9).
+//! - **Two internal attributes** (module `internal`), stored by dirstore
+//!   with ATTRTYPs from the range [MS-ADTS] 3.1.1.2.6 reserves "for internal
+//!   use (never appear on the wire)" — in none of the AD tables or lookups,
+//!   so no LDAP request, PDP resource or wire format can name one:
+//!   [`HOST_ADDRESS`] (task DN6), a computer's DNS host addresses (docs/54
+//!   §5.2), allowed on computer (docs/questions/Q-614 item 1 (b), Q-992);
+//!   and [`PRINCIPAL_NAME_KEY`] (task PN2), the keys of the one principal
+//!   namespace, **unique** — so the store refuses a key another live object
+//!   holds, whichever name it was cut from — allowed on user, computer and
+//!   group (docs/59 §4.6; docs/questions/Q-1008 item 1, A-173).
 //! - **Identifiers computed, not tabled**: `AttrId` / `ClassId` =
 //!   [`make_attid`]`(attributeID | governsID)` — `MakeAttid` over
 //!   `NewPrefixTable()` exactly as [MS-DRSR] 5.16.4 defines them; an OID
@@ -44,7 +54,9 @@
 //! v20261026 2.2.9, 2.2.10, 2.2.12, 2.2.16, 3.1.1.1.4, 3.1.1.2.2.2,
 //! 3.1.1.2.3, 3.1.1.2.3.3, 3.1.1.2.4.3, 3.1.1.2.4.6, 3.1.1.2.4.8, 3.1.1.2.6,
 //! 3.1.1.4.2; [MS-DTYP] v20241119 2.3.4.1, 2.3.4.2, 2.5.1.1; ITU-T X.690
-//! (02/2021) 8.19. No other implementation was consulted or recalled
+//! (02/2021) 8.19. The principal-name key (task PN2) also from docs/59
+//! §4.1-§4.6, docs/questions/Q-1008 (A-173), [MS-SAMR] v20260427 3.1.1.8.4
+//! and RFC 4120 §6.2. No other implementation was consulted or recalled
 //! (docs/CLEAN-ROOM.md).
 //!
 //! Spec: docs/46 §3-§8; [MS-DRSR] 5.16.4; [MS-ADSC]; [MS-ADA1-3];
@@ -55,6 +67,7 @@ mod attributes;
 mod classes;
 mod error;
 pub mod flags;
+mod internal;
 mod schema;
 
 pub use attid::{make_attid, OidError, MAX_OID_LEN};
@@ -63,6 +76,13 @@ pub use attributes::{
 };
 pub use classes::{ClassEntry, CLASSES, STRUCTURAL_CLASS};
 pub use error::{Error, LookupError};
+// The internal attributes: host addresses (task DN6; docs/questions/Q-992)
+// and principal-name keys (task PN2; docs/59 §4.6, docs/questions/Q-1008).
+pub use internal::{
+    host_address_definition, principal_name_key_definition, HOST_ADDRESS, HOST_ADDRESS_HOLDERS,
+    HOST_ADDRESS_OCTETS, INTERNAL_ATTRTYP_FIRST, PRINCIPAL_NAME_KEY, PRINCIPAL_NAME_KEY_HOLDERS,
+    PRINCIPAL_NAME_KEY_MAX_OCTETS,
+};
 pub use schema::{
     phase1, AttributeInfo, ChainClass, ClassChain, ClassInfo, Phase1Schema, PropertySet,
 };

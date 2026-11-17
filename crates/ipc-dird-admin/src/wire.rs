@@ -8,7 +8,7 @@
 //! |---|---|
 //! | `auth` | `requester: bytes<64 KiB>` (a raw AP-REQ) ‖ `approvals: seq<_, 0>` (retired by Q-882: always empty) |
 //! | object | 16-octet objectGUID packet ([MS-DTYP] 2.3.4.2) |
-//! | name, UPN, SPN, dNSHostName, description | `bytes<max>` (UTF-8 in the typed layer) |
+//! | name, UPN, SPN, description | `bytes<max>` (UTF-8 in the typed layer) — no request carries a dNSHostName since task PN6b (dird derives it) |
 //! | DN | `seq<bytes<128>, 64>` of `att=value` components, leaf first |
 //! | SID | `bytes<68>` holding the [MS-DTYP] 2.4.2.2 packet |
 //! | `KeyHandle` | 16-octet `PrincipalId` ‖ purpose `u8` (closed table) |
@@ -36,10 +36,10 @@
 
 use crate::channel::{
     codes, reply_kind, request_kind, RefusalStatus, DIGEST_LEN, MAX_AP_REQ, MAX_BINDING_NAME,
-    MAX_CLASS_NAME, MAX_DESCRIPTION, MAX_DNS_HOST_NAME, MAX_DN_COMPONENT, MAX_DN_COMPONENTS,
-    MAX_FACTS, MAX_KEY_TARGETS, MAX_KVNOS, MAX_LISTED_REQUESTS, MAX_NAME, MAX_PLAN,
-    MAX_POLICY_CHANGES, MAX_POLICY_DN_COMPONENTS, MAX_PRINCIPAL_NAME, MAX_REALM, MAX_REASON_REF,
-    MAX_SALT, MAX_SHOWN_APPROVERS, MAX_SID, RETIRED_APPROVALS,
+    MAX_CLASS_NAME, MAX_DESCRIPTION, MAX_DN_COMPONENT, MAX_DN_COMPONENTS, MAX_FACTS,
+    MAX_KEY_TARGETS, MAX_KVNOS, MAX_LISTED_REQUESTS, MAX_NAME, MAX_PLAN, MAX_POLICY_CHANGES,
+    MAX_POLICY_DN_COMPONENTS, MAX_PRINCIPAL_NAME, MAX_REALM, MAX_REASON_REF, MAX_SALT,
+    MAX_SHOWN_APPROVERS, MAX_SID, RETIRED_APPROVALS,
 };
 use ipc::{DerBlob, Error, MessageSet, Payload, Reader, Result, Writer};
 use keyd_types::KeyPurpose;
@@ -376,14 +376,13 @@ pub enum WireOperation {
         /// The description.
         description: Option<Vec<u8>>,
     },
-    /// `CreateComputer {parent, name, dns_host_name, spn?}`.
+    /// `CreateComputer {parent, name, spn?}` — no dNSHostName: dird derives
+    /// it from the name (task PN6b; docs/questions/Q-1036 item 1, A-182).
     CreateComputer {
         /// The container.
         parent: GuidPacket,
         /// The computer name (without "$").
         name: Vec<u8>,
-        /// The dNSHostName.
-        dns_host_name: Vec<u8>,
         /// The single SPN.
         spn: Option<Vec<u8>>,
     },
@@ -597,15 +596,9 @@ impl WireOperation {
                 write_opt_bytes(writer, upn.as_ref(), MAX_PRINCIPAL_NAME)?;
                 write_opt_bytes(writer, description.as_ref(), MAX_DESCRIPTION)
             }
-            WireOperation::CreateComputer {
-                parent,
-                name,
-                dns_host_name,
-                spn,
-            } => {
+            WireOperation::CreateComputer { parent, name, spn } => {
                 writer.write_array(parent)?;
                 writer.write_bytes(name, MAX_NAME)?;
-                writer.write_bytes(dns_host_name, MAX_DNS_HOST_NAME)?;
                 write_opt_bytes(writer, spn.as_ref(), MAX_PRINCIPAL_NAME)
             }
             WireOperation::CreateGroup {
@@ -742,10 +735,11 @@ impl WireOperation {
                 upn: read_opt_owned(reader, MAX_PRINCIPAL_NAME)?,
                 description: read_opt_owned(reader, MAX_DESCRIPTION)?,
             },
+            // Task PN6b: `parent ‖ name ‖ spn?` — the dNSHostName left the
+            // layout (docs/questions/Q-1045 item 1).
             request_kind::CREATE_COMPUTER => WireOperation::CreateComputer {
                 parent: reader.read_array()?,
                 name: read_owned(reader, MAX_NAME)?,
-                dns_host_name: read_owned(reader, MAX_DNS_HOST_NAME)?,
                 spn: read_opt_owned(reader, MAX_PRINCIPAL_NAME)?,
             },
             request_kind::CREATE_GROUP => WireOperation::CreateGroup {

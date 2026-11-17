@@ -29,14 +29,22 @@
 //! 3. `commit`. Any error before it drops the transaction: nothing of it is
 //!    kept (dirstore: "dropping it without commit aborts it").
 //!
+//! The session is given the zone (task DN10b,
+//! `Provisioning::with_dns_registration`: the naming context and dird's
+//! registrable networks), so the DC account's create carries the DC's own
+//! host record (`--dc-address`) through the checker's host-record rule, and
+//! its commit takes the zone serial (docs/54 §3.1; docs/questions/Q-1003
+//! item 2, Q-1014).
+//!
 //! # The check after the commit
 //!
 //! The store is read back through directory-pip as dird reads it at start
 //! (Q-270 item 3): the NC root has the domain SID as objectSid; the krbtgt
 //! account (domain SID ‖ 502, sAMAccountName "krbtgt") resolves to the
 //! planned object; the RID counter's next value follows the last planned
-//! RID and the change-seq counter's follows the object count. A failure
-//! here means the staged file is not installed.
+//! RID and the change-seq counter's follows the object count; the zone
+//! serial counter was taken once (the DC's host record — task DN10b). A
+//! failure here means the staged file is not installed.
 //!
 //! Spec: docs/51 §4.3 step 5, §8.3; docs/32 §7, §7.1; docs/52 R13 (A-102);
 //! A-75; A-83; A-89 (Q-358 items 1, 8); Q-330 items 4-5; Q-270 item 3.
@@ -45,7 +53,8 @@ use core::fmt;
 
 use directory_admin::{
     wall_clock, InvariantViolation, Provisioning, ProvisioningError, ProvisioningRole,
-    CHANGE_SEQ_COUNTER, CHANGE_SEQ_END_EXCLUSIVE, CHANGE_SEQ_FIRST, RID_COUNTER, RID_END_EXCLUSIVE,
+    CHANGE_SEQ_COUNTER, CHANGE_SEQ_END_EXCLUSIVE, CHANGE_SEQ_FIRST, DNS_ZONE_SERIAL_COUNTER,
+    DNS_ZONE_SERIAL_END_EXCLUSIVE, DNS_ZONE_SERIAL_FIRST, RID_COUNTER, RID_END_EXCLUSIVE,
     RID_FIRST,
 };
 use directory_pip::{DirectoryContext, TierMap};
@@ -154,8 +163,13 @@ pub(crate) fn write_domain(store: &Store, plan: &Plan) -> Result<(), StoreError>
         .begin_write()
         .map_err(|_| StoreError::Store("begin_write"))?;
     {
-        let mut session =
-            Provisioning::begin(&mut txn, &schema, wall, plan.node_id).map_err(session_error)?;
+        // Task DN10b: the session's zone — the naming context's DNS name and
+        // dird's registrable networks (`Plan::dns_registration`) — so the
+        // DC account's create carries the DC's host record through the
+        // checker's host-record rule (module documentation).
+        let mut session = Provisioning::begin(&mut txn, &schema, wall, plan.node_id)
+            .map_err(session_error)?
+            .with_dns_registration(&plan.naming_context, &plan.dns_registration);
         for object in &plan.objects {
             session
                 .create(
@@ -225,6 +239,19 @@ pub(crate) fn check_domain(store: &Store, plan: &Plan) -> Result<(), StoreError>
     if seq.first_value != CHANGE_SEQ_FIRST
         || seq.end_exclusive != CHANGE_SEQ_END_EXCLUSIVE
         || Some(seq.next_value) != CHANGE_SEQ_FIRST.checked_add(writes)
+    {
+        return Err(StoreError::Counter);
+    }
+    // Task DN10b: the DC's host record was the one write that changed the
+    // zone, so the zone serial counter was taken exactly once (A-170: the
+    // one commit takes it for every write that changes the zone).
+    let zone = snapshot
+        .counter(DNS_ZONE_SERIAL_COUNTER)
+        .map_err(|_| StoreError::Counter)?
+        .ok_or(StoreError::Counter)?;
+    if zone.first_value != DNS_ZONE_SERIAL_FIRST
+        || zone.end_exclusive != DNS_ZONE_SERIAL_END_EXCLUSIVE
+        || Some(zone.next_value) != DNS_ZONE_SERIAL_FIRST.checked_add(1)
     {
         return Err(StoreError::Counter);
     }

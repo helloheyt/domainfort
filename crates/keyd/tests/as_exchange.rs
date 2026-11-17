@@ -45,7 +45,7 @@ fn as_round_trip() {
     assert_eq!(proof.authtime, n);
     let parts = f
         .keyd
-        .issue_as_rep(&KDC, &ALICE, &KRBTGT, &proof, None, &template, &n)
+        .issue_as(&KDC, &ALICE, &KRBTGT, &proof, None, &template, &n)
         .unwrap();
 
     // Client side: the enc-part opens with the client key, usage 3.
@@ -288,7 +288,7 @@ fn issue_without_proof_denied() {
     };
     assert_eq!(
         f.keyd
-            .issue_as_rep(&KDC, &ALICE, &KRBTGT, &forged, None, &as_template(), &now()),
+            .issue_as(&KDC, &ALICE, &KRBTGT, &forged, None, &as_template(), &now()),
         Err(IssueError::Denied)
     );
     assert_eq!(
@@ -304,11 +304,11 @@ fn proof_is_single_use() {
     let p = proof(&mut f);
     assert!(f
         .keyd
-        .issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, None, &as_template(), &now())
+        .issue_as(&KDC, &ALICE, &KRBTGT, &p, None, &as_template(), &now())
         .is_ok());
     assert_eq!(
         f.keyd
-            .issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, None, &as_template(), &now()),
+            .issue_as(&KDC, &ALICE, &KRBTGT, &p, None, &as_template(), &now()),
         Err(IssueError::Denied)
     );
 }
@@ -321,7 +321,7 @@ fn expired_proof_denied() {
     let p = proof(&mut f);
     assert_eq!(
         f.keyd
-            .issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, None, &as_template(), &at(31)),
+            .issue_as(&KDC, &ALICE, &KRBTGT, &p, None, &as_template(), &at(31)),
         Err(IssueError::Denied)
     );
     assert_eq!(
@@ -332,7 +332,7 @@ fn expired_proof_denied() {
     let p = proof(&mut f);
     assert!(f
         .keyd
-        .issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, None, &as_template(), &at(30))
+        .issue_as(&KDC, &ALICE, &KRBTGT, &p, None, &as_template(), &at(30))
         .is_ok());
 }
 
@@ -344,7 +344,7 @@ fn proof_bound_to_caller() {
     let mut f = Fixture::new();
     let p = proof(&mut f);
     assert_eq!(
-        f.keyd.issue_as_rep(
+        f.keyd.issue_as(
             &KDC_OTHER,
             &ALICE,
             &KRBTGT,
@@ -361,23 +361,26 @@ fn proof_bound_to_caller() {
     );
     assert_eq!(
         f.keyd
-            .issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, None, &as_template(), &now()),
+            .issue_as(&KDC, &ALICE, &KRBTGT, &p, None, &as_template(), &now()),
         Err(IssueError::Denied)
     );
 }
 
 /// I4: a proof is bound to the pre-authenticated client: it cannot issue a
-/// ticket for another client handle, nor with a template naming another
-/// client. Source: docs/10 §4 step 1 ("proof valid and bound to client").
+/// ticket for another client — dird's resolution of bob's name to bob's key
+/// set (`TokenPrincipalMismatch`: since task PN11b the client key set is the
+/// resolution's, and the proof must be bound to it) — nor with a template
+/// naming another client under alice's key set (the door refuses it), nor
+/// with a proof whose echoed client was changed. Source: docs/10 §4 step 1
+/// ("proof valid and bound to client"); docs/questions/Q-1067, Q-1080.
 #[test]
 fn proof_bound_to_client() {
     let mut f = Fixture::new();
     let p = proof(&mut f);
     let mut t = as_template();
-    t.client = BOB_ID;
+    t.cname = bob_name();
     assert_eq!(
-        f.keyd
-            .issue_as_rep(&KDC, &BOB, &KRBTGT, &p, None, &t, &now()),
+        f.keyd.issue_as(&KDC, &BOB, &KRBTGT, &p, None, &t, &now()),
         Err(IssueError::Denied)
     );
     assert_eq!(
@@ -387,16 +390,19 @@ fn proof_bound_to_client() {
 
     let p = proof(&mut f);
     assert_eq!(
-        f.keyd
-            .issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, None, &t, &now()),
+        f.keyd.issue_as(&KDC, &ALICE, &KRBTGT, &p, None, &t, &now()),
         Err(IssueError::Denied)
+    );
+    assert_eq!(
+        f.records().last().unwrap().reason,
+        AuditReason::NameResolutionMismatch
     );
 
     let mut p = proof(&mut f);
     p.client = BOB_ID;
     assert_eq!(
         f.keyd
-            .issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, None, &as_template(), &now()),
+            .issue_as(&KDC, &ALICE, &KRBTGT, &p, None, &as_template(), &now()),
         Err(IssueError::Denied)
     );
 }
@@ -422,8 +428,7 @@ fn forbidden_flags_bad_template() {
         let mut t = as_template();
         t.flags = flag;
         assert_eq!(
-            f.keyd
-                .issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, None, &t, &now()),
+            f.keyd.issue_as(&KDC, &ALICE, &KRBTGT, &p, None, &t, &now()),
             Err(IssueError::BadTemplate),
             "{flag:?}"
         );
@@ -447,8 +452,7 @@ fn unconfigured_session_enctype_bad_template() {
         let mut t = as_template();
         t.session_enctype = enctype;
         assert_eq!(
-            f.keyd
-                .issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, None, &t, &now()),
+            f.keyd.issue_as(&KDC, &ALICE, &KRBTGT, &p, None, &t, &now()),
             Err(IssueError::BadTemplate)
         );
         assert_eq!(
@@ -486,8 +490,7 @@ fn template_times_bad_template() {
         let mut t = as_template();
         mutate(&mut t);
         assert_eq!(
-            f.keyd
-                .issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, None, &t, &now()),
+            f.keyd.issue_as(&KDC, &ALICE, &KRBTGT, &p, None, &t, &now()),
             Err(IssueError::BadTemplate),
             "case {i}"
         );
@@ -515,8 +518,7 @@ fn template_names_bad_template() {
         let mut t = as_template();
         mutate(&mut t);
         assert_eq!(
-            f.keyd
-                .issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, None, &t, &now()),
+            f.keyd.issue_as(&KDC, &ALICE, &KRBTGT, &p, None, &t, &now()),
             Err(IssueError::BadTemplate),
             "case {i}"
         );
@@ -548,7 +550,7 @@ fn key_change_between_steps_denied() {
         .unwrap();
     assert_eq!(
         f.keyd
-            .issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, None, &as_template(), &now()),
+            .issue_as(&KDC, &ALICE, &KRBTGT, &p, None, &as_template(), &now()),
         Err(IssueError::Denied)
     );
     assert_eq!(
@@ -590,10 +592,14 @@ fn proof_table_is_bounded() {
 }
 
 /// Name binding (Q-040, A-19): a valid proof for alice cannot produce a TGT
-/// naming anyone else — the client key set is bound to alice. Callers see
-/// only the uniform Denied. Source: docs/questions/Q-040 (A-19); docs/25
-/// §3.2 (keyd is a PEP bounding a compromised KDC); RFC 4120 5.3 (cname),
-/// 6.1 / 6.2 (names compared as given; no case folding in keyd).
+/// naming anyone else. Since task PN11 the names a ticket may carry are the
+/// ones dird attested: with dird's resolution of `alice` to alice's key set
+/// (an honest dird), a KDC that writes another cname — another principal, a
+/// case variant, an extra component — is refused (`NameResolutionMismatch`),
+/// whatever it asks. Callers see only the uniform Denied. Source:
+/// docs/questions/Q-040 (A-19); docs/25 §3.2 (keyd is a PEP bounding a
+/// compromised KDC); docs/59 §7.2 step 5 (the ticket's names are one of the
+/// resolution's pairs, exactly — keyd does not fold); RFC 4120 5.3 (cname).
 #[test]
 fn as_cname_must_match_client_binding() {
     let mut f = Fixture::new();
@@ -610,19 +616,27 @@ fn as_cname_must_match_client_binding() {
             name_string: vec![kstr("alice"), kstr("admin")],
         },
     ];
+    let alice = resolution_at(&alice_name(), &ALICE, &now());
     for cname in names {
         let p = proof(&mut f);
         let mut t = as_template();
         t.cname = cname.clone();
         assert_eq!(
-            f.keyd
-                .issue_as_rep(&KDC, &ALICE, &KRBTGT, &p, None, &t, &now()),
+            f.keyd.issue_as_rep(
+                &KDC,
+                &alice,
+                keyd::AsServerKeySet::LocalTgt(&KRBTGT),
+                &p,
+                None,
+                &t,
+                &now()
+            ),
             Err(IssueError::Denied),
             "{cname:?}"
         );
         assert_eq!(
             f.records().last().unwrap().reason,
-            AuditReason::NameBindingMismatch
+            AuditReason::NameResolutionMismatch
         );
     }
 }
@@ -659,7 +673,7 @@ fn krbtgt_bound_to_wrong_name_denied() {
         .unwrap();
     let p = proof(&mut f);
     assert_eq!(
-        f.keyd.issue_as_rep(
+        f.keyd.issue_as(
             &KDC,
             &ALICE,
             &other_krbtgt,

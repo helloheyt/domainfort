@@ -7,21 +7,35 @@
 //! no context for it — docs/questions/Q-523), and passes the ticket's facts
 //! (crealm, cname, authtime, the verified digest). This crate never accepts a SID, a name, groups or a tier that
 //! the caller claims (A-73; docs/06 §2 and docs/11 §10 P3 as cited in
-//! docs/51 §5.3): the cname is resolved through the directory exactly as the
-//! KDC resolves an AS client (`AccountSource::client`, docs/47 §1.3), and
-//! the SID, the transitive groups and the tier all come from that one view.
+//! docs/51 §5.3): the cname is resolved through the directory's one lookup
+//! path in the context of a ticket's client (`LookupCtx::TicketClient` —
+//! in wave 2 exactly the names the KDC accepts as an AS client, docs/47
+//! §1.3; docs/59 §6.2, §6.3), and the SID, the transitive groups and the
+//! tier all come from that one view.
+//!
+//! # No account record of the KDC (task PN10b; A-187)
+//!
+//! The lookup is directory-pip's ticket-subject lookup
+//! (`directory_pip::TicketSubjects`), which answers only the facts this
+//! module reads — the objectGUID, the objectSid, the account state, the
+//! expansion and the tier — and **no** name resolution: the KDC's account
+//! source, whose records carry a resolution attested with dird's key for
+//! keyd, is the KDC channel's alone (docs/questions/Q-1047, class "a
+//! component obtains a capability it does not need"). This crate does not
+//! link crate kdc, so it cannot name that account source at all.
 //!
 //! Spec: docs/51 §5.3 (option D, R51-8; "principal = the account's
 //! objectSid; groups = the transitive closure; tier = tier_of from the same
 //! view; auth = {Kerberos, armored: false, ticket_age: now − authtime,
 //! ticket_verified: true}"), §5.5 (R51-10); docs/47 §1.3, §4, §4.5
-//! (`usable_at`, `revokes` — RFC 4120 §3.3.3.1 as cited there); A-73.
+//! (`usable_at`, `revokes` — RFC 4120 §3.3.3.1 as cited there); docs/59
+//! §6.2, §6.4; docs/questions/Q-1047 (A-187); A-73.
 
 use core::time::Duration;
 use std::collections::BTreeMap;
 
+use directory_pip::TicketSubjects;
 use dtyp::{Guid, Sid};
-use kdc::AccountSource;
 use keyd_types::{OperationDigest, OperationTicket};
 use krb_proto::{KerberosTime, PrincipalName, Realm};
 use pdp::{AuthContext, AuthStrength, Subject};
@@ -96,12 +110,14 @@ pub struct AdminSubject {
 impl AdminSubject {
     /// Build the Subject of the ticket's client (module documentation):
     ///
-    /// 1. `AccountSource::client(crealm, cname)` on `accounts` (the
+    /// 1. `TicketSubjects::ticket_subject(crealm, cname)` on `subjects` (the
     ///    request's view — a `DirectoryView`, or the PEP's
-    ///    `PepView::accounts`, docs/52 R-a) — the configured
-    ///    realm, exactly one component, the sAMAccountName index and an
-    ///    octet-for-octet compare, user or computer, never krbtgt (docs/47
-    ///    §1.3). No account ⇒ [`SubjectError::NotUsable`].
+    ///    `PepView::subjects`, docs/52 R-a): the one lookup path in the
+    ///    `TicketClient` context — the configured realm, exactly one
+    ///    component, the stored sAMAccountName octet for octet, user or
+    ///    computer, never krbtgt (docs/47 §1.3; docs/59 §6.2, §6.3) — and
+    ///    only the facts read below, no name resolution (task PN10b). No
+    ///    account ⇒ [`SubjectError::NotUsable`].
     /// 2. The account must be usable at `now` and must not revoke a ticket
     ///    first authenticated at `authtime` (docs/47 §4, §4.5) — otherwise
     ///    [`SubjectError::NotUsable`], the same answer as for an unknown name.
@@ -110,15 +126,16 @@ impl AdminSubject {
     ///    `auth = {Kerberos, armored: false, ticket_age: now − authtime,
     ///    ticket_verified: true}` (an AP-REQ is not FAST).
     ///
-    /// Spec: docs/51 §5.3; docs/47 §1.3, §4, §4.5; A-73.
+    /// Spec: docs/51 §5.3; docs/47 §1.3, §4, §4.5; docs/59 §6.2;
+    /// docs/questions/Q-1047 (A-187); A-73.
     pub fn from_verified_ticket(
-        accounts: &dyn AccountSource,
+        subjects: &dyn TicketSubjects,
         crealm: &Realm,
         cname: &PrincipalName,
         authtime: &KerberosTime,
         now: &KerberosTime,
     ) -> Result<AdminSubject, SubjectError> {
-        let account = match accounts.client(crealm, cname) {
+        let account = match subjects.ticket_subject(crealm, cname) {
             Ok(Some(account)) => account,
             Ok(None) => return Err(SubjectError::NotUsable),
             Err(_) => return Err(SubjectError::Unavailable),
@@ -129,9 +146,9 @@ impl AdminSubject {
             return Err(SubjectError::NotUsable);
         }
         let ticket_age = time::ticket_age(now, authtime);
-        // The account's objectGUID: the principal id of its key set handle
-        // (docs/47 §1.3: the handle is `(objectGUID, PrincipalLongterm)`).
-        let guid = Guid::from_packet(account.key.principal.as_bytes());
+        // The account's objectGUID (docs/47 §2.3: the principal id of its
+        // key set handle `(objectGUID, PrincipalLongterm)`, docs/47 §1.3).
+        let guid = account.guid;
         Ok(AdminSubject {
             subject: Subject {
                 principal: account.sid,
@@ -151,7 +168,7 @@ impl AdminSubject {
     }
 
     /// The account's objectGUID — what keyd's `DualControlToken` names an
-    /// approver by (crates/keyd-types model.rs; docs/51 §6). Spec: docs/47
+    /// approver by (crates/keyd-types model.rs; docs/51 §5.6). Spec: docs/47
     /// §1.3 (the key handle's principal is the objectGUID).
     #[must_use]
     pub fn guid(&self) -> Guid {

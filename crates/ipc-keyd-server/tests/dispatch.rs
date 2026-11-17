@@ -526,8 +526,14 @@ fn admin_and_directory_operations_through_the_client() {
         .unwrap()
         .entries
         .is_empty());
-    // The ceremony's end (R3): Admin only; afterwards no create_key.
+    // The ceremony's end (R3): Admin only; afterwards no create_key. Task
+    // PN11 (Q-1056, A-188): no seal before the attestation key is installed.
     assert_eq!(ldap.seal_ceremony(), Err(keyd::Error::Denied));
+    assert_eq!(admin.seal_ceremony(), Err(keyd::Error::Denied));
+    assert_eq!(
+        admin.install_attestation_key(samples::attestation_key()),
+        Ok(Ok(()))
+    );
     assert_eq!(admin.seal_ceremony(), Ok(()));
     let other = samples::handle(0x77, KeyPurpose::Service);
     assert_eq!(
@@ -672,13 +678,19 @@ fn every_transport_failure_is_unavailable() {
             Err(AuthnError::Unavailable),
             "{fault:?}"
         );
+        let resolution = samples::resolution(
+            samples::name(1, &["alice"]),
+            samples::name(1, &["alice"]),
+            alice,
+            0x9C,
+        );
         assert_eq!(
             kdc.issue_as_rep(
-                &alice,
-                &samples::KRBTGT,
+                &resolution,
+                keyd::AsServerKeySet::LocalTgt(&samples::KRBTGT),
                 &samples::proof(),
                 None,
-                &samples::as_template(false)
+                &samples::as_template(false),
             ),
             Err(IssueError::Unavailable),
             "{fault:?}"

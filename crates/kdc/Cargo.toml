@@ -54,6 +54,11 @@ keyd = { path = "../keyd", features = ["test-seams"] }
 # decrypt AS-REP / TGS-REP / ticket parts to check names, flags and times. The
 # product library never links it (D182).
 krb-crypto = { path = "../krb-crypto" }
+# TESTS ONLY (task PN10; docs/59 §7.4): every account record carries dird's
+# attested name resolution; the fixtures (tests/common `test_resolution`)
+# tag theirs with a test key through this crate's signer, as dird does. The
+# product KDC links no MAC (D182) — it only forwards the resolution.
+name-attestation = { path = "../name-attestation" }
 
 [lints]
 workspace = true

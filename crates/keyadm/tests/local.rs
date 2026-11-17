@@ -10,7 +10,8 @@ use dtyp::{Guid, Sid};
 use ipc::Refused;
 use ipc_keyd::{Answer, CallFailure, ConversionError, RequestFate, TransportError, Unserved};
 use keyadm::ceremony::{
-    classify, CeremonyReport, GrantReport, NotSent, Outcome, Step, StepReport, Unknown,
+    classify, AttestationKeyStep, CeremonyReport, GrantReport, NotSent, Outcome, Step, StepReport,
+    Unknown,
 };
 use keyadm::cli::{self, Command, UsageError};
 use keyadm::identity::{refuse_root, IdentityError};
@@ -182,9 +183,12 @@ fn every_client_result_is_classified() {
 // ---- command line --------------------------------------------------------------
 
 /// docs/51 §6 (`ceremony <manifest>`), the configuration path first as the
-/// daemons take it; exactly three arguments, no options; the A10 commands
-/// take a decimal request id (`destroy-sweep` nothing) — the rest of their
-/// grammar is in tests/key_operations_local.rs.
+/// daemons take it; exactly four arguments for the ceremony, the fourth the
+/// attestation key file (task PN9; docs/59 §7.4) — required since task PN12
+/// (A-183 on docs/questions/Q-1039 item 2: `ceremony <manifest>` alone is a
+/// usage error) — no options; the A10 commands take a decimal request id
+/// (`destroy-sweep` nothing) — the rest of their grammar is in
+/// tests/key_operations_local.rs.
 #[test]
 fn the_command_line_is_exact() {
     let args = |list: &[&str]| list.iter().map(OsString::from).collect::<Vec<_>>();
@@ -194,17 +198,32 @@ fn the_command_line_is_exact() {
             "ceremony",
             "/etc/test/manifest"
         ])),
+        Err(UsageError)
+    );
+    assert_eq!(
+        cli::parse(args(&[
+            "/etc/test/keyadm.conf",
+            "ceremony",
+            "/etc/test/manifest",
+            "/etc/test/attestation.key"
+        ])),
         Ok(Command::Ceremony {
             config: PathBuf::from("/etc/test/keyadm.conf"),
             manifest: PathBuf::from("/etc/test/manifest"),
+            attestation_key: PathBuf::from("/etc/test/attestation.key"),
         })
     );
     for bad in [
         &[][..],
         &["/c"][..],
         &["/c", "ceremony"][..],
-        &["/c", "ceremony", "/m", "extra"][..],
+        &["/c", "ceremony", "/m", "/k", "extra"][..],
+        &["/c", "ceremony", "/m", "/k", "extra", "more"][..],
+        &["/c", "destroy-sweep", "/m", "/k"][..],
+        &["/c", "rotate-key", "7", "/k"][..],
         &["/c", "Ceremony", "/m"][..],
+        &["/c", "Ceremony", "/m", "/k"][..],
+        &["/c", "ceremony", "/m"][..],
         &["ceremony", "/m", "/c"][..],
         &["/c", "destroy-sweep", "/m"][..],
         &["/c", "rotate-krbtgt", "/m"][..],
@@ -242,6 +261,7 @@ fn step(step: Step, outcome: Outcome<Kvno>) -> StepReport {
 fn a_complete_report_prints_handles_bindings_and_kvnos() {
     let m = manifest();
     let report = CeremonyReport {
+        attestation_key: AttestationKeyStep::Attempted(Outcome::Answered(Ok(()))),
         contact: Outcome::Answered(Ok(())),
         steps: Step::ALL
             .iter()
@@ -276,6 +296,7 @@ fn a_complete_report_prints_handles_bindings_and_kvnos() {
     }
     // Without the grants the ceremony is not complete (task A15a).
     let without = CeremonyReport {
+        attestation_key: AttestationKeyStep::Attempted(Outcome::Answered(Ok(()))),
         grants: Vec::new(),
         seal: None,
         ..report.clone()
@@ -310,6 +331,7 @@ fn a_ceremony_without_its_seal_is_incomplete() {
         ),
     ] {
         let report = CeremonyReport {
+            attestation_key: AttestationKeyStep::Attempted(Outcome::Answered(Ok(()))),
             contact: Outcome::Answered(Ok(())),
             steps: Step::ALL
                 .iter()
@@ -350,6 +372,7 @@ fn a_refused_grant_stops_after_the_key_sets() {
         .map(|s| step(*s, Outcome::Answered(Ok(Kvno::new(1)))))
         .collect();
     let report = CeremonyReport {
+        attestation_key: AttestationKeyStep::Attempted(Outcome::Answered(Ok(()))),
         contact: Outcome::Answered(Ok(())),
         steps: created.clone(),
         grants: vec![GrantReport {
@@ -370,6 +393,7 @@ fn a_refused_grant_stops_after_the_key_sets() {
     assert!(text.contains("initial secret of a user that has no key set yet"));
     assert!(text.contains("keyd is NOT sealed"), "{text}");
     let unknown = CeremonyReport {
+        attestation_key: AttestationKeyStep::Attempted(Outcome::Answered(Ok(()))),
         grants: vec![GrantReport {
             admin: 0,
             outcome: Outcome::Unknown(Unknown::Transport(TransportError::Closed)),
@@ -390,6 +414,7 @@ fn a_refused_grant_stops_after_the_key_sets() {
 fn a_refused_first_step_stops_and_explains() {
     let m = manifest();
     let report = CeremonyReport {
+        attestation_key: AttestationKeyStep::NotAttempted,
         contact: Outcome::Answered(Ok(())),
         steps: vec![step(
             Step::Krbtgt,
@@ -429,6 +454,7 @@ fn a_refused_first_step_stops_and_explains() {
 fn an_unknown_outcome_says_the_key_set_may_exist() {
     let m = manifest();
     let report = CeremonyReport {
+        attestation_key: AttestationKeyStep::NotAttempted,
         contact: Outcome::Answered(Ok(())),
         steps: vec![
             step(Step::Krbtgt, Outcome::Answered(Ok(Kvno::new(1)))),
@@ -491,6 +517,7 @@ fn the_three_fates_are_reported_apart() {
     for (outcome, expected) in cases {
         let unknown = outcome.outcome_unknown();
         let report = CeremonyReport {
+            attestation_key: AttestationKeyStep::NotAttempted,
             contact: Outcome::Answered(Ok(())),
             steps: vec![step(Step::Krbtgt, outcome)],
             grants: Vec::new(),
@@ -506,6 +533,7 @@ fn the_three_fates_are_reported_apart() {
         assert!(text.contains("0 of 4 key sets created"));
 
         let contact = CeremonyReport {
+            attestation_key: AttestationKeyStep::NotAttempted,
             contact: match outcome {
                 Outcome::NotSent(reason) => Outcome::NotSent(reason),
                 Outcome::NotPerformed(refused) => Outcome::NotPerformed(refused),
@@ -538,6 +566,7 @@ fn a_failed_contact_attempts_nothing() {
         Outcome::Answered(Err(KeydError::Denied)),
     ] {
         let report = CeremonyReport {
+            attestation_key: AttestationKeyStep::NotAttempted,
             contact,
             steps: Vec::new(),
             grants: Vec::new(),
@@ -581,4 +610,117 @@ fn a_configuration_file_not_owned_by_root_is_refused() {
     );
     assert_eq!(read_settings(&dir), Err(SettingsError::Permissions));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- the attestation key step (task PN9) -------------------------------------------
+
+/// A report whose four key sets were created, with `attestation_key` and,
+/// when `rest` — the grants and the seal — all answered `Ok`.
+fn report_with(m: &Manifest, attestation_key: AttestationKeyStep, rest: bool) -> CeremonyReport {
+    CeremonyReport {
+        contact: Outcome::Answered(Ok(())),
+        steps: Step::ALL
+            .iter()
+            .map(|s| step(*s, Outcome::Answered(Ok(Kvno::new(1)))))
+            .collect(),
+        attestation_key,
+        grants: if rest {
+            (0..m.first_admins().len())
+                .map(|admin| GrantReport {
+                    admin,
+                    outcome: Outcome::Answered(Ok(())),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
+        first_admins: m.first_admins().len(),
+        seal: rest.then_some(Outcome::Answered(Ok(()))),
+    }
+}
+
+/// docs/59 §7.4, §7.5 (task PN9; docs/questions/Q-1033): a ceremony is
+/// complete only with keyd's `Ok` to its attestation-key install; the report
+/// says so and prints nothing of the key. Task PN11 (Q-1056 item 4, A-188):
+/// there is no keyless ceremony — a report whose install was never
+/// attempted is not complete, whatever else it holds.
+#[test]
+fn the_attestation_key_step_is_reported_without_the_key() {
+    let m = manifest();
+    let installed = report_with(
+        &m,
+        AttestationKeyStep::Attempted(Outcome::Answered(Ok(()))),
+        true,
+    );
+    assert!(installed.is_complete());
+    assert!(installed.attestation_key_installed());
+    assert_eq!(report::exit_code(&installed), EXIT_COMPLETE);
+    let text = report::render(&installed, &m).join("\n");
+    assert!(
+        text.contains("installed the attestation key of dird's name resolutions in keyd"),
+        "{text}"
+    );
+    assert!(text.contains("4 of 4 key sets created; attestation key installed"));
+    assert!(!text.contains("no attestation key file given"));
+
+    let without = report_with(&m, AttestationKeyStep::NotAttempted, true);
+    assert!(!without.is_complete());
+    assert!(!without.grants_registered());
+    assert!(!without.attestation_key_installed());
+    assert_eq!(report::exit_code(&without), EXIT_INCOMPLETE);
+}
+
+/// docs/59 §7.4 (keyd installs the key once, in the ceremony only, for
+/// Role::Admin — its uniform `Denied` otherwise); docs/51 §4.5 (A-77: never
+/// retry, restart keyd): a refused, not performed or unknown install stops
+/// the ceremony before the grants and the seal — not complete, exit 2 — and
+/// the report says the key is not known to be installed and keyd is not
+/// sealed; an unknown outcome points at keyd's audit log.
+#[test]
+fn a_ceremony_whose_attestation_key_is_not_installed_stops() {
+    let m = manifest();
+    for (outcome, expected) in [
+        (
+            Outcome::Answered(Err(KeydError::Denied)),
+            "attestation key: keyd refused (denied)",
+        ),
+        (
+            Outcome::NotPerformed(Refused::Busy),
+            "attestation key: keyd is busy or cannot reach auditd (not performed); not installed",
+        ),
+        (
+            Outcome::NotSent(NotSent::Connect),
+            "attestation key: the keyd socket could not be connected (nothing was sent); not installed",
+        ),
+        (
+            Outcome::Unknown(Unknown::Transport(TransportError::Closed)),
+            "outcome unknown, the key MAY have been installed",
+        ),
+    ] {
+        let report = report_with(&m, AttestationKeyStep::Attempted(outcome), false);
+        assert!(!report.is_complete());
+        assert!(report.key_sets_created());
+        assert!(!report.grants_registered());
+        assert_eq!(report::exit_code(&report), EXIT_INCOMPLETE);
+        let text = report::render(&report, &m).join("\n");
+        assert!(text.contains(expected), "{expected}\n---\n{text}");
+        assert!(
+            text.contains("ceremony stopped at the attestation key"),
+            "{text}"
+        );
+        assert!(text.contains("keyd is NOT sealed"), "{text}");
+        assert_eq!(
+            text.contains("check keyd's audit log"),
+            matches!(outcome, Outcome::Unknown(_)),
+            "{text}"
+        );
+    }
+    // A key that was given but never reached (the key sets stopped first):
+    // no attestation line, the key-set report as before.
+    let mut stopped = report_with(&m, AttestationKeyStep::NotAttempted, false);
+    stopped.steps.truncate(1);
+    stopped.steps[0].outcome = Outcome::Answered(Err(KeydError::Denied));
+    let text = report::render(&stopped, &m).join("\n");
+    assert!(!text.contains("attestation key"), "{text}");
+    assert_eq!(report::exit_code(&stopped), EXIT_INCOMPLETE);
 }

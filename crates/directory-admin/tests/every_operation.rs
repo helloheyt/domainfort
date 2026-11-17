@@ -47,7 +47,6 @@ fn every_write(
         Operation::CreateComputer(CreateComputer {
             parent,
             name: "newpc".into(),
-            dns_host_name: "newpc.example.test".into(),
             spn: None,
         }),
         Operation::CreateGroup(CreateGroup {

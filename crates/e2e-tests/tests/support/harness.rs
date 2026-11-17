@@ -155,8 +155,9 @@ pub const DNS_HOST_NAME: &str = "dc1.example.org";
 
 /// The sources auditd's listeners name the one test uid as (module
 /// documentation, "Identity"): each sender's own process name of docs/50
-/// §2.4 (crates/config `AuditSource`).
-pub const AUDIT_LABELS: [&str; 5] = ["keyd", "dird", "kdc", "ldap-front", "admind"];
+/// §2.4 (crates/config `AuditSource`) — dnsd's too since task DN10a's
+/// end-to-end test runs it (tests/dns_zone.rs; A-160: source `dnsd`).
+pub const AUDIT_LABELS: [&str; 6] = ["keyd", "dird", "kdc", "ldap-front", "admind", "dnsd"];
 
 /// auditd's configuration texts for the one-uid world: one per `(socket,
 /// source name)` listener, all naming `mapped_uid` as that source, with one

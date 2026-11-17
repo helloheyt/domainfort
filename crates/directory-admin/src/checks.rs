@@ -24,14 +24,15 @@
 //!
 //! [`Cx`] holds the request's view twice: as a `directory_pip::PepView`
 //! ([`Cx::pep`], public to the crate) — the gate, the locators, the PIP and
-//! the account source, all the request-facing code (crate::admin,
-//! crate::key_requests) can reach — and as the authority's
+//! the ticket-subject lookup (task PN10b), all the request-facing code
+//! (crate::admin, crate::key_requests) can reach — and as the authority's
 //! `DirectoryView`, a **private** field of `Cx`. Only this module reads the
 //! raw snapshot (`DirectoryView::authority_snapshot`): the internal reads
 //! docs/questions/Q-486 item 5 puts outside the gate — the write invariants'
 //! graph, the self-lockout count, the counters, the name and uniqueness
-//! checks of a create, the has-children probe of a delete, the NC root, the
-//! exact-value locator of `Lookup`, the key-operation target, the
+//! checks of a create (the uniqueness one over the one principal namespace
+//! — task PN5), the has-children probe of a delete, the NC root, the
+//! namespace locator of `Lookup`, the key-operation target, the
 //! tombstones of dird's destroy decisions, and (task MA3) the effect-plan
 //! facts of crate::effects (`directory_pip::PrincipalFacts`, the member
 //! closure, the principals under a subtree, an account's state) — each a
@@ -50,25 +51,37 @@ use std::collections::{BTreeSet, VecDeque};
 
 use ad_schema::flags::group_type::GROUP_TYPE_SECURITY_ENABLED;
 use directory_pip::{
-    DirectoryView, MemberChange, PepView, PrincipalFacts, TierMap, VisibilityGate, VisibilityProof,
-    VisibilityRule, VisibleObject, MAX_EXPANDED_GROUPS, MAX_NESTING_DEPTH,
+    AccountState, DirectoryView, MemberChange, PepView, PrincipalFacts, TicketSubjects, TierMap,
+    VisibilityGate, VisibilityProof, VisibilityRule, VisibleObject, MAX_EXPANDED_GROUPS,
+    MAX_NESTING_DEPTH,
 };
-use dirstore::{AttrId, ClassId, CounterState, Object, Tombstone, TombstonePage};
+use dirstore::{ClassId, CounterState, Object, Tombstone, TombstonePage};
 use dtyp::{Guid, Sid};
 use ipc_audit::{AdminFailure, AdminRefusal};
-use kdc::AccountSource;
-use krb_proto::constants::KRB_NT_PRINCIPAL;
+use krb_proto::constants::{KRB_NT_PRINCIPAL, KRB_NT_SRV_HST};
 use krb_proto::{KerberosString, KerberosTime, PrincipalName};
 use pdp::{
     AccessRequest, Action, Context, Decision, Dn, Instant, IpScope, PolicySnapshot, Resource,
     Subject, Tier, Transport, TransportSec,
 };
+use principal_names::{key_of_request, KeySet, RequestKey, MAX_KEY_COMPONENTS};
 
 use crate::audit::Stop;
 use crate::config::AdminConfig;
 use crate::ids::Ids;
 use crate::invariants::{End, Fault, Graph, Invariants, LinkProof, MAX_WALK_STEPS};
 use crate::record;
+
+/// Which stored name a `Lookup` compares with its value, once the one
+/// namespace probe found an object (docs/59 §6.4: the kind filter).
+/// Spec: docs/51 §5.2 row 10 (`Lookup {sam | spn | dn}`); docs/59 §6.4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NameLookup {
+    /// The object's sAMAccountName.
+    SamAccountName,
+    /// The object's servicePrincipalName.
+    ServicePrincipalName,
+}
 
 /// The transport security of the admin plane's local socket: the bytes
 /// never leave the host's kernel (`encrypted`, `sealed`), and
@@ -108,8 +121,9 @@ pub(crate) struct Cx<'c, 'v, 'a> {
     pub(crate) config: &'c AdminConfig,
     pub(crate) ids: &'c Ids,
     /// The view as the request-facing code receives it: the gate, the
-    /// locators, the PIP, the account source — no raw read (module
-    /// documentation; docs/52 R-a).
+    /// locators, the PIP, the ticket-subject lookup — no raw read and no
+    /// account source of the KDC (module documentation; docs/52 R-a;
+    /// docs/questions/Q-1047).
     pub(crate) pep: PepView<'v, 'a>,
     /// The authority's view of the same snapshot — private to this module,
     /// read only by its internal-read methods (module documentation;
@@ -168,6 +182,33 @@ impl<'c, 'v, 'a> Cx<'c, 'v, 'a> {
             now,
             Transport::Kpasswd,
             KPASSWD_SECURITY,
+        )
+    }
+
+    /// The checks' inputs of a DNS self-update (task DN6): the same view and
+    /// policy, the transport `Dns`, and **no** transport security — what a
+    /// GSS-TSIG signed UPDATE has: the message is signed, the transport is
+    /// neither encrypted nor sealed nor bound (RFC 8945 §4.3 signs, it does
+    /// not encrypt). `DnsUpdate` has no transport floor (A-22), so this
+    /// truthful value refuses nothing; no policy can mistake it for a
+    /// protected channel.
+    /// Spec: pdp `required_sec` (A-22: "DnsUpdate: NO transport floor");
+    /// docs/40 §2 (D166); docs/54 §4.5 step 5; docs/questions/Q-991 item 8.
+    pub(crate) fn dns(
+        config: &'c AdminConfig,
+        ids: &'c Ids,
+        view: &'v DirectoryView<'a>,
+        policy: &'v PolicySnapshot,
+        now: &KerberosTime,
+    ) -> Result<Cx<'c, 'v, 'a>, Stop> {
+        Cx::on(
+            config,
+            ids,
+            view,
+            policy,
+            now,
+            Transport::Dns,
+            TransportSec::NONE,
         )
     }
 
@@ -285,6 +326,9 @@ pub(crate) fn fault_stop(fault: &Fault) -> Stop {
         Fault::Store(e) => store_failure(e),
         Fault::Integrity => Stop::Failed(AdminFailure::IntegrityFailure),
         Fault::Missing => Stop::Failed(AdminFailure::StoreFailure),
+        // The online PEP's checker always has its namespace (task PN5;
+        // `AdminConfig`): a misassembled checker — fail closed.
+        Fault::Namespace => Stop::Failed(AdminFailure::InternalFailure),
     }
 }
 
@@ -327,13 +371,13 @@ impl<'v, 'a> Cx<'_, 'v, 'a> {
     /// The requester's own account object of a kpasswd change (task K6):
     /// the record and the canonical DN of `guid` — the objectGUID of the
     /// account the request ticket's client resolved to through this view's
-    /// account source (`AdminSubject::guid`). Internal read: the object is
+    /// ticket-subject lookup (`AdminSubject::guid`). Internal read: the object is
     /// not named by the request, it **is** the authenticated requester, so
     /// the visibility gate (which answers "is the requester allowed to know
     /// this object exists", A-55) does not apply — nothing of it reaches a
     /// reply (docs/questions/Q-963 item 2). Gone, or outside the naming
-    /// context ⇒ `Failed(IntegrityFailure)`: the account source found it in
-    /// this very snapshot.
+    /// context ⇒ `Failed(IntegrityFailure)`: the ticket-subject lookup found
+    /// it in this very snapshot.
     /// Spec: docs/53 §5.6 step 4 (the PDP on "the account object itself");
     /// [MS-ADTS] 3.1.1.3.1.5.1 ("on itself"); docs/47 §1.3 (the handle's
     /// principal is the objectGUID); docs/52 R-a.
@@ -467,7 +511,7 @@ impl<'v, 'a> Cx<'_, 'v, 'a> {
     /// The KDC's account state of the record `obj` — stored, or the one a
     /// write is about to store (task MA3; directory-pip `account_state_of`).
     /// Spec: docs/47 §4; A-162.
-    pub(crate) fn account_state_of(&self, obj: &Object) -> Result<Option<kdc::AccountState>, Stop> {
+    pub(crate) fn account_state_of(&self, obj: &Object) -> Result<Option<AccountState>, Stop> {
         self.view
             .account_state_of(obj)
             .map_err(|_| Stop::Failed(AdminFailure::IntegrityFailure))
@@ -513,22 +557,32 @@ impl<'v, 'a> Cx<'_, 'v, 'a> {
         }
     }
 
-    /// A create's uniqueness check: no object holds `value` in the unique
-    /// attribute `attr` (docs/46 §8.5, the rule the create path cites) — taken ⇒
-    /// `Conflict`, a value the index cannot hold ⇒ `ValueInvalid`. Internal
+    /// A create's uniqueness check, in the one principal namespace (task
+    /// PN5): no live object holds any of `keys` — the keys the new object
+    /// will hold, derived by the write checker's own rules
+    /// (`Invariants::keys_of_new`) — so a name taken in **any** of its forms
+    /// (a computer `dc$` beside a user `dc`, a UPN local part beside another
+    /// object's sAMAccountName, an SPN in another case) is caught here, not
+    /// only the same value in the same attribute. Taken ⇒ `Conflict`, a key
+    /// the index cannot hold ⇒ `ValueInvalid`. One probe per key, at most
+    /// `principal_names::MAX_KEYS_PER_OBJECT`. The store refuses a key taken
+    /// in between at the commit (`ValueNotUnique` ⇒ `Conflict`). Internal
     /// read (docs/questions/Q-487 item 2).
-    /// Spec: docs/46 §8.5; docs/questions/Q-487 item 2.
-    pub(crate) fn unique_free(&self, attr: AttrId, value: &str) -> Result<(), Stop> {
-        match self
-            .view
-            .authority_snapshot()
-            .lookup_unique(attr, value.as_bytes())
-        {
-            Ok(None) => Ok(()),
-            Ok(Some(_)) => Err(Stop::Refused(AdminRefusal::Conflict)),
-            Err(dirstore::Error::Rejected(_)) => Err(Stop::Refused(AdminRefusal::ValueInvalid)),
-            Err(e) => Err(store_failure(&e)),
+    /// Spec: docs/59 §4.4 N1, §5.1 ("`names_free(&KeySet)`"), §5.3; [MS-SAMR]
+    /// 3.1.1.8.4 item 2; RFC 4120 §6.2; docs/questions/Q-487 item 2.
+    pub(crate) fn names_free(&self, keys: &KeySet) -> Result<(), Stop> {
+        let snapshot = self.view.authority_snapshot();
+        for key in keys.keys() {
+            match snapshot.lookup_unique(self.ids.principal_name_key, key.as_bytes()) {
+                Ok(None) => {}
+                Ok(Some(_)) => return Err(Stop::Refused(AdminRefusal::Conflict)),
+                Err(dirstore::Error::Rejected(_)) => {
+                    return Err(Stop::Refused(AdminRefusal::ValueInvalid))
+                }
+                Err(e) => return Err(store_failure(&e)),
+            }
         }
+        Ok(())
     }
 
     /// The NC root: the object the naming context's DN names — for the
@@ -592,17 +646,27 @@ impl<'v, 'a> Cx<'_, 'v, 'a> {
             .map_err(|f| fault_stop(&f))
     }
 
-    /// `Lookup`'s locator: the object whose stored value of the unique
-    /// attribute `attr` is `value` — through the unique index, then
-    /// compared octet for octet (A-27, as the account source does). A value
-    /// that cannot name anything (empty, longer than `max`, not printable
-    /// ASCII) names nothing. Only a GUID comes back — the object itself
-    /// reaches the reply only through the gate.
-    /// Spec: docs/47 §1.3 steps 3-4 (R47-1); docs/46 §5.4 (bounds);
-    /// docs/52 R-a.
-    pub(crate) fn locate_exact(
+    /// `Lookup`'s locator, through the one principal namespace (task PN5):
+    /// the object one of whose stored names of kind `kind` is exactly
+    /// `value`. The value is turned into the one key a request probes
+    /// (`principal_names::key_of_request` in this realm — a sAMAccountName
+    /// as a one-component name, an SPN split on "/"; the name-type a hint
+    /// only, RFC 4120 §6.2), the namespace index is probed **once**, and the
+    /// object found must hold `value` itself in the attribute of `kind`,
+    /// octet for octet (the kind filter and the exact acceptance of R47-1 —
+    /// today's semantics: `ALICE` does not find `alice`). A value that
+    /// cannot name anything (empty, longer than `max`, not printable ASCII,
+    /// a form no key has — and, as for every request, the krbtgt account,
+    /// which no request's key reaches: docs/59 §4.2, Q-1018 item 5) names
+    /// nothing. Only a GUID comes back — the object itself reaches the reply
+    /// only through the gate.
+    /// Spec: docs/59 §4.2, §5.3, §6.4 ("`Lookup {sam | spn}` ⇒ a probe in
+    /// `PRINCIPAL_NAME_KEY` + the kind filter + the comparison with the
+    /// stored value"); docs/47 §1.3 steps 3-4 (R47-1); docs/46 §5.4
+    /// (bounds); docs/52 R-a; RFC 4120 §6.2.
+    pub(crate) fn locate_name(
         &self,
-        attr: AttrId,
+        kind: NameLookup,
         value: &str,
         max: usize,
     ) -> Result<Option<Guid>, Stop> {
@@ -612,8 +676,37 @@ impl<'v, 'a> Cx<'_, 'v, 'a> {
         {
             return Ok(None);
         }
+        let (attr, name_type, components) = match kind {
+            NameLookup::SamAccountName => {
+                (self.ids.sam_account_name, KRB_NT_PRINCIPAL, vec![value])
+            }
+            NameLookup::ServicePrincipalName => (
+                self.ids.service_principal_name,
+                KRB_NT_SRV_HST,
+                crate::names::spn_components(value),
+            ),
+        };
+        if components.len() > MAX_KEY_COMPONENTS {
+            return Ok(None);
+        }
+        let Some(name_string) = components
+            .iter()
+            .map(|c| KerberosString::new(c).ok())
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
+        let name = PrincipalName {
+            name_type,
+            name_string,
+        };
+        let RequestKey::Key(key) =
+            key_of_request(&name, self.config.realm(), self.config.name_context())
+        else {
+            return Ok(None);
+        };
         let snapshot = self.view.authority_snapshot();
-        let guid = match snapshot.lookup_unique(attr, value.as_bytes()) {
+        let guid = match snapshot.lookup_unique(self.ids.principal_name_key, key.as_bytes()) {
             Ok(Some(guid)) => guid,
             Ok(None) | Err(dirstore::Error::Rejected(_)) => return Ok(None),
             Err(e) => return Err(store_failure(&e)),
@@ -763,9 +856,17 @@ impl<'v, 'a> Cx<'_, 'v, 'a> {
         Ok(admins)
     }
 
-    /// `true` if the user account `obj` could authenticate now: the account
-    /// source finds it by its sAMAccountName and its state is usable.
-    /// Spec: docs/47 §1.3, §4 (`usable_at`); docs/51 §5.3.
+    /// `true` if the user account `obj` could act as a Subject now: the
+    /// ticket-subject lookup (the one lookup path in the `TicketClient`
+    /// context — the one a requester's Subject is built through,
+    /// `AdminSubject::from_verified_ticket`) resolves its sAMAccountName to
+    /// this very object, its Subject facts can be computed (an expansion or
+    /// tier that cannot is a failure, as for the Subject itself), and its
+    /// state is usable — with no name resolution (task PN10b). A name that
+    /// resolves to another object counts as not usable (fewer
+    /// administrators counted ⇒ the guard refuses sooner — fail closed).
+    /// Spec: docs/47 §1.3, §4 (`usable_at`); docs/51 §5.3; docs/59 §6.2;
+    /// Q-295 item 4 (P-22); docs/questions/Q-1047 (A-187).
     fn usable_now(&self, obj: &Object) -> Result<bool, Stop> {
         let Some(sam) = record::text(obj, self.ids.sam_account_name).map_err(malformed)? else {
             return Ok(false);
@@ -777,8 +878,8 @@ impl<'v, 'a> Cx<'_, 'v, 'a> {
             name_type: KRB_NT_PRINCIPAL,
             name_string: vec![component],
         };
-        match self.view.client(self.config.realm(), &name) {
-            Ok(Some(account)) => Ok(account.state.usable_at(&self.now)),
+        match self.view.ticket_subject(self.config.realm(), &name) {
+            Ok(Some(account)) => Ok(account.guid == obj.guid && account.state.usable_at(&self.now)),
             Ok(None) => Ok(false),
             Err(_) => Err(Stop::Failed(AdminFailure::StoreFailure)),
         }

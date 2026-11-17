@@ -38,9 +38,11 @@ pub const MAX_REQUEST_BODY: u32 = 80 * 1024;
 
 /// Reply body bound: 128 KiB. docs/50 §3.3 proposes 64 KiB ("⚠ to be
 /// estimated"); a client record with [`MAX_GROUPS`] group SIDs and
-/// [`MAX_ENCTYPES`] ETYPE-INFO2 entries needs about 90 KiB (checked below at
-/// compile time; docs/questions/Q-270 item 4).
-/// Spec: docs/50 §3.3; Q-270 item 4.
+/// [`MAX_ENCTYPES`] ETYPE-INFO2 entries needs about 90 KiB, and its attested
+/// name resolution (task PN10) at most about 35 KiB more — still within the
+/// bound (checked below at compile time; docs/questions/Q-270 item 4,
+/// Q-1046).
+/// Spec: docs/50 §3.3; Q-270 item 4; docs/59 §7.5.
 pub const MAX_REPLY_BODY: u32 = 128 * 1024;
 
 /// The request direction's [`FrameLimit`]; a bound outside ipc's range stops
@@ -122,11 +124,25 @@ pub const MAX_NC_LABELS: u32 = 16;
 /// Spec: [MS-ADTS] 3.1.1.5.1.2; A-30; A-53.
 pub const MAX_NC_LABEL: u32 = 255;
 
+/// The bounds of an attested name resolution on this channel (task PN10):
+/// a realm (`MAX_RESOLUTION_REALM`), a `PrincipalName` DER
+/// (`MAX_RESOLUTION_NAME`) and the whole resolution's body
+/// (`LARGEST_RESOLUTION`) — defined once in crate keyd-types beside the
+/// bounds of `NameResolution` they are derived from, and used by this
+/// channel and the keyd channel (crate ipc-keyd) alike: one resolution, one
+/// bound on both of its channels (A-190 on docs/questions/Q-1062 item 1).
+/// Spec: docs/59 §7.1, §7.5 ("size bounds"); crates/keyd-types
+/// `name_resolution.rs`; docs/CLEAN-ROOM.md.
+pub use keyd_types::{LARGEST_RESOLUTION, MAX_RESOLUTION_NAME, MAX_RESOLUTION_REALM};
+
 // The bounds agree with the values they are derived from and fit the body
 // bounds; checked at compile time, never at run time.
 const _: () = assert!(MAX_REALM as usize == kdc::MAX_REQUEST_LEN);
 const _: () = assert!(MAX_NAME as usize == kdc::MAX_REQUEST_LEN);
 const _: () = assert!(MAX_SID as usize == 8 + 4 * dtyp::SID_MAX_SUB_AUTHORITIES);
+// A resolution's realm bound is keyd-types' (task PN10; the derivation and
+// its own compile-time checks are keyd-types', A-190).
+const _: () = assert!(MAX_RESOLUTION_REALM as usize == keyd_types::sealed_store::MAX_NAME_OCTETS);
 
 /// Body octets of the largest `Client` / `Service` request a KDC request can
 /// produce: envelope, view id, two length prefixes, and the realm and name,
@@ -138,10 +154,10 @@ const LARGEST_TIER_REQUEST: usize =
 /// Body octets of one ETYPE-INFO2 entry at its bounds.
 const LARGEST_ETYPE_ENTRY: usize =
     4 + (1 + 4 + MAX_SALT as usize) + (1 + 4 + MAX_S2KPARAMS as usize);
-/// Body octets of the largest client record reply.
+/// Body octets of the largest client record reply (no key handle of its
+/// own since task PN10c — the resolution names the key set).
 const LARGEST_CLIENT_REPLY: usize = 4
     + 1
-    + 17
     + (4 + MAX_SID as usize)
     + 4
     + MAX_GROUPS as usize * (4 + MAX_SID as usize)
@@ -150,12 +166,18 @@ const LARGEST_CLIENT_REPLY: usize = 4
     + 2 * (1 + 7)
     + 4
     + MAX_ENCTYPES as usize * LARGEST_ETYPE_ENTRY
-    + 2;
+    + 2
+    + LARGEST_RESOLUTION;
+/// Body octets of the largest service record reply (task PN10: it carries
+/// a resolution too; task PN10c: and no key handle of its own).
+const LARGEST_SERVICE_REPLY: usize =
+    4 + 1 + 2 + 2 * (1 + 7) + 4 + 4 * MAX_ENCTYPES as usize + LARGEST_RESOLUTION;
 /// Body octets of the largest group-expansion reply.
 const LARGEST_GROUPS_REPLY: usize = 4 + 4 + MAX_GROUPS as usize * (4 + MAX_SID as usize);
 const _: () = assert!(LARGEST_NAME_REQUEST <= MAX_REQUEST_BODY as usize);
 const _: () = assert!(LARGEST_TIER_REQUEST <= MAX_REQUEST_BODY as usize);
 const _: () = assert!(LARGEST_CLIENT_REPLY <= MAX_REPLY_BODY as usize);
+const _: () = assert!(LARGEST_SERVICE_REPLY <= MAX_REPLY_BODY as usize);
 const _: () = assert!(LARGEST_GROUPS_REPLY <= MAX_REPLY_BODY as usize);
 
 // ---- kinds -----------------------------------------------------------------

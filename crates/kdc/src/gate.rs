@@ -30,9 +30,8 @@
 
 use crate::accounts::ClientAccount;
 use crate::audit::AuditReason;
-use crate::time::unix_seconds;
 use core::time::Duration;
-use krb_proto::KerberosTime;
+use krb_proto::{kerberos_time_to_unix, KerberosTime};
 use pdp::{
     AccessRequest, Action, AuthContext, AuthStrength, Context, Effect, Instant, IpScope,
     Obligation, Pip, PolicySnapshot, Resource, RlKey, Subject, TransportSec,
@@ -77,7 +76,7 @@ pub(crate) fn enforce(
     inputs: &PolicyInputs<'_>,
     rate: &mut dyn RateLimiter,
 ) -> Result<(), AuditReason> {
-    let time = unix_seconds(question.now).ok_or(AuditReason::ClockOutOfRange)?;
+    let time = kerberos_time_to_unix(question.now).ok_or(AuditReason::ClockOutOfRange)?;
     // armored ⇔ KerberosFast: the PEP's contract (docs/48 §4.2; Q-130 item 5).
     let strength = if question.armored {
         AuthStrength::KerberosFast

@@ -40,6 +40,8 @@ pub(crate) struct Ids {
     /// The RDN attribute of every component of the naming context's DN
     /// (A-53; [MS-ADTS] 3.1.1.1.5, 3.1.1.3.1.2.2).
     pub(crate) dc: AttrId,
+    /// dNSHostName (task DN6: the host-record name rule, crate::host).
+    pub(crate) dns_host_name: AttrId,
     pub(crate) user: ClassId,
     pub(crate) computer: ClassId,
     pub(crate) group: ClassId,
@@ -65,6 +67,7 @@ impl Ids {
             group_type: attr("groupType")?,
             nt_security_descriptor: attr("nTSecurityDescriptor")?,
             dc: attr(crate::naming::NC_RDN_ATTRIBUTE)?,
+            dns_host_name: attr("dNSHostName")?,
             user: class("user")?,
             computer: class("computer")?,
             group: class("group")?,

@@ -62,11 +62,23 @@ provision-manifest = { path = "../provision-manifest" }
 protected-file = { path = "../protected-file" }
 # Only `read_state` — the real and effective uid, read through rustix as
 # docs/50 §6.1 prescribes ("process::getuid/geteuid … to verify") — for the
-# refusal to run as root. No hardening plan is applied (src/identity.rs;
-# docs/questions/Q-347 item 3).
+# refusal to run as root, and (task PN9) for the owner of the attestation key
+# file. No hardening plan is applied (src/identity.rs; docs/questions/Q-347
+# item 3).
 daemon-sandbox = { path = "../daemon-sandbox" }
+# RustCrypto `zeroize` (OD-9 / D180; already in the lock and already a
+# dev-dependency here): task PN9 — the buffer the attestation key file is
+# read into is wiped when it drops (docs/50 §3.3; docs/CLEAN-ROOM.md). Not
+# crypto: keyadm still links no crypto code (D182, A-73, A-173 — the guard
+# in crates/keyd-types/tests/no_crypto_dependency.rs).
+zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
+# TESTS ONLY (task PN10; docs/59 §7.4): the reused crates/kdc/tests/common fixtures (through crates/admin-daemon's
+# support) tag their account records' name resolutions with a test key — crate
+# name-attestation's `tag`, the signer dird uses. Our own crate; no new
+# package.
+name-attestation = { path = "../name-attestation" }
 # TESTS ONLY (docs/50 §9 tier 2): a real keyd-daemon on a real Unix socket in
 # the test's threads, with the test's own uid mapped to the role under test.
 # Workspace crates, or third-party packages already in the lock (tokio,
@@ -84,7 +96,6 @@ krb-proto = { path = "../krb-proto" }
 # closed), so the tests read keyd's uid with tokio `UnixStream::peer_cred`,
 # as crates/keyd-daemon/tests/kdc_flow.rs does (tokio 1.54.1 docs.rs, P-2).
 tokio = { version = "1.54.1", default-features = false, features = ["rt", "rt-multi-thread", "net", "time", "sync", "io-util"] }
-zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
 # TESTS ONLY (task A10, docs/50 §9 tier 2): the approved-request commands
 # and the sweep against a real keyd, dird (with its admin service) and
 # admind, all in this process over real sockets — crates/admin-daemon's

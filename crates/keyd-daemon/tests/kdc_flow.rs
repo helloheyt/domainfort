@@ -203,6 +203,10 @@ fn fixture_keyd(
         )
         .unwrap();
     }
+    // The ceremony hands keyd dird's attestation key (task PN11: keyd
+    // verifies the resolutions the kdc forwards with it).
+    keyd.install_attestation_key(&ADMIN, test_attestation_key(), &now())
+        .unwrap();
     let _ = keyd.audit_sink_mut().take();
     Ok(keyd)
 }
@@ -214,10 +218,13 @@ fn accounts() -> InMemoryAccounts {
         .insert_client(&realm(), &alice_name(), alice_account())
         .unwrap();
     let mut bob = alice_account();
-    bob.key = BOB;
     bob.sid = bob_sid();
     bob.groups = Default::default();
     bob.etype_info = etype_info(BOB_SALT);
+    // Task PN10: bob's record carries the resolution of bob's name — and,
+    // since task PN10c, through it bob's key set (the record's one
+    // statement of its handle).
+    bob.resolution = test_resolution(&bob_name(), BOB);
     accounts.insert_client(&realm(), &bob_name(), bob).unwrap();
     accounts
         .insert_client(&realm(), &machine_name(), machine_account())
@@ -227,9 +234,9 @@ fn accounts() -> InMemoryAccounts {
             &realm(),
             &service_name(),
             kdc::ServiceAccount {
-                key: SERVICE,
                 state: kdc::AccountState::ACTIVE,
                 enctypes: vec![AES256, AES128],
+                resolution: test_resolution(&service_name(), SERVICE),
             },
         )
         .unwrap();

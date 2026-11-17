@@ -24,8 +24,8 @@ use crate::model::KeyHandle;
 use crate::store::KeyStore;
 use crate::tokens::{ArmorId, CtxId};
 use keyd_types::{
-    AsRepParts, AsTicketTemplate, AuthnProof, FastArmor, FastConversation, KeyCustody,
-    TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext,
+    AsRepParts, AsServerKeySet, AsTicketTemplate, AttestedNameResolution, AuthnProof, FastArmor,
+    FastConversation, KeyCustody, TgsFastRequest, TgsRepParts, TgsTicketTemplate, TgtContext,
 };
 use krb_proto::{ApReq, EncryptedData, KerberosTime, KrbError, KrbFastArmoredReq, PaData};
 
@@ -87,8 +87,8 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> KeyCustody for LocalKeyd<S, A,
 
     fn issue_as_rep(
         &mut self,
-        client: &KeyHandle,
-        server: &KeyHandle,
+        client: &AttestedNameResolution,
+        server: AsServerKeySet<'_>,
         proof: &AuthnProof,
         armor: Option<ArmorId>,
         template: &AsTicketTemplate,
@@ -123,7 +123,7 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> KeyCustody for LocalKeyd<S, A,
 
     fn issue_tgs_rep(
         &mut self,
-        service: &KeyHandle,
+        service: &AttestedNameResolution,
         ctx: &CtxId,
         template: &TgsTicketTemplate,
         now: &KerberosTime,

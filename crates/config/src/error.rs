@@ -147,9 +147,6 @@ pub enum ErrorKind {
     /// Spec: docs/50 §3.1 ("a socket per (server, channel)"); docs/questions/
     /// Q-230 item 16.
     DuplicatePath,
-    /// The daemon would have no network listener at all.
-    /// Spec: docs/50 §4.2; docs/questions/Q-230 item 7.
-    NoListener,
     /// A listener address outside every network of the file's zone table
     /// (`internal_networks`): phase 1 has no external LDAP listener — one
     /// front per zone, the internal one; the kdc binds to internal
@@ -164,6 +161,29 @@ pub enum ErrorKind {
     /// Spec: docs/51 §4.6 ("`node_id` (hex, not secret)"); docs/29 §2 as cited
     /// in docs/51 §4.3; docs/questions/Q-385 item 3.
     InvalidNodeId,
+    /// Not a domain name in the accepted form: labels of 1 ..= 63 octets of
+    /// `A-Z a-z 0-9 -`, separated by single dots, at most 253 octets of
+    /// text (255 in wire form).
+    /// Spec: RFC 1035 §2.3.1 (the preferred syntax's character set), §2.3.4
+    /// ("labels 63 octets or less"; "names 255 octets or less"), §3.1;
+    /// docs/questions/Q-1001 item 4.
+    InvalidDomainName,
+    /// A network of an address family the setting does not admit (dird's
+    /// `dns_registrable_networks`: IPv4 only — A records only in phase 1).
+    /// Spec: docs/54 §3.1 (A only; AAAA waits for RFC 3596), §5.5;
+    /// crates/directory-admin `DnsRegistration::new`; docs/questions/Q-1001
+    /// item 3.
+    NetworkFamily,
+    /// A listener whose endpoint the zone advertises (the kdc's `listen`,
+    /// ldap-front's `ldap_listen`, kpasswd-front's `listen`, dnsd's
+    /// `listen`) on a port other than its service's standard port
+    /// ([`crate::StandardPort`]): the SRV record names the standard port, and
+    /// the NS record a name server reached on port 53, so such a listener
+    /// would be advertised where nothing listens.
+    /// Spec: RFC 4120 §7.2.3.2; [MS-ADTS] v20261026 §6.3.2.3; RFC 1035 §4.2;
+    /// docs/54 §3.1; docs/questions/Q-1016 item 4 (A-176), Q-1024, Q-1025
+    /// item 1 (A-178).
+    NonStandardPort,
 }
 
 impl ErrorKind {
@@ -202,12 +222,16 @@ impl ErrorKind {
             ErrorKind::DuplicateEntry => "item appears more than once",
             ErrorKind::DuplicateId => "uid appears more than once in this file",
             ErrorKind::DuplicatePath => "path is used by more than one setting",
-            ErrorKind::NoListener => "no network listener is configured",
             ErrorKind::ListenerNotInternal => {
                 "listener address is outside every configured internal network"
             }
             ErrorKind::InconsistentLimits => "per-source limit exceeds the global limit",
             ErrorKind::InvalidNodeId => "value is not 32 lower-case hex digits, not all zero",
+            ErrorKind::InvalidDomainName => "value is not an acceptable domain name",
+            ErrorKind::NetworkFamily => "network is of an address family this setting refuses",
+            ErrorKind::NonStandardPort => {
+                "listener port is not the service's standard port (the one the zone advertises)"
+            }
         }
     }
 }

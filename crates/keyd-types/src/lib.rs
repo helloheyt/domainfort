@@ -9,7 +9,7 @@
 //! | ids and handles | [`PrincipalId`], [`Kvno`], [`KeyPurpose`], [`KeyHandle`], [`PrincipalBinding`] |
 //! | caller model | [`CallerId`], [`Role`], [`Operation`], [`authz::CAPABILITY_TABLE`], [`authz::role_permits`], [`authz::purpose_permitted`] (with the compile-time pins) |
 //! | errors | [`AuthnError`], [`IssueError`], [`Error`], [`ConfigError`] |
-//! | operation arguments and results | [`AuthnProof`], [`AsTicketTemplate`], [`AsRepParts`], [`TgsFastRequest`], [`TgtContext`], [`TgsTicketTemplate`], [`TgsRepParts`], [`FastArmor`], [`FastConversation`], [`ServiceContext`], [`OperationTicket`], [`AppBinding`], [`OperationDigest`], [`AccountKind`], [`SetSecretTarget`] |
+//! | operation arguments and results | [`AuthnProof`], [`AsTicketTemplate`], [`AsServerKeySet`], [`AsRepParts`], [`TgsFastRequest`], [`TgtContext`], [`TgsTicketTemplate`], [`TgsRepParts`], [`FastArmor`], [`FastConversation`], [`ServiceContext`], [`OperationTicket`], [`AppBinding`], [`OperationDigest`], [`AccountKind`], [`SetSecretTarget`] |
 //! | the set_secret grant (task A15a) | [`grant`]: [`MAX_GRANT_TARGETS`], [`MAX_SET_SECRET_GRANT_SECS`], [`MAX_INITIAL_SECRET_GRANT_SECS`], [`MAX_SET_SECRET_GRANTS`], [`grant::max_grant_lifetime_secs`] |
 //! | the decision table and the ceremony (A-102, docs/52 R1, R3) | [`decision`]: [`DecisionId`], [`DecidedOperation`], [`DecisionIntent`], [`PendingDestruction`], [`DestructionPage`], [`CeremonyState`], the bounds |
 //! | the change-password operations (task K3, docs/53 §5.5) | [`ChangePasswordContext`], [`ChangePasswordVerdict`], [`SealedReply`], [`HostAddr`], the RFC 4120 7.1 address constants |
@@ -17,6 +17,7 @@
 //! | configuration | [`KeydConfig`], [`TicketPolicy`], [`ThrottlePolicy`], [`ConfigDescription`], [`EncTypeId`] |
 //! | audit | [`AuditRecord`], [`AuditOutcome`], [`AuditReason`], [`AuditKeyRef`], [`AuditSink`] |
 //! | time scale | [`kerberos_time_seconds`] |
+//! | dird's attested name resolution (tasks PN3, PN11; docs/59 §7.1) | [`NameResolution`], [`NameResolutionFields`], [`AttestedNameResolution`], the label, tag length, window and MAC-input bound |
 //! | the KDC's custody seam | [`KeyCustody`] |
 //! | the sealed key store's persisted format (task KL1, A-143) | [`sealed_store`]: [`StoreId`], [`sealed_store::KeyRecordAad`], [`sealed_store::KeyRecord`], [`sealed_store::StoreHeader`], [`sealed_store::SealingSuite`] |
 //!
@@ -73,6 +74,7 @@ mod error;
 mod fast_armor;
 pub mod grant;
 pub mod model;
+mod name_resolution;
 pub mod sealed_store;
 mod service_ticket;
 mod tgs_exchange;
@@ -80,7 +82,8 @@ mod time;
 mod tokens;
 
 pub use as_exchange::{
-    AsRepParts, AsServer, AsTicketTemplate, AuthnProof, CHANGE_PASSWORD_TICKET_MAX_LIFETIME_SECS,
+    AsRepParts, AsServer, AsServerKeySet, AsTicketTemplate, AuthnProof,
+    CHANGE_PASSWORD_TICKET_MAX_LIFETIME_SECS,
 };
 pub use audit::{AuditKeyRef, AuditOutcome, AuditReason, AuditRecord, AuditSink};
 pub use authz::{CallerId, Operation, Role};
@@ -110,6 +113,11 @@ pub use model::{
     is_admin_service_name, is_change_password_service_name, KeyHandle, KeyPurpose, Kvno,
     PrincipalBinding, PrincipalId, ServiceKeyHandle, ADMIN_SERVICE_CLASS,
     CHANGE_PASSWORD_SERVICE_NAME,
+};
+pub use name_resolution::{
+    AttestedNameResolution, NameResolution, NameResolutionError, NameResolutionFields,
+    LARGEST_RESOLUTION, MAX_NAME_RESOLUTION_MAC_INPUT, MAX_RESOLUTION_NAME, MAX_RESOLUTION_REALM,
+    NAME_RESOLUTION_LABEL, NAME_RESOLUTION_TAG_LEN, NAME_RESOLUTION_WINDOW_SECS,
 };
 pub use sealed_store::StoreId;
 pub use service_ticket::{

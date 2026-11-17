@@ -5,19 +5,40 @@
 //! (docs/11 §6 snapshot semantics, P9).
 //!
 //! [`DirectoryContext`] is built once (schema identifiers, the reverse
-//! schemaIDGUID map, keyd's realm / enctypes / s2kparams); a
-//! [`DirectoryView`] is taken from it for each request.
+//! schemaIDGUID map, keyd's realm / enctypes / s2kparams, the namespace's
+//! realm context, the configured provisioned service objects and — task
+//! PN10 — the deployment's name-resolution signer); a [`DirectoryView`] is
+//! taken from it for each request.
 //!
-//! Spec: docs/47 §1-§8 (R47-1..R47-11); docs/11 §6; kdc `accounts.rs`;
-//! pdp `pip.rs`.
+//! The account source's client and service lookups are thin wrappers of the
+//! one lookup path by name, [`DirectoryView::canonical_principal`]
+//! (crate::resolve; task PN4, docs/59 §6.1, R59-5). Each record they return
+//! carries the resolution dird attests for keyd (task PN10; docs/59 §7.1,
+//! §7.5: `ClientAccount` / `ServiceAccount` `resolution`), made by the
+//! context's [`NameResolutionSigner`] from that very lookup; a context
+//! without a signer answers neither (fail closed — `AccountSourceError::
+//! Failed`), since a record without dird's statement is not one keyd will
+//! ever honour (docs/questions/Q-1046 item 2).
+//!
+//! The account source is the **KDC channel's** alone (task PN10b; docs/
+//! questions/Q-1047, A-187): the subject checks of the admin plane,
+//! kpasswd, the DNS update and the LDAP session read the ticket-subject
+//! lookup (crate::subject — no resolution), so only the KDC channel's
+//! context needs the signer. The signer field and the one function that
+//! uses it (`DirectoryView::attested`) are private to this module.
+//!
+//! Spec: docs/47 §1-§8 (R47-1..R47-11); docs/11 §6; docs/59 §6, §7.1, §7.5;
+//! docs/questions/Q-1047 (A-187); kdc `accounts.rs`; pdp `pip.rs`.
 
 use crate::error::{Fault, ViewError};
 use crate::groups;
-use crate::names::{
-    client_search_key, is_krbtgt_sid, service_search_key, DOMAIN_USER_RID_KRBTGT, KRBTGT,
-};
+use crate::names::{is_krbtgt_sid, DOMAIN_USER_RID_KRBTGT, KRBTGT};
 use crate::naming::NamingContext;
+use crate::principal::name_context_of;
 use crate::record::{self, Ids};
+use crate::resolve::{
+    namespace_index_holds_every_key, LookupCtx, NameResolutionSigner, ResolvedPrincipal,
+};
 use crate::salt::{account_salt, AccountKind};
 use crate::state;
 use crate::tier::{most_privileged, TierMap};
@@ -29,13 +50,15 @@ use kdc::{
     AccountKind as KdcAccountKind, AccountSource, AccountSourceError, AccountState, ArmorPolicy,
     ClientAccount, ServiceAccount,
 };
-use keyd_types::{KeyHandle, KeyPurpose, KeydConfig, PrincipalId};
+use keyd_types::{AttestedNameResolution, KeyHandle, KeyPurpose, KeydConfig, PrincipalId};
 use krb_proto::{EtypeInfo2Entry, PrincipalName, Realm};
 use pdp::{
     AttrClass, ControlRightId, Dn, ObjClass, ObjClassChain, Pip, PipError, PropertySet, Resource,
     Tier,
 };
+use principal_names::NameContext;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 /// Most RDN components of a DN this crate resolves or produces (project
 /// choice; bounds the walk up and down the tree — dirstore fixes no tree
@@ -63,13 +86,31 @@ pub struct DirectoryContext {
     enctypes: Vec<i32>,
     /// `KeydConfig.s2k_params` (R47-10).
     s2kparams: Option<Vec<u8>>,
-    /// Longest stored sAMAccountName / servicePrincipalName value: a longer
-    /// name cannot match (checked before the index is asked).
-    sam_max_len: usize,
-    spn_max_len: usize,
     /// The DN of the domain NC's root: the suffix of every DN of the NC
     /// (A-53; [MS-ADTS] 3.1.1.1.4, 3.1.1.1.5; crate::naming).
     naming_context: NamingContext,
+    /// The namespace's realm context of `naming_context` (its one alias,
+    /// the NC's DNS name — crate::principal `name_context_of`), built once
+    /// so every lookup and every re-derivation use the same one.
+    /// Spec: docs/59 §4.2 (`NameContext` from `NamingContext`); A-53.
+    name_context: NameContext,
+    /// The provisioned service objects (the manifest's — the set crates/
+    /// directory-admin's checker receives as `ProtectedObjects::
+    /// service_objects`), whose keys the namespace derives without the
+    /// `HostName` key (Q-1010 item 3). Empty until the deployment passes it
+    /// ([`DirectoryContext::with_service_objects`]).
+    /// Spec: docs/questions/Q-1019 option (a) (A-175); docs/59 §4.3.
+    service_objects: BTreeSet<Guid>,
+    /// The deployment's attestation of a resolution (dird's attestation key
+    /// and clock — crates/ipc-directory-server `ResolutionSigner`), which
+    /// the account records carry for keyd. Absent until installed
+    /// ([`DirectoryContext::with_name_resolution_signer`]); without it the
+    /// account source answers no record (fail closed). Private to this
+    /// module: only `DirectoryView::attested` reads it — the ticket-subject
+    /// lookup (crate::subject) cannot name it (task PN10b).
+    /// Spec: docs/59 §7.1, §7.4, §7.5; docs/questions/Q-1011 item 2 (A-173),
+    /// Q-1047 (A-187).
+    signer: Option<Arc<dyn NameResolutionSigner>>,
 }
 
 impl DirectoryContext {
@@ -78,11 +119,18 @@ impl DirectoryContext {
     /// invalid, if the realm is not an upper-case DNS name (the salt's "DNS
     /// of the realm, converted to uppercase" must be the Kerberos realm,
     /// docs/47 §3.3 item 3), if the naming context's DNS name in upper case
-    /// is not that realm (A-53; [MS-ADTS] 3.1.1.1.5), or if the schema lacks
-    /// what docs/47 reads.
+    /// is not that realm (A-53; [MS-ADTS] 3.1.1.1.5) or is not a realm alias
+    /// the principal namespace can hold (RFC 4120 §6.1: no ":" or "/"; no
+    /// "@"; not "krbtgt" — crate `principal-names` `NameContext`), if the
+    /// schema lacks what docs/47 reads, or if the namespace attribute
+    /// `PRINCIPAL_NAME_KEY` cannot hold every key (`principal_names::
+    /// MAX_KEY_OCTETS` octets — the one probe then never asks the store an
+    /// over-long value; crate::resolve). The set of provisioned service
+    /// objects starts empty ([`DirectoryContext::with_service_objects`]).
     ///
     /// Spec: docs/47 §3.3 item 3, §7.3 (R47-10), §8.2; [MS-KILE] 3.1.1.2;
-    /// RFC 4120 §6.1; [MS-ADTS] 3.1.1.1.4, 3.1.1.1.5; A-53.
+    /// RFC 4120 §6.1, §6.2; [MS-ADTS] 3.1.1.1.4, 3.1.1.1.5; A-53; docs/59
+    /// §4.2, §4.6, §6.1 step 2; docs/questions/Q-1008 item 2, Q-1026 item 4.
     pub fn new(
         schema: Phase1Schema,
         keyd: &KeydConfig,
@@ -96,6 +144,8 @@ impl DirectoryContext {
         if !naming_context.names_realm(realm.as_bytes()) {
             return Err(ViewError::NamingContext);
         }
+        let name_context =
+            name_context_of(&naming_context).map_err(|_| ViewError::NamingContext)?;
         let ids = Ids::resolve(&schema)?;
         let mut attr_by_guid = BTreeMap::new();
         for a in schema.attributes() {
@@ -103,26 +153,62 @@ impl DirectoryContext {
                 return Err(ViewError::Schema);
             }
         }
-        let max_len = |id| {
-            schema
-                .schema()
-                .attribute(id)
-                .map(|d| d.max_value_len)
-                .ok_or(ViewError::Schema)
-        };
-        let sam_max_len = max_len(ids.sam_account_name)?;
-        let spn_max_len = max_len(ids.service_principal_name)?;
+        if !namespace_index_holds_every_key(&schema) {
+            return Err(ViewError::Schema);
+        }
         Ok(DirectoryContext {
             ids,
             attr_by_guid,
             realm,
             enctypes: keyd.enctypes.iter().map(|e| e.number()).collect(),
             s2kparams: keyd.s2k_params.map(|p| p.to_vec()),
-            sam_max_len,
-            spn_max_len,
             schema,
             naming_context,
+            name_context,
+            service_objects: BTreeSet::new(),
+            signer: None,
         })
+    }
+
+    /// This context with `service_objects` as the provisioned service
+    /// objects (the deployment's manifest — `Manifest::service_objects()`,
+    /// as crates/directory-admin's checker receives them). The one lookup
+    /// path re-derives an object's namespace keys with this set, so the
+    /// derived keys equal those the checker stored (docs/59 §4.4 N7); an
+    /// object listed here that is not a workstation computer is refused
+    /// when it is resolved (crate::principal; fail closed).
+    /// Spec: docs/questions/Q-1019 option (a) (A-175); docs/59 §4.3, §6.1
+    /// step 3; Q-1010 item 3.
+    #[must_use]
+    pub fn with_service_objects(mut self, service_objects: BTreeSet<Guid>) -> DirectoryContext {
+        self.service_objects = service_objects;
+        self
+    }
+
+    /// The configured provisioned service objects (Q-1019).
+    #[must_use]
+    pub fn service_objects(&self) -> &BTreeSet<Guid> {
+        &self.service_objects
+    }
+
+    /// This context with `signer` as the attestation of the resolutions its
+    /// account records carry (task PN10): dird installs its
+    /// `ResolutionSigner` — its attestation key and its clock (crates/
+    /// ipc-directory-server) — on the KDC channel's context only (task
+    /// PN10b; crates/directory-daemon `kdc_channel_context`). Without one,
+    /// [`AccountSource::client`] / [`AccountSource::service`] answer
+    /// `AccountSourceError::Failed` (fail closed); every other question of
+    /// the view — the ticket-subject lookup of the subject checks
+    /// (crate::subject) included — is unaffected.
+    /// Spec: docs/59 §7.1, §7.4, §7.5; docs/questions/Q-1011 item 2 (A-173),
+    /// Q-1046 item 2, Q-1047 (A-187).
+    #[must_use]
+    pub fn with_name_resolution_signer(
+        mut self,
+        signer: Arc<dyn NameResolutionSigner>,
+    ) -> DirectoryContext {
+        self.signer = Some(signer);
+        self
     }
 
     /// The realm (keyd's).
@@ -135,6 +221,13 @@ impl DirectoryContext {
     #[must_use]
     pub fn naming_context(&self) -> &NamingContext {
         &self.naming_context
+    }
+
+    /// The namespace's realm context (the naming context's DNS name as the
+    /// one realm alias). Spec: docs/59 §4.2; A-53; Q-1012.
+    #[must_use]
+    pub fn name_context(&self) -> &NameContext {
+        &self.name_context
     }
 
     /// The phase-1 schema.
@@ -188,7 +281,7 @@ pub(crate) struct Account<'o> {
 /// keyd's principal identifier of an object: its objectGUID, in the 16-octet
 /// packet form that is also the dirstore key. Spec: docs/47 §2.3 (R47-3);
 /// docs/10 §1 (`PrincipalId = Guid`); [MS-ADTS] 3.1.1.1.3.
-fn principal_id(guid: Guid) -> PrincipalId {
+pub(crate) fn principal_id(guid: Guid) -> PrincipalId {
     PrincipalId::from_bytes(guid.to_packet())
 }
 
@@ -347,7 +440,7 @@ impl DirectoryView<'_> {
     /// no such object exists — then nothing is in the NC (fail closed on a
     /// misconfiguration). Found once per view.
     /// Spec: [MS-ADTS] 3.1.1.1.4, 3.1.1.1.5, 3.1.1.3.1.2.2; A-53.
-    fn nc_root(&self) -> Result<Guid, Fault> {
+    pub(crate) fn nc_root(&self) -> Result<Guid, Fault> {
         *self.nc_root.get_or_init(|| {
             let label = self
                 .ctx
@@ -623,49 +716,25 @@ impl DirectoryView<'_> {
         Ok(KeyHandle::new(principal_id(guid), KeyPurpose::Krbtgt))
     }
 
-    /// [`AccountSource::client`] with internal faults (docs/47 §1.3 AS).
+    /// [`AccountSource::client`] with internal faults (docs/47 §1.3 AS):
+    /// the one lookup path in the AS client's context (steps 1-7 there —
+    /// realm, one component, the probe, the octet compare, user / computer,
+    /// not krbtgt, userAccountControl consistent), then the account record.
+    /// Spec: docs/59 §6.1 (R59-5: `AccountSource::client` a thin wrapper);
+    /// docs/47 §1.3 AS, §2-§7.
     fn client_account(
         &self,
         realm: &Realm,
         name: &PrincipalName,
     ) -> Result<Option<ClientAccount>, Fault> {
-        let ids = self.ctx.ids;
-        // 1. The configured realm, octet for octet.
-        if realm.as_bytes() != self.ctx.realm.as_bytes() {
-            return Ok(None);
-        }
-        // 2. One printable component, not "krbtgt".
-        let Some(key) = client_search_key(name) else {
+        let Some(resolved) = self.resolve_principal(realm, name, LookupCtx::AsClient)? else {
             return Ok(None);
         };
-        if key.len() > self.ctx.sam_max_len {
-            return Ok(None);
-        }
-        // 3. The unique index (ASCII, A–Z folded — Q-080).
-        let Some(guid) = self
-            .snapshot
-            .lookup_unique(ids.sam_account_name, key.as_bytes())?
-        else {
-            return Ok(None);
-        };
-        let Some(obj) = self.snapshot.get_object(guid)? else {
-            return Ok(None);
-        };
-        // 4. The stored value equals the component octet for octet (A-27).
-        let stored = record::text(&obj, ids.sam_account_name)?.ok_or(Fault::Unavailable)?;
-        if stored.as_bytes() != key.as_bytes() {
-            return Ok(None);
-        }
-        // 5-7. user / computer; not krbtgt; userAccountControl consistent.
-        let Some(account) = self.account(&obj)? else {
-            return Ok(None);
-        };
-        if is_krbtgt_sid(&account.sid) {
-            return Ok(None);
-        }
-        let groups = groups::expand(self, &obj)?;
+        let obj = resolved.object();
+        let account = self.account(obj)?.ok_or(Fault::Unavailable)?;
+        let groups = groups::expand(self, obj)?;
         let tier = self.subject_tier(&account.sid, &groups)?;
-        let state = self.state_of(&obj, &account)?;
+        let state = self.state_of(obj, &account)?;
         let salt = account_salt(&self.ctx.realm, account.kind, account.sam_account_name)
             .map_err(|_| Fault::Unavailable)?;
         let etype_info = self
@@ -678,11 +747,14 @@ impl DirectoryView<'_> {
                 s2kparams: self.ctx.s2kparams.clone(),
             })
             .collect();
-        // 8. The key set (objectGUID, PrincipalLongterm).
+        // 8. The key set (objectGUID, PrincipalLongterm) — stated once, by
+        // the resolution of step 10: `ClientAccount::key` derives the handle
+        // from it and no field restates it (task PN10c; Q-1060 item 1 (e)).
         // 9. The account kind and the armor policy (docs/48 §3.1, §7.2).
         let (kind, armor_policy) = armor_facts(account.kind);
+        // 10. dird's statement of this lookup, for keyd (task PN10).
+        let resolution = self.attested(&resolved)?;
         Ok(Some(ClientAccount {
-            key: KeyHandle::new(principal_id(guid), KeyPurpose::PrincipalLongterm),
             sid: account.sid,
             groups,
             tier,
@@ -690,67 +762,62 @@ impl DirectoryView<'_> {
             etype_info,
             kind,
             armor_policy,
+            resolution,
         }))
     }
 
-    /// [`AccountSource::service`] with internal faults (docs/47 §1.3 TGS).
+    /// [`AccountSource::service`] with internal faults (docs/47 §1.3 TGS):
+    /// the one lookup path in the TGS server's context (steps 1-4 there —
+    /// realm, two or more components joined with "/", the probe, the octet
+    /// compare, computer only, not krbtgt), then the account record.
+    ///
+    /// The key set is the resolution's: (objectGUID, Service) — or, for the
+    /// admin service's name (`admind/<host>`, A-73), (objectGUID,
+    /// AdminService), and for `kadmin/changepw` (objectGUID,
+    /// ChangePasswordService) — derived from the object's stored name, not
+    /// from the request's spelling (Q-1009 item 3). keyd binds such a key set
+    /// to that name only, and no other key set to it (A-19), so a
+    /// mis-resolved purpose finds no key.
+    /// Spec: docs/59 §6.1 (R59-5), step 6; docs/47 §1.3 TGS, §2, §4, §7.3,
+    /// R47-13; R2 (docs/52 §5 item 3).
     fn service_account(
         &self,
         realm: &Realm,
         name: &PrincipalName,
     ) -> Result<Option<ServiceAccount>, Fault> {
-        let ids = self.ctx.ids;
-        // 1. The configured realm.
-        if realm.as_bytes() != self.ctx.realm.as_bytes() {
-            return Ok(None);
-        }
-        // 2. Two or more components, joined with "/".
-        let Some(spn) = service_search_key(name) else {
+        let Some(resolved) = self.resolve_principal(realm, name, LookupCtx::TgsServer)? else {
             return Ok(None);
         };
-        if spn.len() > self.ctx.spn_max_len {
-            return Ok(None);
-        }
-        // 3. The unique index, then the stored value octet for octet.
-        let Some(guid) = self
-            .snapshot
-            .lookup_unique(ids.service_principal_name, spn.as_bytes())?
-        else {
-            return Ok(None);
-        };
-        let Some(obj) = self.snapshot.get_object(guid)? else {
-            return Ok(None);
-        };
-        let stored = record::text(&obj, ids.service_principal_name)?.ok_or(Fault::Unavailable)?;
-        if stored.as_bytes() != spn.as_bytes() {
-            return Ok(None);
-        }
-        // 4. computer only (R47-13); not krbtgt.
-        if self.most_specific_class(&obj)? != ids.computer {
-            return Ok(None);
-        }
-        let account = self.account(&obj)?.ok_or(Fault::Unavailable)?;
-        if is_krbtgt_sid(&account.sid) {
-            return Ok(None);
-        }
-        let state = self.state_of(&obj, &account)?;
-        // 5. The key set (objectGUID, Service) — or, for the admin service's
-        // name (`admind/<host>`, A-73), (objectGUID, AdminService): its
-        // tickets are sealed under its own key set (R2, docs/52 §5 item 3).
-        // keyd binds an AdminService key set to that name only, and no other
-        // key set to it (A-19), so a mis-resolved purpose finds no key.
+        let obj = resolved.object();
+        let account = self.account(obj)?.ok_or(Fault::Unavailable)?;
+        let state = self.state_of(obj, &account)?;
+        // dird's statement of this lookup, for keyd (task PN10) — also the
+        // record's one statement of its key set (`ServiceAccount::key`,
+        // task PN10c).
+        let resolution = self.attested(&resolved)?;
         Ok(Some(ServiceAccount {
-            key: KeyHandle::new(principal_id(guid), KeyPurpose::of_service_name(name)),
             state,
             enctypes: self.ctx.enctypes.clone(),
+            resolution,
         }))
+    }
+
+    /// The resolution `resolved` attested by the context's signer — the
+    /// `resolution` of the account record built from that lookup (task
+    /// PN10). No signer, or a refusal ⇒ a fault (fail closed: the record is
+    /// not answered).
+    /// Spec: docs/59 §7.1, §7.5; docs/questions/Q-1011 item 2 (A-173),
+    /// Q-1046 item 2; docs/CLEAN-ROOM.md.
+    fn attested(&self, resolved: &ResolvedPrincipal) -> Result<AttestedNameResolution, Fault> {
+        let signer = self.ctx.signer.as_ref().ok_or(Fault::Unavailable)?;
+        signer.attest(resolved).map_err(|_| Fault::Unavailable)
     }
 
     /// `object_tier` of a directory object (docs/47 §6.3; A-36): its
     /// classification ([`DirectoryView::classified_tier`]); no
     /// classification ⇒ Tier0 (an unclassified resource is Tier0 for writes,
     /// A-36).
-    fn dir_object_tier(&self, dn: &Dn) -> Result<Tier, Fault> {
+    pub(crate) fn dir_object_tier(&self, dn: &Dn) -> Result<Tier, Fault> {
         Ok(self.classified_tier(dn)?.unwrap_or(Tier::Tier0))
     }
 
@@ -889,19 +956,31 @@ impl Pip for DirectoryView<'_> {
 
     /// `object_tier` is asked only for writes (pdp `decide`, layer 4), so
     /// every resource kind the map cannot classify is Tier0: a policy scope
-    /// (docs/06 §9), and RPC / file / DNS / Kerberos resources until the map
-    /// has rows for them (A-36: an unclassified resource is Tier0 for
-    /// writes). The rootDSE is never written (pdp admits only `DirRead` on
-    /// it; [MS-ADTS] 3.1.1.3.2: its attributes "are read-only"), so it is
-    /// never asked; if it were, Tier0 (A-36).
-    /// Spec: docs/47 §6.3, §8.2; docs/06 §9; docs/49 §5.2 (R49-10); A-36.
+    /// (docs/06 §9), and RPC / file / Kerberos resources until the map has
+    /// rows for them (A-36: an unclassified resource is Tier0 for writes).
+    /// The rootDSE is never written (pdp admits only `DirRead` on it;
+    /// [MS-ADTS] 3.1.1.3.2: its attributes "are read-only"), so it is never
+    /// asked; if it were, Tier0 (A-36).
+    ///
+    /// A DNS record (task DN6; docs/54 §5.6; Q-614 item 6): the record is an
+    /// attribute of the one computer object that owns its name, so its tier
+    /// is that object's ([`DirectoryView::dns_record_tier`]) — derived here
+    /// from the directory, never from the request (P3); no record key, a
+    /// zone other than this view's, or a name nobody owns ⇒ Tier0 (fail
+    /// closed).
+    /// Spec: docs/47 §6.3, §8.2; docs/06 §9; docs/49 §5.2 (R49-10); A-36;
+    /// docs/54 §5.6; docs/questions/Q-614 item 6.
     fn object_tier(&self, r: &Resource) -> Result<Tier, PipError> {
         match r {
             Resource::DirObject { dn, .. } => Ok(self.dir_object_tier(dn)?),
+            Resource::Dns {
+                zone,
+                record: Some(key),
+            } => self.dns_record_tier(&zone.0, &key.0),
             Resource::Policy { .. }
             | Resource::RpcMethod { .. }
             | Resource::File { .. }
-            | Resource::Dns { .. }
+            | Resource::Dns { record: None, .. }
             | Resource::Kerberos { .. }
             | Resource::RootDse => Ok(Tier::Tier0),
         }

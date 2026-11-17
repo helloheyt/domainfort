@@ -3,9 +3,11 @@
 //! In L4 nothing outside this crate can bind (task L7 builds the GSSAPI
 //! bind), so a bound session is built here with the test-only constructor
 //! `Session::bound_for_test`, and the per-request re-check is driven through
-//! `Engine::handle` exactly as for an anonymous session. The account source
-//! is kdc's `InMemoryAccounts` (the in-memory equivalent of the
-//! directory-pip view, docs/47 §10.1).
+//! `Engine::handle` exactly as for an anonymous session. The ticket-subject
+//! lookup is an in-memory stand-in for the directory-pip view's
+//! (`InMemorySubjects`, below; directory-pip `TicketSubjects` — task
+//! PN10b: the re-check reads the bound client's facts, never the KDC's
+//! account source, docs/questions/Q-1047).
 //!
 //! Sources (each test names its own): [MS-ADTS] v20261026 5.1.1.6; RFC 4511
 //! §4.4.1, §4.3; RFC 4513 §4; RFC 4120 3.3.3.1; docs/49 §3.2, §4.3, §4.4
@@ -14,12 +16,10 @@
 
 use std::collections::BTreeSet;
 
-use dtyp::{SecurityDescriptor, Sid, SECURITY_NT_AUTHORITY};
-use kdc::{
-    AccountKind, AccountState, ArmorPolicy, ClientAccount, InMemoryAccounts, NamedPrincipal,
-};
-use keyd_types::{KeyHandle, KeyPurpose, PrincipalId as KeydPrincipalId};
-use krb_proto::KerberosTime;
+use directory_pip::{AccountState, TicketSubject, TicketSubjectError, TicketSubjects};
+use dtyp::{Guid, SecurityDescriptor, Sid, SECURITY_NT_AUTHORITY};
+use kdc::NamedPrincipal;
+use krb_proto::{KerberosTime, PrincipalName, Realm};
 use parse_ldap::{
     decode_message, encode_message, AuthState, AuthenticationChoice, BindRequest, DecodeOptions,
     DerefAliases, Direction, Filter, LdapMessage, LdapResult, MessageId, Profile, ProtocolOp,
@@ -66,28 +66,69 @@ fn alice() -> NamedPrincipal {
     NamedPrincipal::from_text(REALM, 1, &["alice"]).expect("valid name")
 }
 
-fn alice_account() -> ClientAccount {
-    ClientAccount {
-        key: KeyHandle::new(
-            KeydPrincipalId::from_bytes([5; 16]),
-            KeyPurpose::PrincipalLongterm,
-        ),
-        sid: alice_sid(),
-        groups: BTreeSet::new(),
-        tier: Tier::Tier2,
-        state: AccountState::ACTIVE,
-        etype_info: Vec::new(),
-        kind: AccountKind::User,
-        armor_policy: ArmorPolicy::Required,
+/// An in-memory ticket-subject lookup (directory-pip `TicketSubjects`):
+/// subjects by exact (realm, name) — the name-type is not part of the match
+/// (RFC 4120 §6.2; kdc `NamedPrincipal::is`) — or "cannot tell" for every
+/// name when unavailable. Test-only; the stand-in for the directory view.
+#[derive(Default)]
+struct InMemorySubjects {
+    subjects: Vec<(NamedPrincipal, TicketSubject)>,
+    unavailable: bool,
+}
+
+impl InMemorySubjects {
+    fn insert(&mut self, who: NamedPrincipal, subject: TicketSubject) {
+        self.subjects.push((who, subject));
+    }
+
+    fn subject_mut(&mut self, realm: &Realm, name: &PrincipalName) -> Option<&mut TicketSubject> {
+        self.subjects
+            .iter_mut()
+            .find(|(who, _)| who.is(realm, name))
+            .map(|(_, subject)| subject)
+    }
+
+    fn remove(&mut self, realm: &Realm, name: &PrincipalName) {
+        self.subjects.retain(|(who, _)| !who.is(realm, name));
+    }
+
+    fn set_unavailable(&mut self, unavailable: bool) {
+        self.unavailable = unavailable;
     }
 }
 
-fn accounts_with_alice() -> InMemoryAccounts {
-    let mut accounts = InMemoryAccounts::new();
-    let p = alice();
-    accounts
-        .insert_client(&p.realm, &p.name, alice_account())
-        .expect("one alice");
+impl TicketSubjects for InMemorySubjects {
+    fn ticket_subject(
+        &self,
+        realm: &Realm,
+        name: &PrincipalName,
+    ) -> Result<Option<TicketSubject>, TicketSubjectError> {
+        if self.unavailable {
+            return Err(TicketSubjectError);
+        }
+        Ok(self
+            .subjects
+            .iter()
+            .find(|(who, _)| who.is(realm, name))
+            .map(|(_, subject)| subject.clone()))
+    }
+}
+
+/// alice's subject facts: the facts the re-check reads (docs/49 §3.2) — no
+/// key handle, no name resolution (task PN10b).
+fn alice_subject() -> TicketSubject {
+    TicketSubject {
+        guid: Guid::from_packet(&[5; 16]),
+        sid: alice_sid(),
+        state: AccountState::ACTIVE,
+        groups: BTreeSet::new(),
+        tier: Tier::Tier2,
+    }
+}
+
+fn accounts_with_alice() -> InMemorySubjects {
+    let mut accounts = InMemorySubjects::default();
+    accounts.insert(alice(), alice_subject());
     accounts
 }
 
@@ -207,7 +248,7 @@ fn root_dse_search(n: u32) -> LdapMessage {
 
 fn send(
     session: &mut Session,
-    accounts: &InMemoryAccounts,
+    subjects: &InMemorySubjects,
     policy: &PolicySnapshot,
     msg: &LdapMessage,
     at: KerberosTime,
@@ -221,7 +262,7 @@ fn send(
         RequestInputs {
             snapshot: policy,
             pip: &pip,
-            accounts,
+            subjects,
             rate: &mut rate,
             now: at,
             transport: tls_report(),
@@ -357,7 +398,7 @@ fn a_disabled_account_is_disconnected() {
     let mut accounts = accounts_with_alice();
     let p = alice();
     accounts
-        .client_mut(&p.realm, &p.name)
+        .subject_mut(&p.realm, &p.name)
         .expect("alice")
         .state
         .enabled = false;
@@ -379,7 +420,7 @@ fn a_revocation_after_authtime_is_disconnected() {
     let mut accounts = accounts_with_alice();
     let p = alice();
     accounts
-        .client_mut(&p.realm, &p.name)
+        .subject_mut(&p.realm, &p.name)
         .expect("alice")
         .state
         .revoked_before = Some(time(9));
@@ -400,7 +441,7 @@ fn a_revocation_before_authtime_does_not_disconnect() {
     let mut accounts = accounts_with_alice();
     let p = alice();
     accounts
-        .client_mut(&p.realm, &p.name)
+        .subject_mut(&p.realm, &p.name)
         .expect("alice")
         .state
         .revoked_before = Some(authtime());
@@ -421,7 +462,7 @@ fn a_revocation_before_authtime_does_not_disconnect() {
 fn a_removed_or_replaced_account_is_disconnected() {
     let p = alice();
     let mut removed = accounts_with_alice();
-    removed.remove_client(&p.realm, &p.name);
+    removed.remove(&p.realm, &p.name);
     let mut session = bound_session();
     let outcome = send(
         &mut session,
@@ -433,7 +474,7 @@ fn a_removed_or_replaced_account_is_disconnected() {
     assert_disconnected(&outcome, &session, AuditReason::IdentityRevoked);
 
     let mut replaced = accounts_with_alice();
-    replaced.client_mut(&p.realm, &p.name).expect("alice").sid =
+    replaced.subject_mut(&p.realm, &p.name).expect("alice").sid =
         Sid::new(SECURITY_NT_AUTHORITY, &[21, 1, 2, 3, 1200]).expect("valid SID");
     let mut session = bound_session();
     let outcome = send(
@@ -446,8 +487,8 @@ fn a_removed_or_replaced_account_is_disconnected() {
     assert_disconnected(&outcome, &session, AuditReason::IdentityRevoked);
 }
 
-/// docs/CLEAN-ROOM.md (fail closed): an account source that cannot answer ends the
-/// session like a revocation.
+/// docs/CLEAN-ROOM.md (fail closed): a ticket-subject lookup that cannot answer
+/// ends the session like a revocation.
 #[test]
 fn an_unavailable_account_source_is_disconnected() {
     let mut accounts = accounts_with_alice();
@@ -548,7 +589,7 @@ fn malformed_input_on_a_bound_session_is_recorded_against_the_principal() {
         RequestInputs {
             snapshot: &allow_policy(),
             pip: &pip,
-            accounts: &accounts,
+            subjects: &accounts,
             rate: &mut rate,
             now: now(),
             transport: tls_report(),

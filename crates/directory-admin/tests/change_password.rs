@@ -46,6 +46,7 @@ fn self_change_domain(test: &str, staff_tier: Option<Tier>) -> Domain {
             self_ace: true,
             self_rule: true,
             staff_tier,
+            ..Extra::default()
         },
     )
 }
@@ -288,6 +289,7 @@ fn the_right_on_itself_is_required() {
                 self_ace: false,
                 self_rule: true,
                 staff_tier: Some(Tier::Tier2),
+                ..Extra::default()
             },
             PdpReasonCode::Acl,
         ),
@@ -296,6 +298,7 @@ fn the_right_on_itself_is_required() {
                 self_ace: true,
                 self_rule: false,
                 staff_tier: Some(Tier::Tier2),
+                ..Extra::default()
             },
             PdpReasonCode::NoGrant,
         ),

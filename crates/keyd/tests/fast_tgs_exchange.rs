@@ -247,7 +247,7 @@ fn fast_response(armor_key: &ProtocolKey, parts: &TgsRepParts) -> KrbFastRespons
 
 fn issue(f: &mut Fixture, ctx: &TgtContext, nonce: u32) -> Result<TgsRepParts, IssueError> {
     f.keyd
-        .issue_tgs_rep(&KDC, &SERVICE, &ctx.ctx_id, &tgs_template(nonce), &now())
+        .issue_tgs(&KDC, &SERVICE, &ctx.ctx_id, &tgs_template(nonce), &now())
 }
 
 /// Full armored TGS round trip. keyd returns the inner request; the issued
@@ -675,7 +675,7 @@ fn template_must_answer_the_inner_request() {
     other_service.sname = bob_name();
     assert_eq!(
         f.keyd
-            .issue_tgs_rep(&KDC, &SERVICE, &ctx.ctx_id, &other_service, &now()),
+            .issue_tgs(&KDC, &SERVICE, &ctx.ctx_id, &other_service, &now()),
         Err(IssueError::Denied)
     );
     assert_eq!(last_reason(&f), AuditReason::FastBindingMismatch);
@@ -684,7 +684,7 @@ fn template_must_answer_the_inner_request() {
     too_long.endtime = kt("20261113180001Z");
     assert_eq!(
         f.keyd
-            .issue_tgs_rep(&KDC, &SERVICE, &ctx.ctx_id, &too_long, &now()),
+            .issue_tgs(&KDC, &SERVICE, &ctx.ctx_id, &too_long, &now()),
         Err(IssueError::BadTemplate)
     );
 
@@ -783,7 +783,7 @@ fn armored_context_is_caller_bound_and_short_lived() {
 
     let ctx = open_armored(&mut f, &armored(&tgt, 70), now()).unwrap();
     assert_eq!(
-        f.keyd.issue_tgs_rep(
+        f.keyd.issue_tgs(
             &KDC_OTHER,
             &SERVICE,
             &ctx.ctx_id,
@@ -817,7 +817,7 @@ fn armored_context_is_caller_bound_and_short_lived() {
     late.starttime = None;
     assert_eq!(
         f.keyd
-            .issue_tgs_rep(&KDC, &SERVICE, &ctx.ctx_id, &late, &at(31)),
+            .issue_tgs(&KDC, &SERVICE, &ctx.ctx_id, &late, &at(31)),
         Err(IssueError::Denied)
     );
     assert_eq!(last_reason(&f), AuditReason::TokenExpired);

@@ -89,14 +89,21 @@
 //! # The admin service's key set (A-73)
 //!
 //! At start, dird resolves the SPN `admind/<dc-fqdn>` — the binding the
-//! provisioning manifest records for the admin service object — exactly as
-//! the KDC resolves a service principal (`AccountSource::service`, docs/47
-//! §1.3: the unique servicePrincipalName index, the single stored value
-//! compared octet for octet, a computer object): the handle is
+//! provisioning manifest records for the admin service object — through the
+//! one lookup path, in the provisioned service object's own context
+//! (`DirectoryView::canonical_principal`, `LookupCtx::ServiceObject` — task
+//! PN10; docs/59 §6.1, §6.2: the namespace probe, the stored value compared
+//! octet for octet under R47-1, a computer object): the handle is
 //! `(objectGUID, AdminService)` (R2: the admin service's own purpose,
-//! `KeyPurpose::of_service_name`). Absent, multi-valued, or naming another object
-//! than the manifest's admin service ⇒ the admin service does not start;
-//! dird's other services run (docs/questions/Q-386 item 3).
+//! `KeyPurpose::of_service_name`) — `admin_service_handle`. It is the
+//! path the KDC's account source wraps, but no KDC account record is built
+//! here and nothing is attested: this service's directory context carries
+//! **no** name-resolution signer — dird builds one only in
+//! `daemon::kdc_channel_context`, for the KDC channel (task PN10b; A-189 on
+//! docs/questions/Q-1050 item 6, Q-1051 item 4). Absent, multi-valued, or
+//! naming another object than the manifest's admin service ⇒ the admin
+//! service does not start; dird's other services run (docs/questions/Q-386
+//! item 3).
 //!
 //! # The request queue (task D2-c; docs/questions/Q-882, A-148)
 //!
@@ -144,7 +151,7 @@ use directory_admin::{
     RequestState as PepState, RequestStep, RequestSummary as PepSummary, RequestView,
     SetAccountExpires, SetEnabled, StepReply,
 };
-use directory_pip::{AccountKind as PipKind, DirectoryView};
+use directory_pip::{AccountKind as PipKind, DirectoryView, LookupCtx};
 use dirstore::NodeId;
 use dtyp::Guid;
 use ipc_audit::AccountExpiresValue;
@@ -153,7 +160,6 @@ use ipc_dird_admin::{
     LookupKey, Operation, PasswordSet, PasswordSetOutcome, PendingRequestState, PolicyChange,
     PolicyTier, RefusalStatus, Reply, RequestShown, RequestState, RequestSummary,
 };
-use kdc::AccountSource;
 use keyd_types::{
     AccountKind as GrantKind, AuthnError, DecidedOperation, DecisionId, DestructionPage, KeyHandle,
     OperationDigest, OperationTicket, PrincipalId, ServiceKeyHandle, SetSecretTarget,
@@ -778,22 +784,48 @@ pub(crate) fn check_manifest(
 }
 
 /// The admin service's key set: the manifest's admin-service binding
-/// resolved as the KDC resolves a service principal, and the result must be
-/// the manifest's handle — `(objectGUID, AdminService)` (module
-/// documentation).
-/// Spec: docs/47 §1.3 (`AccountSource::service`); docs/51 §5.3; A-73;
-/// docs/questions/Q-386 item 3.
+/// resolved through the one lookup path in the provisioned service object's
+/// own context (`LookupCtx::ServiceObject` — task PN10, docs/59 §6.2;
+/// docs/questions/Q-1027 item 2), and the result must be the manifest's
+/// handle — `(objectGUID, AdminService)` (module documentation). The
+/// context's provisioned service objects make the reserved purpose resolve
+/// on this object only (crate directory-pip `resolve`, step 8). No account
+/// record — and so no attested resolution — is built for this check: it is
+/// dird's own question, not the KDC's, and `view`'s context has no signer
+/// (only `daemon::kdc_channel_context` builds one — task PN10b).
+/// Spec: docs/59 §6.1, §6.2 (`ServiceObject`); docs/47 §1.3; docs/51 §5.3;
+/// A-73; A-163; docs/questions/Q-386 item 3, Q-1027 items 2, 6, Q-1050 item
+/// 6 (A-189).
 pub(crate) fn admin_service_handle(
     view: &DirectoryView<'_>,
     manifest: &Manifest,
 ) -> Result<KeyHandle, NotStarted> {
     let expected = manifest.admin_service();
-    match view.service(&expected.binding.realm, &expected.binding.name) {
-        Ok(Some(account)) if account.key == expected.handle => Ok(account.key),
+    match view.canonical_principal(
+        &expected.binding.realm,
+        &expected.binding.name,
+        LookupCtx::ServiceObject,
+    ) {
+        Ok(Some(resolved)) if resolved.key_handle() == expected.handle => Ok(resolved.key_handle()),
         Ok(Some(_)) => Err(NotStarted::AdminServiceMismatch),
         Ok(None) => Err(NotStarted::AdminServiceAbsent),
         Err(_) => Err(NotStarted::DirectoryUnreadable),
     }
+}
+
+/// The objectGUIDs of every provisioned service object the manifest names
+/// (`Manifest::service_objects` — iterated, never listed one by one): the
+/// protected objects of the write PEP and the set every directory context
+/// of dird is built with (task PN10; Q-1019 (a)) — one derivation for both.
+/// Spec: docs/51 §4.3 step 8, §5.2 row 9; A-163; docs/questions/Q-975,
+/// Q-1019 (a), Q-1043.
+#[must_use]
+pub(crate) fn service_object_guids(manifest: &Manifest) -> BTreeSet<Guid> {
+    manifest
+        .service_objects()
+        .into_iter()
+        .map(|set| guid_of(&set.handle))
+        .collect()
 }
 
 /// The key sets a key-operation request may name: the manifest's krbtgt
@@ -830,11 +862,7 @@ pub fn protected_objects(manifest: &Manifest, policy: &DevelopmentPolicy) -> Pro
         // included (A-163; docs/questions/Q-975): iterated, never listed one
         // by one, so a service object added to the manifest is protected
         // without an edit here.
-        service_objects: manifest
-            .service_objects()
-            .into_iter()
-            .map(|set| guid_of(&set.handle))
-            .collect(),
+        service_objects: service_object_guids(manifest),
         policy_principals: BTreeSet::from([policy.mandatory_fast.bootstrap_group]),
     }
 }
@@ -945,7 +973,6 @@ fn wire_operation(operation: &PepOperation) -> Operation {
         PepOperation::CreateComputer(c) => Operation::CreateComputer {
             parent: c.parent,
             name: c.name.clone(),
-            dns_host_name: c.dns_host_name.clone(),
             spn: c.spn.clone(),
         },
         PepOperation::CreateGroup(c) => Operation::CreateGroup {
@@ -1141,17 +1168,14 @@ pub fn pep_operation(operation: &Operation) -> Option<PepOperation> {
             upn: upn.clone(),
             description: description.clone(),
         }),
-        Operation::CreateComputer {
-            parent,
-            name,
-            dns_host_name,
-            spn,
-        } => PepOperation::CreateComputer(CreateComputer {
-            parent: *parent,
-            name: name.clone(),
-            dns_host_name: dns_host_name.clone(),
-            spn: spn.clone(),
-        }),
+        // Task PN6b: no dNSHostName crosses the channel — the PEP derives it.
+        Operation::CreateComputer { parent, name, spn } => {
+            PepOperation::CreateComputer(CreateComputer {
+                parent: *parent,
+                name: name.clone(),
+                spn: spn.clone(),
+            })
+        }
         Operation::CreateGroup {
             parent,
             sam,
@@ -1400,9 +1424,6 @@ const _: () =
 const _: () = assert!(
     ipc_dird_admin::channel::MAX_PRINCIPAL_NAME as usize
         >= directory_admin::MAX_PRINCIPAL_NAME_CHARS
-);
-const _: () = assert!(
-    ipc_dird_admin::channel::MAX_DNS_HOST_NAME as usize >= directory_admin::MAX_DNS_HOST_NAME_CHARS
 );
 const _: () = assert!(
     ipc_dird_admin::channel::MAX_DESCRIPTION as usize >= 3 * directory_admin::MAX_DESCRIPTION_UNITS

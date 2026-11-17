@@ -11,6 +11,11 @@
 # dirstore / redb / the IntegrityKey code into the kdc process (the reason
 # A-63 split ipc-keyd-server). Only the dird daemon depends on this crate.
 #
+# Task PN10 (docs/59 §7.4; A-173): dird's signer of name resolutions
+# (`ResolutionSigner`) lives here — dird's attestation key and clock, tagging
+# what the one lookup path resolved with crate name-attestation's `tag`; the
+# kdc never links this crate (nor name-attestation).
+#
 # Written only from this project's decided design — docs/50 (R50-2, §3.3,
 # §3.4, §3.6, §3.7, §8.2, §9, §10), docs/47 §8, docs/questions Q-213 (A-57),
 # Q-225 (A-59), Q-245 / Q-255 (A-63, A-65), Q-270, PENDING-OWNER — and the
@@ -39,6 +44,14 @@ dirstore = { path = "../dirstore" }
 kdc = { path = "../kdc" }
 # `Pip`, `PolicyVersion`.
 pdp = { path = "../pdp" }
+# Task PN10 (docs/59 §7.4; A-173): dird's signer of name resolutions — the
+# attestation key's type and `tag` (HMAC-SHA-256 over keyd-types' one MAC
+# input; RustCrypto through it, OD-9), the resolution types, and the
+# KerberosTime of `issued_at`. All our own crates; name-attestation brings
+# hmac / sha2 / zeroize, already in the lock (dirstore links the same).
+name-attestation = { path = "../name-attestation" }
+keyd-types = { path = "../keyd-types" }
+krb-proto = { path = "../krb-proto" }
 
 [dev-dependencies]
 # TESTS ONLY: the directory fixtures of crates/directory-pip/tests/common
@@ -49,7 +62,6 @@ pdp = { path = "../pdp" }
 # the lock.
 ad-schema = { path = "../ad-schema" }
 keyd = { path = "../keyd" }
-krb-proto = { path = "../krb-proto" }
 dtyp = { path = "../dtyp" }
 zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
 # `test-seams` (A-113, R15): the reused fixtures open their store by path

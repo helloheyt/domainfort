@@ -908,32 +908,24 @@ fn handle_order(handle: &KeyHandle) -> ([u8; 16], u8) {
     (*handle.principal.as_bytes(), purpose_code(handle.purpose))
 }
 
-/// The persisted code of a purpose — explicit, so that the format does not
-/// depend on the enum's in-memory representation; a new purpose fails to
-/// compile here until it is given a code.
+/// The persisted code of a purpose: [`KeyPurpose::code`], the one table of
+/// it (model.rs) — explicit, so that the format does not depend on the
+/// enum's in-memory representation. Not a table of its own any more
+/// (docs/questions/Q-1023 item 4: the same fact was written here and in the
+/// name-resolution MAC input). The persisted numbers are unchanged (pinned
+/// by `the_persisted_purpose_codes_are_unchanged` below and by
+/// tests/sealed_store_format.rs).
 /// Spec: docs/10 §1 (KeyPurpose); r4-c §3.3 (the handle in the associated
-/// data).
+/// data); docs/questions/Q-1023 item 4 (A-175).
 const fn purpose_code(purpose: KeyPurpose) -> u8 {
-    match purpose {
-        KeyPurpose::PrincipalLongterm => 0,
-        KeyPurpose::Krbtgt => 1,
-        KeyPurpose::Service => 2,
-        KeyPurpose::AdminService => 3,
-        KeyPurpose::ChangePasswordService => 4,
-    }
+    purpose.code()
 }
 
-/// The purpose of a persisted code; `None` for every other code.
-/// Spec: docs/10 §1; r4-c §3.3.
+/// The purpose of a persisted code; `None` for every other code —
+/// [`KeyPurpose::from_code`], the inverse of the one table.
+/// Spec: docs/10 §1; r4-c §3.3, §8.3; docs/questions/Q-1023 item 4.
 const fn purpose_from_code(code: u8) -> Option<KeyPurpose> {
-    match code {
-        0 => Some(KeyPurpose::PrincipalLongterm),
-        1 => Some(KeyPurpose::Krbtgt),
-        2 => Some(KeyPurpose::Service),
-        3 => Some(KeyPurpose::AdminService),
-        4 => Some(KeyPurpose::ChangePasswordService),
-        _ => None,
-    }
+    KeyPurpose::from_code(code)
 }
 
 /// The version rules shared by the encoder and the parser: each version's
@@ -1324,6 +1316,72 @@ mod tests {
         }
         for code in 5..=u8::MAX {
             assert_eq!(purpose_from_code(code), None, "{code}");
+        }
+    }
+
+    /// A test registry of one suite (test data — no real algorithm).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct PinSuite;
+
+    impl SealingSuite for PinSuite {
+        fn from_code(code: u16) -> Option<Self> {
+            (code == 0x7F01).then_some(PinSuite)
+        }
+        fn code(self) -> u16 {
+            0x7F01
+        }
+        fn seal_overhead(self) -> usize {
+            0
+        }
+        fn digest_len(self) -> usize {
+            32
+        }
+    }
+
+    /// Q-1023 item 4 (folding the purpose table into `KeyPurpose::code`)
+    /// changes no persisted octet: for every purpose, the octet after the
+    /// principal id in an encoded record (offset 4 + 2 + 2 + 16 + 16 = 40)
+    /// and in a root-digest entry (offset 12 + 16 = 28) is the number the
+    /// format has always carried — 0..=4, hand-written here, not read from
+    /// `KeyPurpose::code` — and parsing gives the purpose back.
+    /// Source: r4-c §3.3 (the handle in the associated data, the root-digest
+    /// list); this module's layout.
+    #[test]
+    fn the_persisted_purpose_codes_are_unchanged() {
+        let persisted = [
+            (KeyPurpose::PrincipalLongterm, 0u8),
+            (KeyPurpose::Krbtgt, 1),
+            (KeyPurpose::Service, 2),
+            (KeyPurpose::AdminService, 3),
+            (KeyPurpose::ChangePasswordService, 4),
+        ];
+        for (purpose, octet) in persisted {
+            let handle = KeyHandle::new(PrincipalId::from_bytes([0x11; 16]), purpose);
+            let aad = KeyRecordAad {
+                suite: PinSuite,
+                store_id: StoreId::from_bytes([0x5A; 16]),
+                handle,
+                binding: PrincipalBinding::new(
+                    KerberosString::new("EXAMPLE.ORG").unwrap(),
+                    PrincipalName {
+                        name_type: 1,
+                        name_string: vec![KerberosString::new("n").unwrap()],
+                    },
+                ),
+                current: RecordVersion {
+                    kvno: Kvno::new(1),
+                    source: KeySource::KeydDrawn,
+                    enctypes: vec![EncTypeId::Aes256CtsHmacSha196],
+                },
+                previous: None,
+            };
+            let record = encode_record(&aad, &vec![0u8; aad.sealed_len()]).unwrap();
+            assert_eq!(record[40], octet, "{purpose:?}");
+            let parsed = KeyRecord::<PinSuite>::parse(&record).unwrap();
+            assert_eq!(parsed.aad().handle.purpose, purpose);
+            let digest = [0xD1u8; 32];
+            let list = root_digest_input(PinSuite, &[(handle, &digest[..])]).unwrap();
+            assert_eq!(list[12 + 16], octet, "{purpose:?}");
         }
     }
 

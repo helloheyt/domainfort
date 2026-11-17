@@ -14,6 +14,7 @@
 //!     --kpasswd-front-account <uid>:<gid> --dnsd-account <uid>:<gid> \
 //!     --keyadm-uid <uid> --admin-socket-group <gid> \
 //!     --staging-dir <path> --database-path <path> --integrity-key-path <path> \
+//!     --attestation-key-path <path> --keyadm-attestation-key-path <path> \
 //!     --policy-path <path> --manifest-path <path> --audit-log-path <path> \
 //!     --keyd-config <path> --dird-config <path> --kdc-config <path> \
 //!     --ldap-front-config <path> --auditd-config <path> \
@@ -24,11 +25,12 @@
 //!     --dird-dns-socket <path> --audit-socket <path> --admin-socket <path> \
 //!     --tls-certificate-path <path> --tls-private-key-path <path> \
 //!     --policy-next-path <path> \
-//!     --kdc-listen <addr:port> [--kdc-listen …] \
-//!     [--ldap-listen <addr:port> …] [--ldaps-listen <addr:port> …] \
-//!     --kpasswd-listen <addr:port> [--kpasswd-listen …] \
-//!     --dnsd-listen <addr:port> [--dnsd-listen …] \
-//!     --internal-network <addr/prefix> [--internal-network …]
+//!     --kdc-listen <addr:88> [--kdc-listen …] \
+//!     --ldap-listen <addr:389> [--ldap-listen …] [--ldaps-listen <addr:port> …] \
+//!     --kpasswd-listen <addr:464> [--kpasswd-listen …] \
+//!     --dnsd-listen <addr:53> [--dnsd-listen …] \
+//!     --internal-network <addr/prefix> [--internal-network …] \
+//!     --dc-address <IPv4> [--dc-address …]
 //!
 //! provision policy --policy-path <path> <change> [<change> …]
 //!   <change> := --add-principal <SID> <Tier0|Tier1|Tier2>
@@ -69,6 +71,21 @@
 //! the two network fronts' accounts, files and listeners (kpasswd-front —
 //! docs/53 §3.3; dnsd — docs/54 §4.3, §4.7) and the two dird sockets they
 //! name (`dird-kpasswd.sock`, docs/53 §4.3; `dird-dns.sock`, docs/54 §4.6).
+//! Task DN10b adds `--dc-address` (repeatable, at least one — checked with
+//! the input, docs/questions/Q-1014): the DC's own host record (docs/54
+//! §3.1, §10 row DN13). Task DN10c makes `--ldap-listen` required (at least
+//! one StartTLS listener — the zone advertises `_ldap._tcp` on 389) and the
+//! kdc, StartTLS and kpasswd listeners take only their standard port (88,
+//! 389, 464 — crates/config `StandardPort`); docs/questions/Q-1016 items 3–4
+//! (A-176), Q-1024. Task DN10d moves the StartTLS requirement into
+//! ldap-front's own schema (the plan's parse-back refuses a file without
+//! `ldap_listen`) and gives dnsd's listeners port 53 only (A-178 on
+//! docs/questions/Q-1025 items 1, 3). Task PN12 adds the attestation key's
+//! two files (docs/59 §7.4): `--attestation-key-path` (dird's key file, the
+//! `attestation_key_path` of dird's file) and `--keyadm-attestation-key-path`
+//! (keyadm's input copy — the operand of `keyadm ceremony`; docs/questions/
+//! Q-1039 item 1, A-183) — paths only: the key is drawn by the run, never an
+//! argument (D95).
 //!
 //! Spec: docs/51 §4.3 (the input; step 12), §4.4 (the password source),
 //! §5.10 (`provision policy`), §3 (D95); docs/50 §7.1 (numeric ids, no
@@ -175,6 +192,8 @@ const DOMAIN_FLAGS: &[(&str, Arity)] = &[
     ("--staging-dir", Arity::One),
     ("--database-path", Arity::One),
     ("--integrity-key-path", Arity::One),
+    ("--attestation-key-path", Arity::One),
+    ("--keyadm-attestation-key-path", Arity::One),
     ("--policy-path", Arity::One),
     ("--manifest-path", Arity::One),
     ("--audit-log-path", Arity::One),
@@ -204,6 +223,7 @@ const DOMAIN_FLAGS: &[(&str, Arity)] = &[
     ("--kpasswd-listen", Arity::Repeated),
     ("--dnsd-listen", Arity::Repeated),
     ("--internal-network", Arity::Repeated),
+    ("--dc-address", Arity::Repeated),
 ];
 
 /// The arguments as checked text: valid UTF-8, printable ASCII only
@@ -366,6 +386,8 @@ fn parse_domain(args: &[String]) -> Result<DomainInput, CliError> {
             staging: f.path("--staging-dir")?,
             database: f.path("--database-path")?,
             integrity_key: f.path("--integrity-key-path")?,
+            attestation_key: f.path("--attestation-key-path")?,
+            keyadm_attestation_key: f.path("--keyadm-attestation-key-path")?,
             policy: f.path("--policy-path")?,
             manifest: f.path("--manifest-path")?,
             audit_log: f.path("--audit-log-path")?,
@@ -397,6 +419,7 @@ fn parse_domain(args: &[String]) -> Result<DomainInput, CliError> {
             internal_networks: f.all("--internal-network"),
             kpasswd_listen: f.all("--kpasswd-listen"),
             dnsd_listen: f.all("--dnsd-listen"),
+            dc_addresses: f.all("--dc-address"),
         },
         names: Names {
             tier0_ou: f.one("--tier0-ou")?.to_owned(),

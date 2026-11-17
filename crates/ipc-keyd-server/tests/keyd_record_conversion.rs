@@ -106,10 +106,12 @@ fn keyd_outcomes_never_map_to_a_phase_code() {
 /// their own same-named codes, never `Unlisted`; likewise the seven decision
 /// reasons appended by A-102 (docs/52 §4.5) and the two operation-binding
 /// reasons of R2 (docs/52 §5 item 3), and the two revocation reasons of task
-/// F3 (docs/questions/Q-976).
+/// F3 (docs/questions/Q-976), and the attestation-key install's reason of
+/// task PN9 (docs/59 §7.5, docs/questions/Q-1033 item 4).
 #[test]
 fn keyd_grant_reasons_match() {
     for reason in [
+        keyd::AuditReason::AttestationKeyInstalled,
         keyd::AuditReason::DecisionRevoked,
         keyd::AuditReason::DecisionExecuted,
         keyd::AuditReason::NoGrant,
@@ -190,5 +192,40 @@ fn keyd_operations_and_roles_match() {
             reason: keyd::AuditReason::None,
         };
         assert_eq!(keyd_record(&record).caller_role.name(), format!("{role:?}"));
+    }
+}
+
+/// Task PN11 (docs/59 §7.5; docs/questions/Q-1033 item 4, Q-1056 item 4):
+/// the four name-resolution reasons keyd reports on the issuance path, and
+/// the seal's refusal without the attestation key, map to their own
+/// same-named codes (97-101, appended in keyd's declaration order), never
+/// `Unlisted`.
+#[test]
+fn the_name_resolution_reasons_have_their_own_codes() {
+    for (reason, code) in [
+        (keyd::AuditReason::AttestationKeyMissing, 97),
+        (keyd::AuditReason::NameResolutionInvalid, 98),
+        (keyd::AuditReason::NameResolutionStale, 99),
+        (keyd::AuditReason::NameResolutionMismatch, 100),
+        (keyd::AuditReason::AttestationKeyNotInstalled, 101),
+    ] {
+        let record = keyd::AuditRecord {
+            ts: ktime(),
+            caller_role: keyd::Role::Kdc,
+            caller_uid: 1,
+            op: keyd::Operation::IssueTgsRep,
+            principal: None,
+            purpose: None,
+            kvno: None,
+            secondary: None,
+            approvers: None,
+            decision: None,
+            result: keyd::AuditOutcome::Denied,
+            reason,
+        };
+        let wire = keyd_record(&record).reason;
+        assert_eq!(wire.name(), format!("{reason:?}"));
+        assert_eq!(wire.code(), code, "{reason:?}");
+        assert_ne!(wire, KeydReason::Unlisted);
     }
 }

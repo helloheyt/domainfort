@@ -61,12 +61,76 @@
 //! itself): uniqueness of sAMAccountName / userPrincipalName /
 //! servicePrincipalName / objectSid and of an RDN under its parent, the
 //! parent's existence and class (possSuperiors), the schema's must / may
-//! and value syntaxes.
+//! and value syntaxes — and the uniqueness of every **namespace key** over
+//! all objects (below).
+//!
+//! # The one principal namespace (task PN5; docs/59 §5, A-173)
+//!
+//! **Class M2 (= C31 / W3, docs/59 §3) — uniqueness per attribute, not over
+//! the union**: a computer `dc$` beside a user `dc`, a UPN `bob@<realm>`
+//! beside another object's sAMAccountName `bob`, one SPN in two spellings
+//! each passed every per-attribute index. **The root change, write half**
+//! (the storage half is ad-schema's `PRINCIPAL_NAME_KEY`, task PN2): every
+//! create of a security principal gets its keys from the checker — module
+//! `object` derives them with `principal_names::keys_of_names` from the
+//! object's own names and its claim, asserts their count, and
+//! [`Invariants::check_create`] writes exactly those keys into the object it
+//! creates. A caller can neither supply nor change a key (docs/59 N7:
+//! `known()` / `modifiable()`), so "stored keys = derived keys" holds for
+//! every write path — online, provisioning, and any later one, which can
+//! only reach the store through this module. The store's unique index on
+//! the one attribute then refuses, in the same commit, a key another live
+//! object holds: the union is unique by construction. The provisioning
+//! session derives the keys in the realm of the naming context it is given
+//! ([`Provisioning::with_dns_registration`], task DN10b's `NamingContext`);
+//! without one it creates no principal (fail closed); it marks the store it
+//! builds (`principal-namespace` counter — Q-1008 item 5).
 //!
 //! **Not here** (decisions of the requester's request, not invariants of
 //! the store — they stay in the online PEP): visibility, the PDP decision,
 //! dual control, the self-lockout guard, the policy-named objects (they
 //! depend on the policy version, docs/47 §8.1).
+//!
+//! # The zone serial (task DN6)
+//!
+//! **Class — the zone's content changes while its SOA SERIAL does not**
+//! (RFC 2136 §3.6: "It is imperative that the zone's contents and the SOA's
+//! SERIAL be tightly synchronized. If the zone appears to change, the SOA
+//! must appear to change as well"). dnsd fetches a new image only when the
+//! SERIAL moves (docs/54 §4.4), so a content change without one is never
+//! served — or a stale record is served on. The content (crate directory-pip
+//! `zone`) depends on more than a host's own record: an admin write that
+//! disables, expires or deletes a computer holding one changes it too.
+//!
+//! **The change.** The one commit ([`CheckedWrite::commit`]) takes the
+//! `dns-zone-serial` counter in the same transaction for **every** write
+//! that changes the zone's content: a host record's write ([`Op`]
+//! `HostRecord`, `DnsSelfUpdate`), and any create, change or delete of an
+//! object that holds — or will hold — host addresses. No write path can skip
+//! it: there is no other commit. A host record is itself a state rule of the
+//! checker (module `object`, `check_host_record`): a computer named
+//! `<computerName>.<zone>` with one LDH label, at most eight registrable
+//! addresses — so a write the zone image would refuse cannot be stored.
+//! What the commit cannot see is the clock (an address ageing out, an
+//! account reaching accountExpires): the projection names that instant
+//! (`ZoneProjection::valid_until`) — docs/questions/Q-993.
+//!
+//! **The serial-only write (task DN10b; Q-1002, decision A-172).** For the
+//! changes no commit sees — the clock, and a dird restart with other zone
+//! values — dird advances the serial alone: [`Op`] `ZoneSerial`, checked by
+//! [`Invariants::check_zone_serial`], whose commit writes no object and takes
+//! no change-seq (there is no originating write to stamp — docs/29 §2 as
+//! cited in docs/51 §8.3: the change-seq is an object write's `Origin`) and
+//! takes the zone serial exactly as a content write does, in the one commit:
+//! `take_zone_serial` stays the counter's only taker, so there is still
+//! exactly one writer of SERIAL and one door to it (crate::zone_serial is
+//! the public entry, after auditd acknowledged the decision).
+//!
+//! A host record's write that registers again an address already stored
+//! makes two originating writes in the transaction (the value written out,
+//! then back), because a dirstore Replace keeps a present value's attr-stamp
+//! — the stamp is the address's registration time (docs/questions/Q-991
+//! item 5).
 //!
 //! # Links checked once
 //!
@@ -83,8 +147,10 @@
 //! Spec: docs/52 §3.14, §7 (R13); docs/CLEAN-ROOM.md; A-79, A-83, A-89, A-92,
 //! A-95, A-102; docs/51 §4.3 step 5, §5.2, §8.3, §11; docs/46 §4.4, §5.4,
 //! §8.2-§8.5; docs/47 §5.3; [MS-SAMR] v20260427 2.2.1.14, 3.1.1.6,
-//! 3.1.1.8.9, 3.1.1.9.2; docs/questions/Q-298, Q-355..Q-358, Q-376, Q-416,
-//! Q-505..Q-507.
+//! 3.1.1.8.4 item 2, 3.1.1.8.9, 3.1.1.9.2; RFC 4120 §6.2 ("Ignoring the
+//! name type, no two names can be the same"); docs/59 §3 (M2), §4.4 N1, N7,
+//! §5.1-§5.2 (A-173); docs/questions/Q-298, Q-355..Q-358, Q-376, Q-416,
+//! Q-505..Q-507, Q-1008, Q-1020.
 
 mod graph;
 mod object;
@@ -99,11 +165,16 @@ use dirstore::{
     MAX_VALUES_PER_ATTRIBUTE,
 };
 use dtyp::{Guid, Sid, GUID_PACKET_LEN};
+use principal_names::{KeySet, NameContext};
 
 pub(crate) use graph::{End, Graph, MAX_WALK_STEPS};
+pub(crate) use object::HostZone;
 pub use provisioning::{Provisioning, ProvisioningError, ProvisioningRole};
 
-use crate::config::{ConfigError, CHANGE_SEQ_COUNTER, RID_COUNTER, RID_END_EXCLUSIVE, RID_FIRST};
+use crate::config::{
+    ConfigError, CHANGE_SEQ_COUNTER, DNS_ZONE_SERIAL_COUNTER, RID_COUNTER, RID_END_EXCLUSIVE,
+    RID_FIRST,
+};
 use crate::ids::Ids;
 use crate::record;
 
@@ -154,6 +225,11 @@ pub(crate) enum Fault {
     Integrity,
     /// The change-seq counter or the NC root's domain SID is missing.
     Missing,
+    /// A security principal is to be created by a checker that has no
+    /// principal namespace context (a provisioning session given no naming
+    /// context): its keys cannot be derived, so it is not written (task
+    /// PN5; docs/59 §5.1 — fail closed).
+    Namespace,
 }
 
 /// A check that did not pass: a rule refused the write, or no decision was
@@ -288,6 +364,35 @@ enum Op {
     Delete {
         target: Guid,
     },
+    /// A host record's write (task DN6, `DnsSelfUpdate`): `addresses` is the
+    /// record's complete new value set; `renewed` the values of it the write
+    /// registers again (their registration time — the attr-stamp — becomes
+    /// this write's even when already present); `when_changed` the change
+    /// that sets whenChanged.
+    HostRecord {
+        target: Guid,
+        addresses: Vec<Vec<u8>>,
+        renewed: Vec<Vec<u8>>,
+        when_changed: AttributeChange,
+    },
+    /// The serial-only write (task DN10b; docs/questions/Q-1002 item 2):
+    /// no object is written; the commit takes the zone serial alone
+    /// (module documentation, "The zone serial").
+    ZoneSerial,
+}
+
+/// What an originating object write is stamped with (its `Origin`, beside
+/// the change-seq the commit takes): the write's wall clock (directory-admin
+/// `wall_clock`) and this DC's node-id. The serial-only write has none — it
+/// writes no object — and an object write without one is refused
+/// ([`CommitError::Unstamped`]), never stamped with a stand-in.
+/// Spec: docs/51 §8.3; docs/29 §2 as cited there; dirstore `Origin`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WriteStamp {
+    /// The wall clock of the write (DSTIME seconds).
+    pub(crate) wall_clock: Timestamp,
+    /// This DC's node-id.
+    pub(crate) origin_node: NodeId,
 }
 
 /// A write every rule passed, against the transaction state whose
@@ -297,13 +402,18 @@ enum Op {
 pub(crate) struct CheckedWrite {
     basis: CounterState,
     op: Op,
+    /// The host-address attribute's id, for the zone-serial rule of the
+    /// commit (task DN6).
+    host_address: AttrId,
 }
 
-/// What a commit allocated: the RID and objectSid of a new principal.
+/// What a commit allocated: the RID and objectSid of a new principal, and —
+/// for a write that changed the zone's content — the zone's new SOA SERIAL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Committed {
     pub(crate) rid: Option<u32>,
     pub(crate) sid: Option<Sid>,
+    pub(crate) zone_serial: Option<u32>,
 }
 
 /// Why a checked write did not commit. Every variant leaves the
@@ -326,6 +436,15 @@ pub(crate) enum CommitError {
     ChangeSeq(dirstore::Error),
     /// dirstore refused the write itself.
     Write(dirstore::Error),
+    /// The write changes the zone's content and the zone serial counter
+    /// refused a take, or is missing (task DN6; A-83: never created here).
+    ZoneSerial(dirstore::Error),
+    /// The target could not be read to tell whether the write changes the
+    /// zone's content.
+    Read(dirstore::Error),
+    /// An object write was committed without its [`WriteStamp`] (a
+    /// misassembled caller — fail closed).
+    Unstamped,
 }
 
 impl CheckedWrite {
@@ -333,17 +452,18 @@ impl CheckedWrite {
     /// refused if the change-seq counter is no longer the checked state;
     /// for a security principal, the RID from the counter (or the krbtgt
     /// exception's 502) and the objectSid it forms; the change-seq of the
-    /// write's `Origin` (with `wall_clock` and `origin_node`); then the one
-    /// dirstore call.
+    /// write's `Origin` (with `stamp`'s wall clock and node-id — required
+    /// for every object write, absent for the serial-only write, which
+    /// writes no object); then the one dirstore call; then, for a write
+    /// that changes the zone, the zone serial.
     /// Spec: module documentation; docs/51 §8.3 (RID and change-seq from
     /// the counters, in the creation's own `WriteTxn`); A-75; A-83; A-89
     /// (Q-358 item 1); [MS-SAMR] 3.1.1.9.2, 3.1.1.9.2.1 item 1.2; docs/29 §2
-    /// as cited in docs/51 §8.3.
+    /// as cited in docs/51 §8.3; docs/questions/Q-1002 item 2 (A-172).
     pub(crate) fn commit(
         self,
         txn: &mut WriteTxn<'_>,
-        wall_clock: Timestamp,
-        origin_node: NodeId,
+        stamp: Option<WriteStamp>,
     ) -> Result<Committed, CommitError> {
         let current = txn
             .counter(CHANGE_SEQ_COUNTER)
@@ -351,16 +471,85 @@ impl CheckedWrite {
         if current != Some(self.basis) {
             return Err(CommitError::Stale);
         }
-        match self.op {
+        // The zone serial (task DN6; RFC 2136 §3.6: "If the zone appears to
+        // change, the SOA must appear to change as well"): a write that
+        // leaves, or finds, host addresses on its object changes what the
+        // zone projection returns, so it takes the zone serial counter in
+        // this same transaction — here, in the one commit every write path
+        // goes through (module documentation, "The zone serial"). The
+        // serial-only write (task DN10b) is such a write by definition.
+        let host_address = self.host_address;
+        let zone = self.op.changes_zone(txn, host_address)?;
+        let mut committed = self.op.commit(txn, stamp, host_address)?;
+        if zone {
+            committed.zone_serial = Some(take_zone_serial(txn)?);
+        }
+        Ok(committed)
+    }
+}
+
+impl Op {
+    /// `true` if this write changes the zone's content: the object it
+    /// creates holds host addresses, or the object it changes or deletes
+    /// holds some (before the write) or will (a host record's write always
+    /// counts) — or it is the serial-only write, whose whole purpose is the
+    /// zone's SERIAL (task DN10b). Read in the transaction, before the
+    /// write.
+    /// Spec: RFC 2136 §3.6; docs/54 §5.4; crate directory-pip `zone`
+    /// (what the projection reads); docs/questions/Q-1002 item 2.
+    fn changes_zone(&self, txn: &WriteTxn<'_>, host_address: AttrId) -> Result<bool, CommitError> {
+        let holds = |target: Guid| -> Result<bool, CommitError> {
+            Ok(txn
+                .get_object(target)
+                .map_err(CommitError::Read)?
+                .is_some_and(|obj| obj.attribute(host_address).is_some()))
+        };
+        match self {
+            Op::Create { new, .. } => Ok(new
+                .attributes
+                .iter()
+                .any(|(id, values)| *id == host_address && !values.is_empty())),
+            Op::Modify { target, changes } => {
+                let writes = changes.iter().any(|change| {
+                    let AttributeChange::Replace { id, values } = change;
+                    *id == host_address && !values.is_empty()
+                });
+                Ok(writes || holds(*target)?)
+            }
+            Op::Delete { target } => holds(*target),
+            Op::HostRecord { .. } | Op::ZoneSerial => Ok(true),
+        }
+    }
+
+    /// The write itself (see [`CheckedWrite::commit`]).
+    fn commit(
+        self,
+        txn: &mut WriteTxn<'_>,
+        stamp: Option<WriteStamp>,
+        host_address: AttrId,
+    ) -> Result<Committed, CommitError> {
+        let none = Committed {
+            rid: None,
+            sid: None,
+            zone_serial: None,
+        };
+        // The serial-only write writes no object, so it has no `Origin` to
+        // stamp (module documentation); every other write needs its stamp.
+        let WriteStamp {
+            wall_clock,
+            origin_node,
+        } = match (&self, stamp) {
+            (Op::ZoneSerial, _) => return Ok(none),
+            (_, Some(stamp)) => stamp,
+            (_, None) => return Err(CommitError::Unstamped),
+        };
+        match self {
             Op::Create {
                 mut new,
                 principal,
                 object_sid,
             } => {
-                let mut committed = Committed {
-                    rid: None,
-                    sid: None,
-                };
+                let mut committed = none;
                 if let Some((source, domain)) = principal {
                     let rid = match source {
                         RidSource::Krbtgt => graph::DOMAIN_USER_RID_KRBTGT,
@@ -387,6 +576,7 @@ impl CheckedWrite {
                     committed = Committed {
                         rid: Some(rid),
                         sid: Some(sid),
+                        zone_serial: None,
                     };
                 }
                 let origin = take_origin(txn, wall_clock, origin_node)?;
@@ -398,22 +588,93 @@ impl CheckedWrite {
                 let origin = take_origin(txn, wall_clock, origin_node)?;
                 txn.modify_object(target, changes, &origin)
                     .map_err(CommitError::Write)?;
-                Ok(Committed {
-                    rid: None,
-                    sid: None,
-                })
+                Ok(none)
             }
             Op::Delete { target } => {
                 let origin = take_origin(txn, wall_clock, origin_node)?;
                 txn.delete_object(target, &origin)
                     .map_err(CommitError::Write)?;
-                Ok(Committed {
-                    rid: None,
-                    sid: None,
-                })
+                Ok(none)
             }
+            Op::HostRecord {
+                target,
+                addresses,
+                renewed,
+                when_changed,
+            } => {
+                // A value the write registers again that is already stored
+                // keeps its attr-stamp under a Replace (dirstore
+                // `AttributeChange::Replace`); so it is first written out,
+                // then back with the rest — two originating writes of the
+                // same transaction, each with its own change-seq; nothing in
+                // between is ever committed (module documentation, "The zone
+                // serial"; docs/questions/Q-991 item 5).
+                let stored: Vec<Vec<u8>> = txn
+                    .get_object(target)
+                    .map_err(CommitError::Read)?
+                    .and_then(|obj| obj.attribute(host_address).cloned())
+                    .map(|a| a.values.into_iter().map(|v| v.value).collect())
+                    .unwrap_or_default();
+                let again: Vec<&Vec<u8>> = renewed.iter().filter(|v| stored.contains(v)).collect();
+                if !again.is_empty() {
+                    let without: Vec<Vec<u8>> = addresses
+                        .iter()
+                        .filter(|v| !again.contains(v))
+                        .cloned()
+                        .collect();
+                    let origin = take_origin(txn, wall_clock, origin_node)?;
+                    txn.modify_object(
+                        target,
+                        vec![AttributeChange::Replace {
+                            id: host_address,
+                            values: without,
+                        }],
+                        &origin,
+                    )
+                    .map_err(CommitError::Write)?;
+                }
+                let origin = take_origin(txn, wall_clock, origin_node)?;
+                txn.modify_object(
+                    target,
+                    vec![
+                        AttributeChange::Replace {
+                            id: host_address,
+                            values: addresses,
+                        },
+                        when_changed,
+                    ],
+                    &origin,
+                )
+                .map_err(CommitError::Write)?;
+                Ok(none)
+            }
+            // Returned above: no object, no change-seq.
+            Op::ZoneSerial => Ok(none),
         }
     }
+}
+
+/// Take the zone serial counter in `txn` and return the zone's new SOA
+/// SERIAL ([`directory_pip::zone_serial`] of the counter's state): one take
+/// per content change, and one more when that would show SERIAL 0 (RFC 2136
+/// §7.11: "if the result of the increment is zero … increment it again").
+/// The counter missing or exhausted ⇒ refused (A-83: never created or reset
+/// here).
+/// Spec: docs/54 §5.4; RFC 2136 §3.6, §7.11; A-75; A-83.
+fn take_zone_serial(txn: &mut WriteTxn<'_>) -> Result<u32, CommitError> {
+    for _ in 0..2 {
+        txn.take_counter_value(DNS_ZONE_SERIAL_COUNTER)
+            .map_err(CommitError::ZoneSerial)?;
+        let state = txn
+            .counter(DNS_ZONE_SERIAL_COUNTER)
+            .map_err(CommitError::ZoneSerial)?
+            .ok_or(CommitError::ZoneSerial(dirstore::Error::NoSuchCounter))?;
+        if let Some(serial) = directory_pip::zone_serial(&state) {
+            return Ok(serial);
+        }
+    }
+    // Two takes cannot both land on a multiple of 2³².
+    Err(CommitError::ZoneSerial(dirstore::Error::CounterExhausted))
 }
 
 /// The `Origin` of one write: the next change-seq, taken in `txn`.
@@ -515,21 +776,57 @@ pub(crate) struct Invariants {
     ids: Ids,
     schema: Schema,
     service_objects: BTreeSet<Guid>,
+    /// The zone and registrable networks of host records (task DN6);
+    /// `None` ⇒ no host address can be written.
+    hosts: Option<HostZone>,
+    /// The principal namespace's realm context (task PN5): the online PEP's
+    /// from `AdminConfig`, the provisioning session's from the naming
+    /// context it is given; `None` ⇒ no security principal can be created
+    /// (fail closed — `Fault::Namespace`).
+    names: Option<NameContext>,
 }
 
 impl Invariants {
     /// The checker for the phase-1 schema with these protected service
-    /// objects. Fails closed if the schema lacks a name it needs.
-    /// Spec: docs/46 §4.4, §5.4; docs/51 §5.2 row 9.
+    /// objects, when DNS self-updates are enabled the zone of host records
+    /// (`hosts`), and the principal namespace's realm context (`names`).
+    /// Fails closed if the schema lacks a name it needs.
+    /// Spec: docs/46 §4.4, §5.4; docs/51 §5.2 row 9; docs/54 §5.3, §5.5;
+    /// docs/59 §5.1 (`NameContext` from `AdminConfig` and for the
+    /// provisioning session).
     pub(crate) fn new(
         schema: &Phase1Schema,
         service_objects: BTreeSet<Guid>,
+        hosts: Option<HostZone>,
+        names: Option<NameContext>,
     ) -> Result<Invariants, ConfigError> {
         Ok(Invariants {
             ids: Ids::resolve(schema)?,
             schema: schema.schema().clone(),
             service_objects,
+            hosts,
+            names,
         })
+    }
+
+    /// The zone of host records, if DNS self-updates are enabled.
+    pub(crate) fn hosts(&self) -> Option<&HostZone> {
+        self.hosts.as_ref()
+    }
+
+    /// The dNSHostName rule N6 gives a new computer whose sAMAccountName is
+    /// `sam_account_name` — derived from this checker's own realm context,
+    /// the one [`Invariants::check_create`] judges it in (module `object`,
+    /// `own_host_name`). The online `CreateComputer` writes this value and
+    /// takes none from the request (task PN6b; docs/questions/Q-1036 item
+    /// 1, decided A-182). No namespace context ⇒ `Fault::Namespace` (fail
+    /// closed, as for every security principal). Reads nothing from the
+    /// directory.
+    /// Spec: [MS-ADTS] v20261026 3.1.1.5.3.1.1.2; docs/59 §4.4 N6, §5.1;
+    /// docs/questions/Q-1036 item 1.
+    pub(crate) fn own_host_name(&self, sam_account_name: &str) -> Result<String, Refused> {
+        let names = self.names.as_ref().ok_or(Fault::Namespace)?;
+        Ok(object::own_host_name(sam_account_name, names)?)
     }
 
     /// The rules of module `graph` over `store`.
@@ -668,13 +965,86 @@ impl Invariants {
         Ok(())
     }
 
+    /// The per-object rules of a new object (`object::check_new`) on the
+    /// record `obj` of most specific class `class`, for the claim `role`,
+    /// in this checker's namespace — and the keys it will hold (`Some` for a
+    /// security principal). A security principal with no namespace context
+    /// is refused first (`Fault::Namespace`).
+    /// Spec: module documentation, "The one principal namespace"; docs/59
+    /// §5.1.
+    fn per_object(
+        &self,
+        obj: &Object,
+        class: ClassId,
+        role: Option<ProvisioningRole>,
+    ) -> Result<Option<KeySet>, Refused> {
+        if object::is_principal_class(&self.ids, class) && self.names.is_none() {
+            return Err(Fault::Namespace.into());
+        }
+        Ok(object::check_new(
+            &self.ids,
+            obj,
+            class,
+            role,
+            self.hosts.as_ref(),
+            self.names.as_ref(),
+        )?)
+    }
+
+    /// N7 on the caller's raw values (docs/59 §4.4): a new object's values
+    /// name the namespace attribute not at all — not even with an empty
+    /// value set, which the record draft would drop and the checker's own
+    /// keys would then follow as a second entry (`NotModifiable`).
+    /// Spec: docs/59 §4.4 N7, §5.1; docs/questions/Q-1008 item 6.
+    fn no_supplied_keys(&self, attributes: &[(AttrId, Vec<Vec<u8>>)]) -> Result<(), Refused> {
+        if attributes
+            .iter()
+            .any(|(id, _)| *id == self.ids.principal_name_key)
+        {
+            return Err(InvariantViolation::NotModifiable.into());
+        }
+        Ok(())
+    }
+
+    /// The keys an object the online path creates — most specific class
+    /// `class`, objectClass chain `classes`, under `parent`, with the values
+    /// `attributes` — will hold in the namespace, by the very rules
+    /// [`Invariants::check_create`] applies to it (no claim): `None` for an
+    /// object outside the namespace. `prepare`'s conflict check probes these
+    /// keys (`names_free`, docs/59 §5.1); the store refuses a key taken in
+    /// between at the commit. Reads nothing from the directory.
+    /// Spec: docs/59 §5.1 ("`new_values` … becomes `names_free(&KeySet)`");
+    /// docs/questions/Q-487 item 2.
+    pub(crate) fn keys_of_new(
+        &self,
+        class: ClassId,
+        classes: &[ClassId],
+        parent: Guid,
+        attributes: &[(AttrId, Vec<Vec<u8>>)],
+    ) -> Result<Option<KeySet>, Refused> {
+        self.no_supplied_keys(attributes)?;
+        let obj = draft(
+            Guid::from_packet(&[0; 16]),
+            Some(parent),
+            classes,
+            attributes,
+        )?;
+        if self.schema.most_specific_class(&obj.classes) != Some(class) {
+            return Err(InvariantViolation::Class.into());
+        }
+        self.per_object(&obj, class, None)
+    }
+
     /// Check the create of `new` in `txn` (module documentation): the
     /// per-object rules on the record it will have, for the exception
     /// `role` it claims (`None` except in the provisioning session), its
     /// `member` links against `txn` (`proofs` from the PEP, if any), and —
     /// for a security principal — the domain SID its objectSid will
-    /// extend. A supplied objectSid is verified at the commit.
-    /// Spec: module documentation; docs/51 §5.2 rows 1-4, §4.3 step 5, §8.3.
+    /// extend and the keys it holds in the namespace, which the checker
+    /// itself writes into the object (docs/59 N7). A supplied objectSid is
+    /// verified at the commit.
+    /// Spec: module documentation; docs/51 §5.2 rows 1-4, §4.3 step 5, §8.3;
+    /// docs/59 §4.4 N1, N7, §5.1.
     pub(crate) fn check_create(
         &self,
         txn: &WriteTxn<'_>,
@@ -683,14 +1053,14 @@ impl Invariants {
         proofs: &[LinkProof],
     ) -> Result<CheckedWrite, Refused> {
         let basis = Self::basis(txn)?;
+        self.no_supplied_keys(&new.attributes)?;
         let obj = draft(new.guid, new.parent, &new.classes, &new.attributes)?;
         let class = self
             .schema
             .most_specific_class(&obj.classes)
             .ok_or(InvariantViolation::Class)?;
-        object::check_new(&self.ids, &obj, class, role)?;
-        let principal_class = [self.ids.user.id, self.ids.computer.id, self.ids.group.id];
-        let principal = if principal_class.contains(&class) {
+        let keys = self.per_object(&obj, class, role)?;
+        let principal = if object::is_principal_class(&self.ids, class) {
             let source = if role == Some(ProvisioningRole::Krbtgt) {
                 RidSource::Krbtgt
             } else {
@@ -717,6 +1087,18 @@ impl Invariants {
             };
             self.new_links(&before, basis, end, &[], &values, proofs)?;
         }
+        // The namespace's keys, written by the checker itself (docs/59 N7;
+        // module documentation): exactly what `object::check_new` derived
+        // from the object's own names — the caller could supply none
+        // (`known()`). The store's unique index refuses, at the commit, a
+        // key another live object holds (N1, uniqueness over the union).
+        let mut new = new;
+        if let Some(keys) = keys {
+            new.attributes.push((
+                self.ids.principal_name_key,
+                keys.keys().map(|key| key.as_bytes().to_vec()).collect(),
+            ));
+        }
         Ok(CheckedWrite {
             basis,
             op: Op::Create {
@@ -724,6 +1106,7 @@ impl Invariants {
                 principal,
                 object_sid: self.ids.object_sid,
             },
+            host_address: self.ids.host_address,
         })
     }
 
@@ -769,6 +1152,7 @@ impl Invariants {
         Ok(CheckedWrite {
             basis,
             op: Op::Modify { target, changes },
+            host_address: self.ids.host_address,
         })
     }
 
@@ -793,6 +1177,87 @@ impl Invariants {
         Ok(CheckedWrite {
             basis,
             op: Op::Delete { target },
+            host_address: self.ids.host_address,
+        })
+    }
+
+    /// Check a host record's write (task DN6, `DnsSelfUpdate`) of `target`
+    /// in `txn`: the target exists and is not structural (the DC, a service
+    /// object, krbtgt, the NC root — their records, if any, come from
+    /// provisioning only); its new value set `addresses` keeps the
+    /// host-record rule (`object::check_host_record`: a computer whose names
+    /// pass the host-name rule, at most eight registrable addresses); every
+    /// value of `renewed` is one of `addresses`; `when_changed` is the new
+    /// whenChanged (DSTIME, one value). The commit takes the write's
+    /// change-seq(s) and the zone serial itself.
+    /// Spec: docs/54 §4.5 step 6, §5.2-§5.5; docs/questions/Q-614 items 2,
+    /// 3, 8; RFC 2136 §3.6; docs/46 §5.4 (whenChanged).
+    pub(crate) fn check_host_record(
+        &self,
+        txn: &WriteTxn<'_>,
+        target: Guid,
+        addresses: Vec<Vec<u8>>,
+        renewed: Vec<Vec<u8>>,
+        when_changed: Vec<u8>,
+    ) -> Result<CheckedWrite, Refused> {
+        let basis = Self::basis(txn)?;
+        let graph = self.graph(txn);
+        let current = txn
+            .get_object(target)
+            .map_err(Fault::Store)?
+            .ok_or(InvariantViolation::NoSuchObject)?;
+        let class = graph.class_of(&current)?;
+        if graph.is_structural(target, &current, class)? {
+            return Err(InvariantViolation::Protected.into());
+        }
+        let mut distinct = BTreeSet::new();
+        if !addresses.iter().all(|v| distinct.insert(v.as_slice())) {
+            return Err(InvariantViolation::Value.into());
+        }
+        if !renewed.iter().all(|v| addresses.contains(v)) {
+            return Err(InvariantViolation::Value.into());
+        }
+        // Even an empty set (the record removed) is written only for a
+        // holder the rule admits — a computer whose names pass it.
+        let hosts =
+            object::check_host_holder(&self.ids, &current, class, None, self.hosts.as_ref())?;
+        let values: Vec<&[u8]> = addresses.iter().map(Vec::as_slice).collect();
+        object::check_host_values(&values, hosts)?;
+        object::check_change(
+            &self.ids,
+            &current,
+            class,
+            self.ids.when_changed,
+            core::slice::from_ref(&when_changed),
+        )?;
+        Ok(CheckedWrite {
+            basis,
+            op: Op::HostRecord {
+                target,
+                addresses,
+                renewed,
+                when_changed: AttributeChange::Replace {
+                    id: self.ids.when_changed,
+                    values: vec![when_changed],
+                },
+            },
+            host_address: self.ids.host_address,
+        })
+    }
+
+    /// Check the serial-only write (task DN10b) in `txn`: nothing of the
+    /// directory is changed, so no object rule applies; the write is checked
+    /// against the transaction's change-seq state like every other (its
+    /// commit is refused if another write committed in between) and its
+    /// commit takes the zone serial — the counter missing or exhausted
+    /// refuses it there (A-83: never created at run time).
+    /// Spec: module documentation, "The zone serial"; docs/questions/Q-1002
+    /// item 2 (A-172); RFC 2136 §3.6, §7.11.
+    pub(crate) fn check_zone_serial(&self, txn: &WriteTxn<'_>) -> Result<CheckedWrite, Refused> {
+        Ok(CheckedWrite {
+            basis: Self::basis(txn)?,
+            op: Op::ZoneSerial,
+            host_address: self.ids.host_address,
         })
     }
 }

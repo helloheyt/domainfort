@@ -30,13 +30,28 @@
 //! auditd and dird were verified (crate::daemon) — the kdc daemon's
 //! arrangement (Q-275 item 3).
 //!
-//! Spec: docs/50 R50-12, R50-14, R50-15, R50-16, §5.3, §6.1, §6.2, §6.4,
-//! §7.1, §7.5; docs/questions/Q-221 (A-57), Q-230 (A-60), Q-235 (A-61).
+//! # A StartTLS listener on 389, always (task DN10d)
+//!
+//! The file always has at least one StartTLS listener, every one on port
+//! 389 — crates/config refuses a file without `ldap_listen` (A-178 on
+//! docs/questions/Q-1025 item 3: the zone advertises `_ldap._tcp` on 389)
+//! and any other port for it (`NonStandardPort`, task DN10c) — and
+//! [`bind_listeners`] binds exactly the file's addresses. The binding
+//! itself is the crate-private `bind_addresses`, whose only product caller
+//! is [`bind_listeners`]; the in-crate test binds it on loopback ports the
+//! system picks. No product path and no test seam takes an address that is
+//! not from the file (the arrangement of the kdc and kpasswd-front —
+//! docs/questions/Q-1024 item 5).
+//!
+//! Spec: docs/50 R50-12, R50-14, R50-15, R50-16, §4.2, §5.3, §6.1, §6.2,
+//! §6.4, §7.1, §7.5; docs/questions/Q-221 (A-57), Q-230 (A-60), Q-235
+//! (A-61), Q-1025 item 3 (A-178).
 
 use crate::daemon::{Listeners, MAX_CONNECTIONS};
 use crate::tls::{server_config, CredentialError, DcCredential, TlsConfigError};
 use config::LdapFrontSettings;
 use core::fmt;
+use core::net::SocketAddr;
 use daemon_sandbox::{HardeningPlan, PlanError, ProcessIdentity};
 use protected_file::{configuration_file_rule, FileFacts, OpenError, PERMISSION_BITS};
 use rustls::pki_types::UnixTime;
@@ -327,29 +342,33 @@ pub fn load_tls_config(
 }
 
 /// Bind the configured StartTLS and LDAPS listeners (docs/50 §4.2; crates/
-/// config refuses unspecified, multicast and port-0 addresses). Called as
-/// root, before the drop (module documentation).
+/// config refuses unspecified, multicast and port-0 addresses, a file
+/// without a StartTLS listener, and a StartTLS listener off port 389 —
+/// tasks DN10c, DN10d). Called as root, before the drop (module
+/// documentation).
 ///
 /// # Errors
 /// [`StartupError::Bind`].
 ///
-/// Spec: RFC 4511 §5.2; docs/50 §4.2, §6.2.
+/// Spec: RFC 4511 §5.2; docs/50 §4.2, §6.2; docs/questions/Q-1025 item 3.
 pub fn bind_listeners(settings: &LdapFrontSettings) -> Result<Listeners, StartupError> {
-    let bind = |address: &core::net::SocketAddr| {
+    bind_addresses(settings.ldap_listen(), settings.ldaps_listen())
+}
+
+/// The binding itself, over the StartTLS and LDAPS addresses
+/// [`bind_listeners`] takes from the settings — its only product caller, so
+/// every address is one ldap-front's schema accepted. Crate-private: the
+/// in-crate test binds it on loopback ports the system picks (module
+/// documentation, "A StartTLS listener on 389, always").
+/// Spec: RFC 4511 §5.2; docs/50 §4.2, §6.2; docs/questions/Q-1025 item 3.
+fn bind_addresses(ldap: &[SocketAddr], ldaps: &[SocketAddr]) -> Result<Listeners, StartupError> {
+    let bind = |address: &SocketAddr| {
         std::net::TcpListener::bind(address)
             .map_err(|error| StartupError::Bind(error.raw_os_error()))
     };
     Ok(Listeners {
-        ldap: settings
-            .ldap_listen()
-            .iter()
-            .map(bind)
-            .collect::<Result<_, _>>()?,
-        ldaps: settings
-            .ldaps_listen()
-            .iter()
-            .map(bind)
-            .collect::<Result<_, _>>()?,
+        ldap: ldap.iter().map(bind).collect::<Result<_, _>>()?,
+        ldaps: ldaps.iter().map(bind).collect::<Result<_, _>>()?,
     })
 }
 
@@ -387,4 +406,46 @@ pub fn hardening_plan(settings: &LdapFrontSettings) -> Result<HardeningPlan, Pla
         .open_files_limit(open_files)
         .working_directory("/")
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A loopback address on a port the system picks (never a privileged
+    /// one), free when returned.
+    fn free_loopback() -> SocketAddr {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = probe.local_addr().unwrap();
+        drop(probe);
+        address
+    }
+
+    /// docs/50 §4.2, §6.2: each configured StartTLS and LDAPS address is
+    /// bound as a TCP listener at that address, on its own list; an address
+    /// already taken refuses the start. In-crate, through the crate-private
+    /// `bind_addresses`, on loopback ports the system picks — ldap-front's
+    /// file names port 389 for StartTLS only (tasks DN10c, DN10d). Moved
+    /// from tests/startup_files.rs (docs/questions/Q-1025 item 3).
+    /// Hand-made values.
+    #[test]
+    fn the_listeners_are_bound() {
+        let ldap = free_loopback();
+        let ldaps = free_loopback();
+        if ldap == ldaps {
+            return; // the system handed the same port twice: nothing to check
+        }
+        let listeners = bind_addresses(&[ldap], &[ldaps]).unwrap();
+        assert_eq!((listeners.ldap.len(), listeners.ldaps.len()), (1, 1));
+        assert_eq!(listeners.ldap[0].local_addr().unwrap(), ldap);
+        assert_eq!(listeners.ldaps[0].local_addr().unwrap(), ldaps);
+        assert!(matches!(
+            bind_addresses(&[ldap], &[]),
+            Err(StartupError::Bind(_))
+        ));
+        assert!(matches!(
+            bind_addresses(&[], &[ldaps]),
+            Err(StartupError::Bind(_))
+        ));
+    }
 }

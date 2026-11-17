@@ -12,11 +12,15 @@
 //! it: nothing was sent, keyd did not perform it, or its outcome is unknown
 //! (docs/questions/Q-367, A-88).
 //!
+//! The attestation key (task PN9) is reported by whether keyd installed it —
+//! never a key octet, a length or a digest of it (keyadm prints nothing
+//! derived from the key; docs/59 §7.4; docs/CLEAN-ROOM.md).
+//!
 //! Spec: docs/51 §6; docs/10 §7, §9, §10; docs/50 §8.2 (fixed messages, no
 //! request octets); docs/CLEAN-ROOM.md; docs/questions/Q-367 (A-88); docs/52
 //! §3.10, §4.2, §4.4 (A-102).
 
-use crate::ceremony::{CeremonyReport, NotSent, Outcome, Step, Unknown};
+use crate::ceremony::{AttestationKeyStep, CeremonyReport, NotSent, Outcome, Step, Unknown};
 use ipc::Refused;
 use ipc_keyd::TransportError;
 use keyd_types::{Error as KeydError, MAX_INITIAL_SECRET_GRANT_SECS};
@@ -133,6 +137,36 @@ fn grant_identifiers(admin: usize, manifest: &Manifest) -> String {
     }
 }
 
+/// The line of the attestation key step (task PN9), if any: the step's
+/// outcome — never anything of the key.
+/// Spec: docs/59 §7.4, §7.5; docs/questions/Q-1033; docs/50 §8.2.
+fn attestation_key_line(step: AttestationKeyStep) -> Option<String> {
+    let outcome = match step {
+        AttestationKeyStep::NotAttempted => return None,
+        AttestationKeyStep::Attempted(outcome) => outcome,
+    };
+    Some(match outcome {
+        Outcome::Answered(Ok(())) => {
+            "installed the attestation key of dird's name resolutions in keyd (keyd only verifies with it and never hands it out)".to_owned()
+        }
+        Outcome::Answered(Err(error)) => format!(
+            "attestation key: keyd refused ({}): keyd installs it once per start, for this account's Admin role, in the ceremony only - keyd's audit record names the reason; not installed",
+            keyd_error_text(error)
+        ),
+        Outcome::NotSent(reason) => {
+            format!("attestation key: {}; not installed", not_sent_text(reason))
+        }
+        Outcome::NotPerformed(refused) => format!(
+            "attestation key: {}; not installed",
+            not_performed_text(refused)
+        ),
+        Outcome::Unknown(reason) => format!(
+            "attestation key: {} after the request was sent; outcome unknown, the key MAY have been installed",
+            unknown_text(reason)
+        ),
+    })
+}
+
 /// The lines of the first administrators' grants (task A15a).
 /// Spec: docs/51 §4.3 steps 11-12, §5.8 option (b); docs/questions/Q-451.
 fn render_grants(report: &CeremonyReport, manifest: &Manifest, lines: &mut Vec<String>) {
@@ -223,6 +257,9 @@ pub fn render(report: &CeremonyReport, manifest: &Manifest) -> Vec<String> {
             ),
         });
     }
+    if report.key_sets_created() {
+        lines.extend(attestation_key_line(report.attestation_key));
+    }
     render_grants(report, manifest, &mut lines);
     if let Some(seal) = report.seal {
         lines.push(match seal {
@@ -244,9 +281,14 @@ pub fn render(report: &CeremonyReport, manifest: &Manifest) -> Vec<String> {
         .iter()
         .filter(|grant| grant.outcome.succeeded())
         .count();
+    let attestation = if report.attestation_key_installed() {
+        "; attestation key installed"
+    } else {
+        ""
+    };
     if report.is_complete() {
         lines.push(format!(
-            "ceremony complete and sealed: {created} of {} key sets created; {granted} of {} first administrators' initial secrets granted",
+            "ceremony complete and sealed: {created} of {} key sets created{attestation}; {granted} of {} first administrators' initial secrets granted",
             Step::ALL.len(),
             report.first_admins
         ));
@@ -270,9 +312,28 @@ pub fn render(report: &CeremonyReport, manifest: &Manifest) -> Vec<String> {
         );
         return lines;
     }
+    if report.key_sets_created() && !report.attestation_key.is_done() {
+        // Task PN9: the attestation key's install stopped the ceremony.
+        lines.push(format!(
+            "ceremony stopped at the attestation key: {created} of {} key sets created; the attestation key is NOT known to be installed; no initial secret granted",
+            Step::ALL.len()
+        ));
+        if matches!(
+            report.attestation_key,
+            AttestationKeyStep::Attempted(Outcome::Unknown(_))
+        ) {
+            lines.push(
+                "outcome unknown: the request reached keyd but its answer did not come back; check keyd's audit log before anything else - it holds the install's intent and its outcome (docs/10 10, A-88)".to_owned(),
+            );
+        }
+        lines.push(
+            "keyd is NOT sealed; keyadm never retries: restart keyd (development mode: every key is lost) and run the whole ceremony again (docs/51 4.5, A-77)".to_owned(),
+        );
+        return lines;
+    }
     if report.key_sets_created() {
         lines.push(format!(
-            "ceremony stopped after the key sets: {created} of {} key sets created; {granted} of {} first administrators' initial secrets granted",
+            "ceremony stopped after the key sets: {created} of {} key sets created{attestation}; {granted} of {} first administrators' initial secrets granted",
             Step::ALL.len(),
             report.first_admins
         ));

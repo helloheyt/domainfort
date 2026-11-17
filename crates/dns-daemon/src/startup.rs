@@ -16,13 +16,27 @@
 //! forwarding) and the audit check (docs/54 §4.7: "no outbound socket";
 //! enforced by the code, not by seccomp — P-19).
 //!
-//! Spec: docs/54 §4.3, §4.7; docs/50 R50-14, R50-15, §6.1, §6.2, §6.4, §7.1,
-//! §7.5; docs/questions/Q-235 (A-61).
+//! # Port 53 only (task DN10d)
+//!
+//! The file's `listen` addresses are all on port 53 — crates/config refuses
+//! any other (`NonStandardPort`, A-178 on docs/questions/Q-1025 item 1: the
+//! NS record names the DC as the zone's name server, reached on port 53) —
+//! and [`bind_listeners`] binds exactly those. The binding itself is the
+//! crate-private `bind_addresses`, whose only product caller is
+//! [`bind_listeners`]; the in-crate test binds it on a loopback port the
+//! system picks. No product path and no test seam takes an address that is
+//! not from the file (the arrangement of the kdc and kpasswd-front, task
+//! DN10c — docs/questions/Q-1024 item 5).
+//!
+//! Spec: docs/54 §3.1, §4.3, §4.7; docs/50 R50-14, R50-15, §6.1, §6.2, §6.4,
+//! §7.1, §7.5; RFC 1035 §4.2; docs/questions/Q-235 (A-61), Q-1025 item 1
+//! (A-178).
 
 use crate::daemon::Listeners;
 use crate::limits::OPEN_FILES_HEADROOM;
 use config::DnsdSettings;
 use core::fmt;
+use core::net::SocketAddr;
 use daemon_sandbox::{HardeningPlan, PlanError, ProcessIdentity};
 use protected_file::Refusal;
 use std::path::Path;
@@ -87,15 +101,26 @@ pub fn read_settings(path: &Path, owner: u32) -> Result<DnsdSettings, StartupErr
 /// Bind one UDP socket and one TCP listener per configured address (RFC
 /// 1035 §4.2: "TCP … on server port 53 … as well as datagram access using
 /// UDP"; the addresses are interface addresses inside `internal_networks`
-/// only — crates/config refuses any other). Called as root, before the drop.
+/// only, and all on port 53 — crates/config refuses any other, task DN10d).
+/// Called as root, before the drop.
 ///
 /// # Errors
 /// [`StartupError::Bind`].
 ///
-/// Spec: RFC 1035 §4.2, §4.2.1, §4.2.2; docs/54 §4.7; docs/50 §6.2.
+/// Spec: RFC 1035 §4.2, §4.2.1, §4.2.2; docs/54 §4.7; docs/50 §6.2;
+/// docs/questions/Q-1025 item 1.
 pub fn bind_listeners(settings: &DnsdSettings) -> Result<Listeners, StartupError> {
+    bind_addresses(settings.listen())
+}
+
+/// The binding itself, over the addresses [`bind_listeners`] takes from the
+/// settings — its only product caller, so every address is one dnsd's
+/// schema accepted (port 53). Crate-private: the in-crate test binds it on a
+/// loopback port the system picks (module documentation, "Port 53 only").
+/// Spec: RFC 1035 §4.2; docs/54 §4.7; docs/questions/Q-1025 item 1.
+fn bind_addresses(addresses: &[SocketAddr]) -> Result<Listeners, StartupError> {
     let mut listeners = Listeners::default();
-    for address in settings.listen() {
+    for address in addresses {
         let udp = std::net::UdpSocket::bind(address)
             .map_err(|error| StartupError::Bind(error.raw_os_error()))?;
         let tcp = std::net::TcpListener::bind(address)
@@ -140,6 +165,35 @@ pub fn hardening_plan(settings: &DnsdSettings) -> Result<HardeningPlan, PlanErro
 mod tests {
     use super::*;
     use daemon_sandbox::Step;
+
+    /// RFC 1035 §4.2 (UDP and TCP on the same server address); docs/54 §4.7
+    /// ("`bind` UDP+TCP 53 for every configured address"): every address is
+    /// bound on UDP and on TCP, at that address; an address already taken
+    /// refuses the start with the OS error. In-crate, through the
+    /// crate-private `bind_addresses`, on a loopback port the system picks
+    /// (never a privileged one) — dnsd's file names port 53 only (task
+    /// DN10d). Moved from tests/startup_files.rs (docs/questions/Q-1025
+    /// item 1). Hand-made values.
+    #[test]
+    fn every_address_is_bound_on_udp_and_tcp() {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("probe");
+        let port = probe.local_addr().expect("probe").port();
+        drop(probe);
+        let Ok(free) = std::net::TcpListener::bind(("127.0.0.1", port)) else {
+            return; // the port was taken meanwhile: nothing to check
+        };
+        drop(free);
+        let address = SocketAddr::from(([127, 0, 0, 1], port));
+        let listeners = bind_addresses(&[address]).expect("bound");
+        assert_eq!((listeners.udp.len(), listeners.tcp.len()), (1, 1));
+        assert_eq!(listeners.udp[0].local_addr().expect("udp"), address);
+        assert_eq!(listeners.tcp[0].local_addr().expect("tcp"), address);
+        // The address is taken now: binding it again fails with the OS error.
+        assert!(matches!(
+            bind_addresses(&[address]),
+            Err(StartupError::Bind(_))
+        ));
+    }
 
     /// A hand-made dnsd file (docs/54 §4.3; Q-619 item 4).
     const FILE: &str = "\

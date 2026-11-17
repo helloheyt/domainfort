@@ -548,13 +548,17 @@ impl<S: KeyStore, A: AuditSink, E: EntropySource> Keyd<S, A, E> {
         if ap_req.ticket.realm != *realm {
             return Err(Deny::denied(AuditReason::WrongRealm));
         }
-        // The key set is used only through the proof that it is bound to
-        // the ticket's (srealm, sname) (A-19; crate::store, R7).
+        // The key set is used only through the proof that the ticket's
+        // (srealm, sname) is its bound principal — compared in the
+        // namespace's one equivalence (principal-names: name-type ignored,
+        // case folded), never by octets (task PN11; docs/questions/Q-1011
+        // item 6, A-173; class C49; crate::store, R7, "The doors").
+        let names = self.name_context()?;
         let bound = self
             .store
             .get(service)
             .ok_or(Deny::denied(AuditReason::KeyNotFound))?
-            .bound_to(&ap_req.ticket.realm, &ap_req.ticket.sname)?;
+            .accepting(&ap_req.ticket.realm, &ap_req.ticket.sname, &names)?;
 
         // 5-7. Only keyd-drawn versions (A-46); the ticket under usage 2,
         // the authenticator under usage 11 (shared steps).

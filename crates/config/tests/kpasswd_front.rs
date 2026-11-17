@@ -13,7 +13,7 @@
 //! implementation.
 
 use config::limits::MAX_LIST_ITEMS;
-use config::{ErrorKind, KpasswdFrontSettings, DIRD_KPASSWD_DEADLINE_SECS};
+use config::{ErrorKind, KpasswdFrontSettings, StandardPort, DIRD_KPASSWD_DEADLINE_SECS};
 use std::time::Duration;
 
 /// A complete kpasswd-front file. Source: docs/53 R53-3, §3.3, §5.1, §5.7;
@@ -190,6 +190,33 @@ fn listeners_must_be_internal_interfaces() {
         kind(&set(SAMPLE, "listen", &many.join(", "))),
         ErrorKind::TooManyItems
     );
+}
+
+/// Task DN10c (A-176 on docs/questions/Q-1016 item 4; Q-1024): the zone
+/// advertises `_kpasswd._tcp` on port 464 ([MS-ADTS] §6.3.2.3: "Set to 464
+/// for Kerberos Password Change service"; RFC 3244 §2), so every `listen`
+/// address is on [`StandardPort::Kpasswd`] — any other port, also on one
+/// address of several, is `NonStandardPort` at `listen`; the addresses stay
+/// the operator's.
+#[test]
+fn listeners_take_only_port_464() {
+    assert_eq!(StandardPort::Kpasswd.number(), 464);
+    for value in [
+        "192.0.2.5:465",
+        "192.0.2.5:88",
+        "192.0.2.5:1464",
+        "192.0.2.5:464, [2001:db8::5]:4464",
+    ] {
+        let err = KpasswdFrontSettings::parse(set(SAMPLE, "listen", value).as_bytes())
+            .expect_err("a port other than 464 is refused");
+        assert_eq!(err.kind(), ErrorKind::NonStandardPort, "{value}");
+        assert_eq!(err.key(), Some("listen"), "{value}");
+    }
+    let s = KpasswdFrontSettings::parse(
+        set(SAMPLE, "listen", "192.0.2.9:464, [2001:db8::9]:464").as_bytes(),
+    )
+    .expect("any internal address on 464");
+    assert_eq!(s.listen().len(), 2);
 }
 
 /// docs/50 §4.1, Q-230 item 4 (a limit within 1 ..= its documented value;

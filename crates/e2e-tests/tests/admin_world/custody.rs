@@ -33,11 +33,22 @@
 //! present on both sides is refused (the tests never set the password of an
 //! account whose key set already exists during an admin phase).
 //!
+//! **The attestation key travels with the key sets** (task PN11, A-190):
+//! since A-190 it is part of keyd's `KeyStore` (`attestation_key`,
+//! `install_attestation_key` — once, `Exists` when held), so the custody
+//! holds it by value beside the sets and hands it home with them: the keyd
+//! of a later phase — operational, with no ceremony — still verifies dird's
+//! name resolutions, as a keyd over KL3's sealed store will. Only the
+//! ceremony's keyd installs it (Role::Admin, keyd's own rule); admind's
+//! custody never holds one, and [`Custody::merge_from`] refuses a key held
+//! on both sides.
+//!
 //! Spec: docs/50 R50-3, R50-18, §9 (tier 2: "the uid map is injected with
 //! the test's own uid for the role under test"); docs/10 §1, §11; crates/keyd
-//! `KeyStore` (its documentation); P-17; A-82.
+//! `KeyStore` (its documentation); P-17; A-82; docs/59 §7.4; docs/questions/
+//! Q-1063 item 3 (A-190).
 
-use keyd::{KeyHandle, KeyPurpose, KeyStore, StoreError, StoredKeySet};
+use keyd::{AttestationKey, KeyHandle, KeyPurpose, KeyStore, StoreError, StoredKeySet};
 use keyd_types::Kvno;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -48,28 +59,37 @@ pub const CAPACITY: usize = 4096;
 
 type Sets = HashMap<KeyHandle, StoredKeySet>;
 
-/// Where the key sets rest between keyd lifetimes. `None` while lent to a
-/// running keyd.
+/// What a custody holds between keyd lifetimes: the key sets and the
+/// attestation key (A-190), by value.
+#[derive(Default)]
+struct Held {
+    sets: Sets,
+    attestation_key: Option<AttestationKey>,
+}
+
+/// Where the key sets and the attestation key rest between keyd lifetimes.
+/// `None` while lent to a running keyd.
 #[derive(Clone, Default)]
-pub struct Custody(Arc<Mutex<Option<Sets>>>);
+pub struct Custody(Arc<Mutex<Option<Held>>>);
 
 impl Custody {
     /// An empty custody.
     pub fn new() -> Custody {
-        Custody(Arc::new(Mutex::new(Some(HashMap::new()))))
+        Custody(Arc::new(Mutex::new(Some(Held::default()))))
     }
 
-    /// Lend the key sets to the next keyd: the store keyd is built on.
-    /// Panics if they are still lent (a keyd of this custody runs).
+    /// Lend the key sets and the attestation key to the next keyd: the
+    /// store keyd is built on. Panics if they are still lent (a keyd of
+    /// this custody runs).
     pub fn lend(&self) -> CustodyStore {
-        let sets = self
+        let held = self
             .0
             .lock()
             .unwrap()
             .take()
             .expect("the key sets are back from the previous keyd");
         CustodyStore {
-            sets,
+            held,
             home: self.clone(),
         }
     }
@@ -80,21 +100,30 @@ impl Custody {
     }
 
     /// Move every key set of `other` (whose keyd has stopped) into this
-    /// custody. A handle on both sides is a test error.
+    /// custody, and its attestation key if it holds one. A handle on both
+    /// sides, or an attestation key on both sides, is a test error (admind's
+    /// custody never holds a key: only the ceremony's keyd installs one).
     pub fn merge_from(&self, other: &Custody) {
         let moved = other
             .0
             .lock()
             .unwrap()
-            .replace(HashMap::new())
+            .replace(Held::default())
             .expect("the other keyd has stopped");
         let mut held = self.0.lock().unwrap();
-        let sets = held.as_mut().expect("this custody's keyd has stopped");
-        for (handle, set) in moved {
+        let held = held.as_mut().expect("this custody's keyd has stopped");
+        for (handle, set) in moved.sets {
             assert!(
-                sets.insert(handle, set).is_none(),
+                held.sets.insert(handle, set).is_none(),
                 "a key set was created on both sides: {handle:?}"
             );
+        }
+        if let Some(key) = moved.attestation_key {
+            assert!(
+                held.attestation_key.is_none(),
+                "an attestation key is held on both sides"
+            );
+            held.attestation_key = Some(key);
         }
     }
 
@@ -104,19 +133,20 @@ impl Custody {
         let held = self.0.lock().unwrap();
         held.as_ref()
             .expect("the key sets are home")
+            .sets
             .get(handle)
             .map(StoredKeySet::current_kvno)
     }
 
     /// How many key sets are held. Panics while lent.
     pub fn len(&self) -> usize {
-        self.0.lock().unwrap().as_ref().expect("home").len()
+        self.0.lock().unwrap().as_ref().expect("home").sets.len()
     }
 }
 
 /// The key store of one keyd lifetime (module documentation).
 pub struct CustodyStore {
-    sets: Sets,
+    held: Held,
     home: Custody,
 }
 
@@ -136,17 +166,35 @@ impl KeyStore for CustodyStore {
 
     /// docs/52 §4.4 (A-102): a keyd whose store is empty at start is in its
     /// provisioning ceremony; the later phases' keyds start with the
-    /// carried key sets and so are operational.
+    /// carried key sets (and the attestation key — A-190) and so are
+    /// operational. Empty = no key set and no attestation key (the trait's
+    /// contract).
     fn is_empty(&self) -> bool {
-        self.sets.is_empty()
+        self.held.sets.is_empty() && self.held.attestation_key.is_none()
+    }
+
+    /// The trait's contract (A-190): the key the ceremony installed, carried
+    /// from lifetime to lifetime.
+    fn attestation_key(&self) -> Option<&AttestationKey> {
+        self.held.attestation_key.as_ref()
+    }
+
+    /// The trait's contract (A-190): once — `Exists` when one is held (the
+    /// refused key wipes on drop).
+    fn install_attestation_key(&mut self, key: AttestationKey) -> Result<(), StoreError> {
+        if self.held.attestation_key.is_some() {
+            return Err(StoreError::Exists);
+        }
+        self.held.attestation_key = Some(key);
+        Ok(())
     }
 
     fn get(&self, handle: &KeyHandle) -> Option<&StoredKeySet> {
-        self.sets.get(handle)
+        self.held.sets.get(handle)
     }
 
     fn get_mut(&mut self, handle: &KeyHandle) -> Option<&mut StoredKeySet> {
-        self.sets.get_mut(handle)
+        self.held.sets.get_mut(handle)
     }
 
     /// The trait's contract: an existing handle ⇒ `Exists`, a full store ⇒
@@ -155,13 +203,13 @@ impl KeyStore for CustodyStore {
         if !self.accepts(handle.purpose) {
             return Err(StoreError::Refused);
         }
-        if self.sets.contains_key(&handle) {
+        if self.held.sets.contains_key(&handle) {
             return Err(StoreError::Exists);
         }
-        if self.sets.len() >= CAPACITY {
+        if self.held.sets.len() >= CAPACITY {
             return Err(StoreError::Full);
         }
-        self.sets.insert(handle, set);
+        self.held.sets.insert(handle, set);
         Ok(())
     }
 
@@ -172,18 +220,19 @@ impl KeyStore for CustodyStore {
         if handle.purpose == KeyPurpose::Krbtgt {
             return Err(StoreError::Refused);
         }
-        let set = self.sets.remove(handle).ok_or(StoreError::NotFound)?;
+        let set = self.held.sets.remove(handle).ok_or(StoreError::NotFound)?;
         drop(set);
         Ok(())
     }
 }
 
 impl Drop for CustodyStore {
-    /// Hand the key sets back (module documentation).
+    /// Hand the key sets and the attestation key back (module
+    /// documentation).
     fn drop(&mut self) {
-        let sets = std::mem::take(&mut self.sets);
+        let held = std::mem::take(&mut self.held);
         if let Ok(mut home) = self.home.0.lock() {
-            *home = Some(sets);
+            *home = Some(held);
         }
     }
 }

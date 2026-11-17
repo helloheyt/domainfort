@@ -30,9 +30,9 @@
 //! decision 10.
 
 use crate::options::FlagRequests;
-use crate::time::{from_seconds, seconds, till_maximum};
+use crate::time::{seconds, till_maximum};
 use keyd_types::TicketPolicy;
-use krb_proto::KerberosTime;
+use krb_proto::{kerberos_time_from_seconds, KerberosTime};
 
 /// What the client asked for. Spec: RFC 4120 5.4.1 (from, till, rtime).
 #[derive(Debug, Clone, Copy)]
@@ -133,7 +133,7 @@ pub(crate) fn plan(
                 .copied()
                 .fold(asked.min(policy_renew), i64::min);
             if renew >= end {
-                Some(from_seconds(renew).ok_or(TimeRefusal::OutOfRange)?)
+                Some(kerberos_time_from_seconds(renew).ok_or(TimeRefusal::OutOfRange)?)
             } else {
                 None
             }
@@ -141,7 +141,7 @@ pub(crate) fn plan(
         _ => None,
     };
     Ok(Planned {
-        endtime: from_seconds(end).ok_or(TimeRefusal::OutOfRange)?,
+        endtime: kerberos_time_from_seconds(end).ok_or(TimeRefusal::OutOfRange)?,
         renew_till,
     })
 }
@@ -252,6 +252,31 @@ mod tests {
             plan(&now(), &req, &limits(false)),
             Err(TimeRefusal::CannotPostdate)
         );
+    }
+
+    /// The end of the KerberosTime range (RFC 4120 5.2.3, four-digit
+    /// years): `till` 19700101000000Z asks for the policy maximum (5.4.1,
+    /// one day), which from 9999-12-31T12:00:00Z lies after
+    /// 9999-12-31T23:59:59Z — no KerberosTime carries it, so the plan is
+    /// refused (fail closed) rather than wrapped or clamped; an explicit
+    /// `till` at the last second is planned as asked.
+    #[test]
+    fn past_the_kerberos_time_range_fails_closed() {
+        let late = kt(9999, 12, 31, 12, 0, 0);
+        let zero = kt(1970, 1, 1, 0, 0, 0);
+        let req = LifetimeRequest {
+            from: None,
+            till: &zero,
+            rtime: None,
+            flags: flags(false, false),
+        };
+        assert_eq!(
+            plan(&late, &req, &limits(false)),
+            Err(TimeRefusal::OutOfRange)
+        );
+        let last = kt(9999, 12, 31, 23, 59, 59);
+        let req = LifetimeRequest { till: &last, ..req };
+        assert_eq!(plan(&late, &req, &limits(false)).unwrap().endtime, last);
     }
 
     /// RFC 4120 3.1.3 renew-till: earliest of request and policy (1 week,

@@ -258,7 +258,7 @@ pub fn direct(
         RequestInputs {
             snapshot: &snapshot,
             pip: &view,
-            accounts: &view,
+            subjects: &view,
             rate: &mut rate,
             now,
             transport: TransportReport {

@@ -20,6 +20,11 @@ echo "crates present — running the full Rust gate."
 # builds exactly the graph recorded in Cargo.lock. If the lock would change
 # (a manifest edited without the lock, or a resolver drift), cargo refuses
 # instead of silently resolving a different graph than the one reviewed.
+# The full offline cache first (A-168; Q-998): `cargo fetch` without --target
+# downloads the dependencies of every target, exactly as locked. Guards that
+# read the worst-case graph (`cargo tree --target all --offline`) then work
+# on a fresh machine or CI runner, not only where a cache happens to be warm.
+cargo fetch --locked
 cargo fmt --all --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo build --locked --all

@@ -46,6 +46,7 @@ use config::KdcSettings;
 use core::fmt;
 use core::time::Duration;
 use ipc_audit::WindowConfig;
+use ipc_audit_client::Unflushed;
 use pdp::PolicyVersion;
 use policy_store::DevelopmentPolicy;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -305,7 +306,7 @@ pub struct Stopped {
     engine: EngineThread,
     engine_failed: bool,
     policy_version: PolicyVersion,
-    unacknowledged: usize,
+    unflushed: Unflushed,
 }
 
 impl Stopped {
@@ -326,11 +327,22 @@ impl Stopped {
     /// auditd counted as unreachable): lost with the process (Q-252 item 9).
     /// The shared flush's report (`ipc_audit_client::AuditGate::close`, docs/52
     /// R6), as dird and admind expose it; the kdc writes no log note for it,
-    /// as before.
+    /// as before. Only the events part: the whole report is
+    /// [`Stopped::unflushed_audit`].
     /// Spec: docs/50 R50-17, §8.1; docs/questions/Q-313 (A-82).
     #[must_use]
     pub fn unacknowledged_audit_events(&self) -> usize {
-        self.unacknowledged
+        self.unflushed.events()
+    }
+
+    /// Everything the stop could not deliver to auditd — the events above
+    /// and the counts never sent as a summary (`suppressed_noise`,
+    /// `refused_gating`, `unrecorded_outcomes`): the shared flush's whole
+    /// report (`ipc_audit_client::AuditGate::close`), read with
+    /// `Unflushed::undelivered` (docs/questions/Q-990 item 4, A-166; Q-995).
+    /// Spec: docs/questions/Q-313 (A-82), Q-995.
+    pub fn unflushed_audit(&self) -> Unflushed {
+        self.unflushed
     }
 
     /// Wait for the engine thread; call after the runtime was dropped.
@@ -585,13 +597,12 @@ where
     // The one flush of every daemon (`ipc_audit_client::AuditGate::close`, docs/52
     // R6): the kdc's rule ends the wait early when auditd counts as
     // unreachable (A-87 kept it).
-    let unacknowledged = gate
+    let unflushed = gate
         .close(AUDIT_FLUSH_GRACE, async {
             audit_task.abort();
             let _ = audit_task.await;
         })
-        .await
-        .events();
+        .await;
     if engine_failed {
         note(Note::EngineStopped, None);
     }
@@ -600,6 +611,6 @@ where
         engine: engine_thread,
         engine_failed,
         policy_version,
-        unacknowledged,
+        unflushed,
     })
 }

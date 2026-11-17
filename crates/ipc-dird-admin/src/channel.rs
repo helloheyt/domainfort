@@ -141,11 +141,6 @@ pub const MAX_NAME: u32 = 256;
 /// `MAX_PRINCIPAL_NAME_CHARS`.
 pub const MAX_PRINCIPAL_NAME: u32 = 1024;
 
-/// Bound of a dNSHostName (octets): 2048.
-/// Spec: docs/46 §5.4 (dNSHostName 0..2048); crates/directory-admin
-/// `MAX_DNS_HOST_NAME_CHARS`.
-pub const MAX_DNS_HOST_NAME: u32 = 2048;
-
 /// Bound of a description (octets of UTF-8): 3072 — 1024 UTF-16 units
 /// (docs/46 §5.4) take at most three UTF-8 octets each (a unit of the Basic
 /// Multilingual Plane), or four octets per surrogate pair of two units.
@@ -238,6 +233,25 @@ pub const MAX_PLAN_PRINCIPALS: u32 = 256;
 /// Spec: docs/research/r5-a-admin-model.md §3.3.
 pub const MAX_PLAN_EFFECTS: u32 = 64;
 
+/// Most principal-namespace keys one `NamesReleased` effect lists (task
+/// PN7): the most keys one object may hold under the decided bounds — a
+/// computer's sAMAccountName, base name and host name, its
+/// userPrincipalName's local part and at most 32 servicePrincipalNames once
+/// that attribute is multi-valued (docs/59 PN16) — 4 + 32 = 36. Phase 1
+/// holds at most crates/principal-names `MAX_KEYS_PER_OBJECT` (pinned in
+/// crates/directory-admin, which links both).
+/// Spec: docs/59 §4.3, §4.6; docs/questions/Q-1008 item 2 (A-173: "user ≤ 2
+/// values, computer ≤ 3 + SPNs + 1; 32 SPNs when multi-valued"), Q-1037.
+pub const MAX_PLAN_RELEASED_NAMES: u32 = 36;
+
+/// Bound of one released principal-namespace key (octets): 2048 — the
+/// namespace's key bound (crates/principal-names `MAX_KEY_OCTETS`, crates/
+/// ad-schema `PRINCIPAL_NAME_KEY_MAX_OCTETS`; pinned in crates/
+/// directory-admin, which links both).
+/// Spec: docs/59 §4.6; docs/questions/Q-1008 item 2 (A-173: "a value ≤ 2048
+/// octets"), Q-1037.
+pub const MAX_PLAN_RELEASED_NAME: u32 = 2048;
+
 /// Body octets of the `auth` field at its largest: the requester's AP-REQ
 /// and the (always empty) retired approvals count.
 pub const MAX_AUTH: usize = 4 + MAX_AP_REQ as usize + 4;
@@ -250,10 +264,9 @@ const CREATE_USER: usize = 16
     + (4 + MAX_NAME as usize)
     + (1 + 4 + MAX_PRINCIPAL_NAME as usize)
     + (1 + 4 + MAX_DESCRIPTION as usize);
-const CREATE_COMPUTER: usize = 16
-    + (4 + MAX_NAME as usize)
-    + (4 + MAX_DNS_HOST_NAME as usize)
-    + (1 + 4 + MAX_PRINCIPAL_NAME as usize);
+// Task PN6b: no dNSHostName field (dird derives it — docs/questions/
+// Q-1036 item 1); there is no bound for one either.
+const CREATE_COMPUTER: usize = 16 + (4 + MAX_NAME as usize) + (1 + 4 + MAX_PRINCIPAL_NAME as usize);
 const LOOKUP_DN: usize = 1 + 4 + MAX_DN_COMPONENTS as usize * (4 + MAX_DN_COMPONENT as usize);
 const LOOKUP_SPN: usize = 1 + 4 + MAX_PRINCIPAL_NAME as usize;
 
@@ -812,6 +825,10 @@ pub mod codes {
     pub const EFFECT_PROTECTED_DATA_LOSS: u8 = 0x05;
     /// Effect tag: `KeyDestruction`.
     pub const EFFECT_KEY_DESTRUCTION: u8 = 0x06;
+    /// Effect tag: `NamesReleased` (appended by task PN7): the
+    /// principal-namespace keys a `Delete` frees.
+    /// Spec: docs/59 §4.6, §9 S7, §10 (PN7); docs/questions/Q-1037.
+    pub const EFFECT_NAMES_RELEASED: u8 = 0x07;
 
     /// `PolicyReference`: a tier-map row names the group (its tier
     /// follows). Spec: docs/47 §6.3; A-36.

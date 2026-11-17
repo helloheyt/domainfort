@@ -49,6 +49,7 @@ dns_host_name = dc1.example.test
 database_path = /var/lib/dird/directory.redb
 integrity_key_source = insecure-development-file
 integrity_key_path = /etc/dird/integrity.key
+attestation_key_path = /etc/dird/attestation.key
 policy_store_path = /etc/domain/policy.store
 policy_store_format = unsigned-development
 dird_kdc_socket = /run/dird/kdc/dird-kdc.sock
@@ -59,6 +60,17 @@ dird_admin_socket = /run/dird/admin/dird-admin.sock
 admind_uid = 806
 dird_kpasswd_socket = /run/dird/kpasswd/dird-kpasswd.sock
 kpasswd_front_uid = 807
+dird_dns_socket = /run/dird/dns/dird-dns.sock
+dnsd_uid = 809
+dns_registrable_networks = 10.0.0.0/8
+dns_record_max_age = 86400s
+dns_soa_rname = hostmaster.example.test
+dns_soa_refresh = 7200s
+dns_soa_retry = 600s
+dns_soa_expire = 3600000s
+dns_soa_minimum = 60s
+dns_infrastructure_ttl = 3600s
+dns_host_ttl = 600s
 keyd_socket = /run/keyd/keyd.sock
 keyd_uid = 801
 node_id = 0123456789abcdef00112233445566ff
@@ -72,7 +84,9 @@ frame_timeout = 5s
 view_lifetime = 3s
 ";
 
-/// dird, required keys only. Spec: docs/50 §7.1.
+/// dird, required keys only — `attestation_key_path` among them since task
+/// PN12 (docs/59 §7.4; docs/questions/Q-1048 item 1, A-187). Spec: docs/50
+/// §7.1.
 pub const DIRD_MINIMAL: &str = "\
 run_as_uid = 802
 run_as_gid = 802
@@ -82,6 +96,7 @@ dns_host_name = dc1.example.test
 database_path = /var/lib/dird/directory.redb
 integrity_key_source = insecure-development-file
 integrity_key_path = /etc/dird/integrity.key
+attestation_key_path = /etc/dird/attestation.key
 policy_store_path = /etc/domain/policy.store
 policy_store_format = unsigned-development
 dird_kdc_socket = /run/dird/kdc/dird-kdc.sock
@@ -155,12 +170,13 @@ tls_handshake_timeout = 10s
 dird_deadline = 62s
 ";
 
-/// ldap-front, required keys only (LDAPS only). Spec: docs/50 §7.1, §4.2;
-/// docs/52 R14 (`internal_networks` required).
+/// ldap-front, required keys only (StartTLS only — `ldap_listen` is
+/// required, task DN10d). Spec: docs/50 §7.1, §4.2 (A-178); docs/52 R14
+/// (`internal_networks` required); docs/questions/Q-1025 item 3.
 pub const LDAP_FRONT_MINIMAL: &str = "\
 run_as_uid = 804
 run_as_gid = 804
-ldaps_listen = 10.0.0.5:636
+ldap_listen = 10.0.0.5:389
 internal_networks = 10.0.0.0/8
 tls_certificate_path = /etc/ldap-front/dc-cert.der
 tls_private_key_path = /etc/ldap-front/dc-key.der

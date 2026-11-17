@@ -34,18 +34,26 @@ pub struct CreateUser {
     pub description: Option<String>,
 }
 
-/// `CreateComputer {parent, name, dns_host_name, spn?}`. Spec: docs/51 §5.2
-/// row 2, §7.3.
+/// `CreateComputer {parent, name, spn?}`.
+///
+/// **No dNSHostName field** (task PN6b; docs/questions/Q-1036 item 1,
+/// decided A-182 — the root form of rule N6): a computer's dNSHostName is a
+/// function of its identity, `<name>.<realm DNS name>` ([MS-ADTS]
+/// 3.1.1.5.3.1.1.2), so the create derives it (crate::names
+/// `own_host_name`, through the checker's realm context) and the request
+/// cannot name a host at all — not even one that would then be refused.
+/// The servicePrincipalName's host must be that derived value.
+/// Spec: docs/51 §5.2 row 2, §7.3; [MS-ADTS] v20261026 3.1.1.5.3.1.1.2;
+/// docs/59 §4.4 N6; docs/questions/Q-1036 item 1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateComputer {
     /// The container (objectGUID).
     pub parent: Guid,
     /// The computer name, without the trailing "$" (the sAMAccountName is
-    /// `name ‖ "$"`; the cn is `name`).
+    /// `name ‖ "$"`; the cn is `name`; the dNSHostName is derived from it).
     pub name: String,
-    /// The dNSHostName.
-    pub dns_host_name: String,
-    /// The single servicePrincipalName, if any.
+    /// The single servicePrincipalName, if any; its host component is the
+    /// derived dNSHostName.
     pub spn: Option<String>,
 }
 

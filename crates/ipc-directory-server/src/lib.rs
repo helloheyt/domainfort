@@ -40,8 +40,19 @@
 //! that cannot compute it is not built ([`StartError`]): dird does not start
 //! on a directory without its domain root and krbtgt account (fail closed).
 //!
+//! # The resolution a record carries (task PN10)
+//!
+//! A `Client` / `Service` record carries dird's attested resolution of the
+//! name it was looked up by (docs/59 §7.5): the view's own account source
+//! builds it with the signer of its context, which dird builds from this
+//! crate's [`ResolutionSigner`] — dird's attestation key and clock (module
+//! `attest`; docs/59 §7.1, §7.4). The server adds nothing to the record and
+//! reads nothing of it; a context without a signer answers every record
+//! `AccountSourceError::Failed` (fail closed).
+//!
 //! Spec: docs/50 R50-2, §3.3, §3.4, §3.7, §7.5; docs/47 §1.4 (R47-2), §8;
-//! docs/11 §6 (snapshot semantics); D39; A-53; A-59.
+//! docs/11 §6 (snapshot semantics); D39; A-53; A-59; docs/59 §7.1, §7.4,
+//! §7.5.
 //!
 //! # Provenance
 //!
@@ -51,6 +62,14 @@
 //! ipc-directory, directory-pip, dirstore, kdc and pdp (ipc-keyd-server as
 //! the pattern). No other implementation, directory server or RPC framework
 //! was consulted or recalled (docs/CLEAN-ROOM.md).
+
+mod attest;
+
+pub use attest::{IssueClock, ResolutionSigner, SharedAttestationKey};
+// The attestation key's length and refusal, for the reader of dird's key
+// file (crates/directory-daemon `startup`) — the key's type itself stays
+// inside `SharedAttestationKey` (task PN10; docs/59 §7.4).
+pub use name_attestation::{KeyRefused, ATTESTATION_KEY_LEN};
 
 use core::fmt;
 use core::time::Duration;

@@ -25,6 +25,20 @@
 #[path = "../../../ipc-audit-client/tests/linked/mod.rs"]
 pub mod linked;
 
+/// The principal namespace of a store written beneath the one checker —
+/// crates/directory-pip's one fixture helper (task PN4b; docs/59 §5.1,
+/// §5.5; docs/questions/Q-1031): the keys every provisioned principal gets,
+/// derived, and the `principal-namespace` marker.
+#[path = "../../../directory-pip/tests/common/namespace.rs"]
+pub mod namespace;
+
+// No name-resolution signer (task PN10b; docs/59 §6.2; docs/questions/
+// Q-1047, A-187): the write PEP reads its requesters, approvers and the
+// self-lockout count through directory-pip's ticket-subject lookup, which
+// attests nothing — so the fixture's context carries no signer, as dird's
+// admin, kpasswd and DNS contexts carry none, and every test of this crate
+// shows the admin plane works without one.
+
 use core::time::Duration;
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -217,6 +231,45 @@ pub fn sid_of(id: u32) -> Sid {
     account_sid(rid(id))
 }
 
+/// The keys a provisioned object holds in the one principal namespace (task
+/// PN5), written by hand in the folded form docs/59 §4.1-§4.3 gives them —
+/// the expectation only: the fixture writes the keys the derivation gives
+/// (module [`namespace`], task PN4b — never these literals) and checks, on
+/// every provisioning, that they are exactly these. A user / group its
+/// sAMAccountName; a computer its sAMAccountName, its base name, its SPN
+/// and its dNSHostName (the DC account too); a service object the same
+/// without the host name (Q-1010 item 3); the krbtgt account its
+/// sAMAccountName and the realm alias `example.test` (N5). Nothing for an
+/// object outside the namespace.
+/// Source: docs/59 §4.1, §4.3, §4.4 N5; docs/questions/Q-1010 item 3; this
+/// project's own test data.
+pub fn namespace_keys(id: u32) -> &'static [&'static str] {
+    match id {
+        KRBTGT => &["krbtgt", "example.test"],
+        DC01 => &["dc01$", "dc01", "dc01.example.test"],
+        LDAP_SVC => &["ldap-svc$", "ldap-svc", "ldap/dc01.example.test"],
+        ADMIND_SVC => &["admind-svc$", "admind-svc", "admind/dc01.example.test"],
+        WS01 => &[
+            "ws01$",
+            "ws01",
+            "host/ws01.example.test",
+            "ws01.example.test",
+        ],
+        ADMIN1 => &["admin1"],
+        ADMIN2 => &["admin2"],
+        HELPER => &["helper"],
+        BOB => &["bob"],
+        SECRET => &["secret"],
+        DISABLED => &["disabled"],
+        ALICE => &["alice"],
+        TIER0_GROUP => &["tier0"],
+        HELPDESK => &["helpdesk"],
+        READERS => &["readers"],
+        BOOTSTRAP => &["bootstrap"],
+        _ => &[],
+    }
+}
+
 pub fn realm() -> Realm {
     Realm::new(REALM).unwrap()
 }
@@ -384,6 +437,13 @@ pub struct Extra {
     pub self_rule: bool,
     /// The tier map classifies ou=Staff with this tier.
     pub staff_tier: Option<Tier>,
+    /// Task DN6: the PEP accepts DNS self-updates under this rule
+    /// (`AdminConfig::with_dns_registration`).
+    pub dns: Option<directory_admin::DnsRegistration>,
+    /// Task DN6: the policy also allows `DnsUpdate` on the zone
+    /// `example.test` to any subject (the coarse layer; the tier layer and
+    /// the PEP's structural checks decide).
+    pub dns_rule: bool,
 }
 
 /// A child's SD, computed as provisioning computes it (CreateSecurityDescriptor
@@ -649,6 +709,22 @@ impl Domain {
                 SubjectMatch::Any,
             ));
         }
+        if extra.dns_rule {
+            rules.push(Rule {
+                id: RuleId(5),
+                effect: Effect::Allow,
+                when: Match {
+                    action: ActionMatch::Exact(pdp::Action::DnsUpdate),
+                    resource: ResourceMatch::Dns {
+                        zone: pdp::ZoneId("example.test".into()),
+                    },
+                    subject: SubjectMatch::Any,
+                    context: ContextMatch::ANY,
+                    auth: AuthMatch::ANY,
+                },
+                obligations: vec![],
+            });
+        }
         let policy = PolicySnapshot::new(PolicyVersion(1), rules, vec![]);
         let config = AdminConfig::new(
             TICKET_AGE_MAX,
@@ -662,6 +738,10 @@ impl Domain {
             },
         )
         .expect("config");
+        let config = match extra.dns.clone() {
+            Some(dns) => config.with_dns_registration(dns),
+            None => config,
+        };
         let admin = DirectoryAdmin::new(config, &p1, CountingRandom::default()).expect("admin");
         let domain = Domain {
             p1,
@@ -839,7 +919,15 @@ impl Domain {
         ]
     }
 
-    /// Provision the domain in ONE transaction (module documentation).
+    /// Provision the domain in ONE transaction (module documentation). The
+    /// fixture writes beneath the one checker, so it writes what the checker
+    /// would have (tasks PN5, PN4b; docs/59 §4.3, §5.1, §5.5): every
+    /// principal's namespace keys, derived (module [`namespace`]; the
+    /// service objects listed — Q-1010 item 3) and checked against
+    /// [`namespace_keys`], and — with the counters — the
+    /// `principal-namespace` marker, with the product's one definition of its
+    /// name and range (crate directory-pip since task PN10, re-exported by
+    /// this crate's config — docs/questions/Q-1043 item 1).
     fn provision(&self, rid_end: Option<u64>) {
         let mut txn = self.store.begin_write().expect("begin write");
         if let Some(rid_end) = rid_end {
@@ -847,12 +935,14 @@ impl Domain {
                 .expect("rid counter");
             txn.create_counter(CHANGE_SEQ_COUNTER, 1, u64::MAX)
                 .expect("change-seq counter");
+            namespace::create_namespace_marker(&mut txn);
             for id in RID_ORDER {
                 let taken = txn.take_counter_value(RID_COUNTER).expect("rid");
                 assert_eq!(taken, u64::from(rid(id)));
             }
         }
         let mut sds: BTreeMap<u32, SecurityDescriptor> = BTreeMap::new();
+        let mut created = Vec::new();
         for (index, planned) in self.plan().into_iter().enumerate() {
             let class_id = self.p1.class_by_name(planned.class).expect(planned.class);
             let class = self.p1.class(class_id).unwrap();
@@ -878,6 +968,7 @@ impl Domain {
                     origin_seq: u64::try_from(index).unwrap() + 1,
                 }
             };
+            created.push((guid(planned.id), origin));
             txn.create_object(
                 NewObject {
                     guid: guid(planned.id),
@@ -889,6 +980,26 @@ impl Domain {
             )
             .unwrap_or_else(|e| panic!("create {}: {e:?}", planned.id));
             sds.insert(planned.id, sd);
+        }
+        let services =
+            DirectoryContext::new(self.p1.clone(), &KeydConfig::new(realm()), naming_context())
+                .expect("context")
+                .with_service_objects(BTreeSet::from([guid(LDAP_SVC), guid(ADMIND_SVC)]));
+        namespace::write_namespace_keys(&self.store, &mut txn, &services, &created);
+        // The derived keys are docs/59's, as written out by hand above.
+        for (g, _) in &created {
+            let stored: BTreeSet<Vec<u8>> = txn
+                .get_object(*g)
+                .expect("store")
+                .expect("created")
+                .attribute(ad_schema::PRINCIPAL_NAME_KEY)
+                .map(|a| a.values.iter().map(|v| v.value.clone()).collect())
+                .unwrap_or_default();
+            let expected: BTreeSet<Vec<u8>> = namespace_keys(g.data1)
+                .iter()
+                .map(|k| k.as_bytes().to_vec())
+                .collect();
+            assert_eq!(stored, expected, "{}", g.data1);
         }
         txn.commit().expect("commit");
     }

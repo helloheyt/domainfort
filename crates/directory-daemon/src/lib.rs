@@ -33,17 +33,25 @@
 //! 2. read the configuration path from argv and parse `DirdSettings`
 //!    ([`startup::read_settings`]: root-owned, not group/other-writable,
 //!    bounded read);
-//! 3. as root, before the drop: read the development integrity key
-//!    ([`startup::read_integrity_key`]: root-owned, mode 0400, exactly 32
-//!    octets, reading buffer wiped) and the development policy
+//! 3. as root, before the drop: read the name-resolution attestation key
+//!    (task PN10 — [`startup::read_attestation_key`] at
+//!    `attestation_key_path`: root-owned, mode 0400, exactly 32 octets, not
+//!    all zero; not configured ⇒ no start — docs/59 §7.4), the development
+//!    integrity key ([`startup::read_integrity_key`]: root-owned, mode 0400,
+//!    exactly 32 octets, reading buffer wiped — the same one reader) and
+//!    the development policy
 //!    ([`startup::read_policy`]: root-owned, bounded, strictly decoded —
 //!    absent or invalid ⇒ no start); prepare the socket directory;
 //! 4. apply the hardening plan ([`startup::hardening_plan`]) while the
 //!    process has one thread (R50-14);
 //! 5. only then build the tokio runtime (current-thread) and run [`serve`]:
 //!    verify auditd (R50-16), open the redb file as dird's account (it must
-//!    exist, owned by dird, no group/other access), build the directory
-//!    context and the tier map, check the domain (naming-context root,
+//!    exist, owned by dird, no group/other access), refuse a store without
+//!    the `principal-namespace` marker (task PN10; docs/59 §5.5), build the
+//!    directory context — with the manifest's service objects, through one
+//!    constructor, and (the directory-view context only, task PN10b) dird's
+//!    name-resolution signer — and the tier map, check the domain
+//!    (naming-context root,
 //!    domain SID, krbtgt account), build the LDAP service (the engine, the
 //!    PDP snapshot of the same policy file, the audit
 //!    gate), spawn the directory-view engine thread and the LDAP engine
@@ -96,6 +104,9 @@
 //! | `kpasswd_engine` | the kpasswd thread: its bounded queue and docs/53 §5.6's steps |
 //! | `kpasswd_listener` | `dird-kpasswd.sock`: kpasswd-front's uid only, ≤ 8 connections, framing, deadlines |
 //! | `operation_ids` | dird's one counter of operation numbers (admin and kpasswd threads) |
+//! | [`dns_service`] | the DNS service's parameters and the host of the dnsd ↔ dird channel: the zone image from the one projection, `Forward` refused unread (task DN10a) |
+//! | `dns_engine` | the DNS thread: its bounded queue and the channel's dispatcher |
+//! | `dns_listener` | `dird-dns.sock`: dnsd's uid only, ≤ 4 connections, framing, deadlines |
 //!
 //! # Security
 //!
@@ -181,6 +192,9 @@ mod audit_convert;
 pub mod audit_link;
 pub mod clock;
 mod daemon;
+mod dns_engine;
+mod dns_listener;
+pub mod dns_service;
 mod engine;
 mod kpasswd_engine;
 mod kpasswd_listener;
@@ -214,6 +228,12 @@ pub use daemon::{
     OpenedStore, Stopped, StoreSource, AUDIT_FLUSH_GRACE, DRAIN_GRACE, ENGINE_QUEUE_CAPACITY,
     LDAP_QUEUE_CAPACITY, MAX_KDC_CONNECTIONS, MAX_LDAP_SESSIONS, MAX_OPEN_VIEWS, SOCKET_FILE_MODE,
 };
+pub use dns_listener::dns_refused_peer_count;
+pub use dns_service::{
+    dns_forward_refused_count, dns_serial_advance_deferred_count, DnsNotStarted, DnsParams,
+    SerialAdvanceStop, DNS_QUEUE_CAPACITY, MAX_DNS_CONNECTIONS, MAX_DNS_QUEUE_CAPACITY,
+    MIN_SERIAL_ADVANCE_INTERVAL,
+};
 pub use engine::{DirectoryEngine, EngineError, EngineHandle, EnginePanicked, EngineThread};
 pub use kpasswd_listener::kpasswd_refused_peer_count;
 pub use kpasswd_service::{
@@ -226,6 +246,13 @@ pub use ldap_listener::ldap_refused_peer_count;
 pub use listener::refused_peer_count;
 pub use reconcile::{MAX_PAGES_PER_RUN, MAX_REGISTRATIONS_PER_RUN, MAX_SETTLED, TOMBSTONE_PAGE};
 pub use registration::{destroy_decision_id, DecisionRegistration};
+// dird's name-resolution attestation (task PN10; docs/59 §7.4): the key's
+// shared handle a `DaemonParams` carries, and the signer dird's
+// directory-view (KDC channel) context is built with — that context only
+// (task PN10b; docs/questions/Q-1047) — crate ipc-directory-server.
+pub use ipc_directory_server::{
+    IssueClock, ResolutionSigner, SharedAttestationKey, ATTESTATION_KEY_LEN,
+};
 
 /// The test seams (docs/52 C18, task R15): the full parameters, the generic
 /// serve, an already-opened store and any keyd verifier. Compiled only with
